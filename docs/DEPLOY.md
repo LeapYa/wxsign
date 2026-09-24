@@ -34,6 +34,8 @@ sudo usermod -aG docker $USER && newgrp docker
 移除 `/.dockerenv`、真实 OUI 的 MAC、可开关的 OS 伪装、面板一键「重置设备 ID」）。
 不做伪装的话，容器里的微信很容易被判定为设备农场，表现为**登录后立刻被踢下线、反复循环**。
 
+### 2.1 起面板与实例
+
 ```bash
 mkdir -p ~/woc && cd ~/woc
 curl -fsSLO https://raw.githubusercontent.com/Gloridust/WechatOnCloud/main/docker-compose.yml
@@ -78,8 +80,12 @@ docker compose up -d
 >   -e TZ=Asia/Shanghai --restart unless-stopped gloridust/woc-panel:latest
 > ```
 
+### 2.2 建实例并登录
+
 浏览器打开 `http://<机器IP>:36080`（用户名 `admin`）→ 新建「微信实例」→ 等镜像拉完、
 微信自动装好 → 进实例 → **手机扫码登录**（建议用闲置小号）。
+
+> 容器画面在面板里看（KasmVNC 网页），扫码和后面万一要人工确认都在这上面做。
 
 > 首次必然是**扫码**（这时还没有登录态）。之后只要实例不重启就一直有效 ——
 > 掉登录只发生在实例重启后，而重启后点「登录」**还得手机确认**（Linux 版没有免确认选项）。
@@ -97,29 +103,111 @@ docker compose up -d
 > 注意本方案有**两个 `.env`**，别搞混：`~/woc/.env` 是**云微面板**的；
 > `brands/<slug>.env` 是**签到脚本**的。青龙环境变量页里配的是后者那类。
 
-### 2.5 先验 WMPF 版本（不通过就别往下走）
+### 2.3 装微信时就把版本钉住（建议先做）
 
-hook 靠 frida 找 WMPF 里的偏移，**WMPF 版本必须落在 WMPFDebugger 的配置里**。
-**要看的是 WMPF 版本，不是微信版本号**（多个微信版本可能共用同一个 `WeChatAppEx`）。
+云微面板默认装**最新版**微信，而 hook 需要对应的 WMPF 偏移配置 —— 最新版未必有
+（下一节要验的就是这个）。所以最好**建实例时就指定版本**，别等挂不上再回退：
 
 ```bash
-docker exec $WX sh -c 'ls /opt/wechat 2>/dev/null; \
-  find / -name "WeChatAppEx" -maxdepth 6 2>/dev/null | head -3'
-# 或者直接从 hook 启动日志看： [frida] script loaded, WMPF version: xxxxx
+bash wmpf/fetch_wechat_deb.sh 4.1.13.23 ./wechat-cdn    # 按版本下载 + 校验 sha256
 ```
 
-已知可用组合：微信 Linux **4.1.13.23** / WMPF **2.5.6.25665**（deb 231,359,624 字节，
-sha256 `b7d0f8d53e9f648bc2c77a6096a04100d008f2d9f0d3988a2a4859b5992aca0a`）。
-另外 4.1.13.9 与 4.1.13.23 的 `WeChatAppEx` 字节完全相同（都是 25665）。
+把 `./wechat-cdn` 挂到任意能 HTTP 访问的地方（nginx / 对象存储 / 临时用
+`python3 -m http.server 8000` 都行），建实例时加一个环境变量（⚠️ 指的是**目录**，不带文件名）：
 
-> ⚠️ **别点面板里的「更新微信」** —— 它下的是不带版本号的直链，永远拿最新版；
+```
+WECHAT_CDN=https://<你的域名>/<指向该目录的路径>
+```
+
+> ⚠️ **不要点面板里的「更新微信」** —— 它下的是官网那条**不带版本号**的直链，永远拿到最新版。
+> 哪些版本已知可用、各自对应哪个 WMPF，见下一节表格。
+
+### 2.4 先验 WMPF 版本（不通过就别往下走）
+
+hook 靠 frida 找 WMPF 内部的偏移，**WMPF 版本必须落在 WMPFDebugger 的偏移配置里**，否则挂不上。
+⚠️ **要看的是 WMPF 版本，不是微信版本号**（多个微信版本可能共用同一个 `WeChatAppEx`）。
+
+一条命令验完（纯只读：只 `docker exec` 读文件，不重启、不影响登录态）：
+
+```bash
+bash wmpf/check_wmpf.sh $WX
+```
+
+看到 `[OK] WMPF 25665 有对应偏移配置` 再继续；看到 `[FAIL]` 先别往下走。
+
+#### 目前已知可用的组合
+
+| 微信 Linux | WMPF | 偏移配置来自 | 状态 |
+|---|---|---|---|
+| **4.1.13.23**（4.1.13.9 的 `WeChatAppEx` 字节完全相同） | 2.5.6.**25665** | 上游自带 | ✅ 真机跑通 —— **本项目的默认版本** |
+| 4.1.1.8 | 2.2.4.**14978** | 上游自带 | ✅ 真机跑通 |
+| 4.1.1.4 | 2.2.4.**14910** | 上游自带 | ✅ 真机跑通 |
+| 4.0.0.30 | 2.1.4.**11459** | 本仓库自算 | ✅ 真机跑通（另需上游那两条补丁，见 §4.1） |
+| 4.1.0.13 | 2.2.4.**14664** | 本仓库自算 | ❌ 偏移算得出，但**微信服务端拒绝登录**（提示「版本过低」） |
+
+**上游 linux 配置只有 3 份**（14910 / 14978 / 25665），其余是我们自己算出来的。
+这 5 份的产出都留在 [`wmpf/offsets/addresses.*.recovered.json`](../wmpf/offsets/) 里，可直接对照。
+
+> ⚠️ **别点面板里的「更新微信」** —— 它下的是官网那条不带版本号的直链，永远拿到最新版；
 > 一旦新版 WMPF 没有对应偏移配置，hook 就挂不上。
-> 万一漂了：① 把最接近的配置改名试挂（同一 `x.y.z` 下不同 build 偏移可能一样）；
-> ② 换一个微信 deb 版本（`/config/wechat` 做符号链接切版本，登录数据在 `/config/.xwechat`，不丢登录）。
+
+#### 微信升级了、上游还没适配 —— 四条路
+
+**这件事迟早会发生**：微信会一直出新版，而上游 WMPFDebugger 是人工适配的，必然滞后。
+按成本从低到高：
+
+**① 先看上游有没有人已经适配了（2 分钟，最省事）**
+
+```bash
+bash wmpf/check_upstream.sh 26123        # 把 26123 换成你实际的 WMPF 版本号
+```
+
+它列四样：上游现有的 linux 配置清单、**开放中的 PR**（经常有「已经算好了、只是没合并」）、
+最近更新的 issue、以及直接搜你那个版本号的命中。
+有的话把 PR 里的 JSON 抄下来，放进 hook 容器即可：
+
+```bash
+docker cp addresses.<版本>.json woc-hook:/opt/wmpf/frida/config/linux/
+bash wmpf/restart_hook.sh
+```
+
+**② 自己算（本仓库自带工具，不用等任何人）**
+
+```bash
+bash wmpf/auto_offsets.sh $WX    # 抠二进制 → 算偏移 → 判卷 → 装进 hook 容器
+bash wmpf/restart_hook.sh        # 重启 hook 生效
+```
+
+为什么这条路成立：**偏移的「值」每版都变，但用来定位的「锚点」几乎不动**（跨 WMPF
+11459→25665 五代实测，8 条锚点都在场且唯一）。所以「重新对地址」这一步可以自动化 ——
+上游累的正是这一步。原理、五条恢复规则、判卷方式见
+[`wmpf/offsets/README.md`](../wmpf/offsets/README.md)。
+
+两个已知边界（工具会自己报，不会静默给错值）：
+
+- 锚点真被大改（日志串改名、`1101` 魔数变更、筛选函数被内联）→ 工具**报错退出**，需人工重新锚定；
+- **配置形态已经换过一代**：从 WMPF 25715 起不再用 `SceneOffsets` 六元组，改结构化
+  `MiniAppConfigStructOffsets`。真遇到那种版本，光重算值不够，得扩展工具。
+  （Linux 已知运行时都还是旧形态，暂时不受影响。）
+
+需要宿主机有 `python3` + `capstone` + `numpy`，只在算的时候用，跑 hook 不需要。
+
+**③ 把微信钉回已知可用的旧版**
+
+```bash
+bash wmpf/fetch_wechat_deb.sh 4.1.13.23 ./wechat-cdn   # 按版本下载 + 校验 sha256
+```
+
+把该目录挂到任意静态服务，启动实例时加 `-e WECHAT_CDN=https://<你的域名>/<目录路径>`。
+⚠️ 钉旧版有下限：**微信服务端会拒过旧的客户端**（实测 4.1.0.13 点登录直接提示「版本过低」），
+建议钉在 4.1.1.x 或更新。切版本**不丢登录**（登录数据在 `/config/.xwechat`，与程序目录分开）。
+
+**④ 换 Windows 方案** —— 上游 win32 有 53 份现成配置，linux 只有 3 份。
+代价是得常开一台 Windows 机器。见 `wmpf/offsets/README.md` 末尾。
 
 ---
 
-### 2.6 让小程序以「手机竖版」运行（建议做）
+### 2.5 让小程序以「手机竖版」运行（建议做）
 
 云微镜像的 openbox 有一条**通配**规则，把所有新窗口无条件最大化：
 
@@ -170,7 +258,7 @@ docker exec $WX sh -c 'cp /config/.config/openbox/rc.xml.orig.bak /etc/xdg/openb
 
 ```
 window.screenX/screenY = (435,124)   ← 与 xdotool 报的窗口原点完全一致
-innerHeight(779) > outerHeight(776)  ← 顶部那条「⌂ 首页 ●●● ─ ⊙」是**覆盖层**，不占视口
+innerHeight(779) > outerHeight(776)  ← 顶部那条「⌂ 首页 ●●● ─ ⊙」是覆盖层，不占视口
 devicePixelRatio = 1
 ```
 
@@ -258,20 +346,23 @@ docker exec woc-hook sh -c '
 
 ### 4.1 必须打的两个补丁
 
+上游 WMPFDebugger 有两个坑会让本项目跑不起来，得补上：
+
 ```bash
-# ① 场景号白名单：从「小程序面板 → 搜索 → 结果卡片」打开小程序时场景号是 1183，
-#    不在上游白名单里 → 小程序不会连 ws://localhost:9421 → CDP 拿不到 appId、换不了 token。
-#    现象：hook 日志里没有 miniapp client connected。
-# ② 老版本（4.0.x 及更早）没有 wmpf_release/<tag>_<x.y.z> 串，上游取版本号会直接抛
-#    [frida] error in find wmpf version 起不来 → 需要一条回退正则。
+bash wmpf/hook_patch.sh $WX      # 默认 hook 容器 woc-hook，幂等，可反复跑
 ```
 
-`wxsign.py` 不做这两个补丁（它不碰 WMPFDebugger 源码），请按上游 issue 的方式改
-`frida/hook.js` 的 `sceneNumberArray`（加 `1183`，并加一行诊断日志）、
-以及 `src/platform/linux.ts` 的版本探测。改完 `docker commit woc-hook woc-hook:1` 固化。
+它做两件事（各自都有备份与失败回滚）：
 
-> 换入口或换微信版本后如果又「换不到 token」，用 `--debug-frida` 起一次 hook，
-> 日志会打印 `[hook] scene NOT in whitelist: N`，把 N 补进白名单即可。
+| 补丁 | 文件 | 不打会怎样 |
+|---|---|---|
+| ① 场景号白名单加 `1183` | `frida/hook.js` | 从「面板 → 搜索 → 结果卡片」打开小程序时场景号是 **1183**，不在上游白名单（1145/1256/1260…）→ 场景号不被改写成 1101 → 小程序**不会连** `ws://localhost:9421` → CDP 拿不到身份、换不了 token。现象：hook 日志里没有 `miniapp client connected` |
+| ② 版本探测回退正则 | `src/platform/linux.ts` | 老版本（4.0.x 及更早）没有 `wmpf_release/<tag>_<x.y.z>` 串，上游取版本号会直接抛 `[frida] error in find wmpf version` 起不来 |
+
+补丁 ① 顺带加了一行诊断日志：场景号不在白名单时打印 `[hook] scene NOT in whitelist: N`。
+以后换入口或换微信版本又「换不到 token」，就把日志里那个 N 补进白名单。
+
+> 固化下来（免得以后重建容器又要打一遍）：`docker commit woc-hook woc-hook:1`。
 
 启动 hook：
 
@@ -279,6 +370,10 @@ docker exec woc-hook sh -c '
 docker exec -d woc-hook sh -c 'cd /opt/wmpf && node node_modules/ts-node/dist/bin.js src/index.ts > /tmp/wmpf.log 2>&1'
 docker exec woc-hook tail -5 /tmp/wmpf.log     # 期望看到 [frida] script loaded, WMPF version: 25665
 ```
+
+> 以后要重启它（换配置 / 微信版本后）：`bash wmpf/restart_hook.sh`。
+> ⚠️ 它**只在启动时 attach 一次** —— 不重启的话，新拉起的小程序实例不会被挂上，
+> 表现为 CDP 一个 context 都拿不到（`ctx=0`）。
 
 ---
 
@@ -330,9 +425,9 @@ Windows 版微信有「登录免确认」选项（可做到纯自动），**Linu
 1. **掉登录 = 必须有人拿手机**（这一步替代不了）。定时任务在这一点上没法自愈 ——
    `sign.sh` 会在这种时候**明确报出来并中止**（退出码 2 / 3），不会假装成功往下跑。
 2. **拖久了会升级成扫码**。手机长时间不确认，微信会提示「登录状态已过期」，
-   之后就**只能扫码**了；而扫码必须能看到容器画面（KasmVNC 网页，见 §2.4）。
+   之后就**只能扫码**了；而扫码必须能看到容器画面（KasmVNC 网页，见 §2.2）。
 3. 所以运维要点就一条：**容器和宿主都别重启**，也别让看门狗因内存把实例「柔和重启」掉
-   （这就是 §2.3 里把 `WOC_INSTANCE_MEM_SOFT_MB` 调到 2800 的原因）。
+   （这就是 §2.1 里把 `WOC_INSTANCE_MEM_SOFT_MB` 调到 2800 的原因）。
 
 > 注意 `sign.sh --ensure-only` 那个「保活」任务只保**进程活着**，保不了**登录态** ——
 > 它的用途是别让 hook / 面板挂掉，不是"替你维持登录"。
@@ -382,9 +477,10 @@ docker exec $WX sh -c 'for p in $(ls /proc | grep -E "^[0-9]+$"); do \
 | `docker: not found` | 青龙容器没挂 docker 二进制，或没挂 `docker.sock` |
 | `Cannot connect to the Docker daemon` | 同上 |
 | 「微信实例容器未运行」 | 云微实例没起，或 `WOC_INSTANCE` 写错 |
-| hook 日志没有 `script loaded` | WMPFDebugger 没起 / WMPF 版本没有对应偏移配置 |
-| hook 日志没有 `miniapp client connected` | 场景号没进白名单（见 4.1） |
+| hook 日志没有 `script loaded` | WMPFDebugger 没起，或 WMPF 版本没有对应偏移配置 → `bash wmpf/check_wmpf.sh $WX` |
+| hook 日志没有 `miniapp client connected` | 场景号没进白名单 → `bash wmpf/hook_patch.sh $WX`（见 §4.1） |
+| CDP 一个 context 都读不到（`ctx=0`） | hook 只在启动时 attach 一次：重启过 hook、或杀过 `WeChatAppEx` 之后没重开小程序 → `bash wmpf/restart_hook.sh`，**再把小程序重开一次** |
 | 一直「小程序没开成」 | 微信没登录，或 `brands.json` 里 appId / miniapp 名写错 |
 | `RESULT code=208/211` | token 失效 —— 重跑一次即可（脚本会自己刷） |
-| `RESULT code=401` | 该账号还不是这个品牌的会员，且没配注册手机号 |
+| `RESULT code=401` | 该账号还不是这个品牌的会员 → 脚本会自动走微信授权弹窗注册；若仍失败，看 `[ui]` 日志与 `shots/<slug>/` 截图 |
 | `RESULT code=-1` | 网络层错误（已重试仍失败），看 msg |

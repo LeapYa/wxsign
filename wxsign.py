@@ -18,8 +18,14 @@
     python3 <脚本目录>/wxsign.py --list              看品牌表
     python3 <脚本目录>/wxsign.py <slug> --probe      只探测（会员 + 活动列表），不签到
     python3 <脚本目录>/wxsign.py <slug> --discover   把该租户所有活动的原始 JSON 打出来
-    python3 <脚本目录>/wxsign.py <slug>              该品牌签到
+    python3 <脚本目录>/wxsign.py <slug> --register   只做会员注册（不是会员时用）
+    python3 <脚本目录>/wxsign.py <slug>              该品牌签到（不是会员会自动注册再签）
     python3 <脚本目录>/wxsign.py --all [--ensure]    所有 enabled 品牌（--ensure 会先开小程序并刷 token）
+
+会员注册：签到接口要求 memberId/cardId/cardNo，只有会员才有。不是会员时脚本会**自动注册**
+    （POST /api/member/register，明文手机号；该接口在每个吾享游戏型包里都有）。
+    手机号来源：brands/<slug>.env 的 WX_REGISTER_PHONE，或进程环境变量 WXSIGN_REGISTER_PHONE。
+    同一个人可以在多个品牌各注册一次会员，互不影响。
 
 环境变量：
     WOC_HOOK=woc-hook           旁挂 hook 容器名（刷 token 用）
@@ -33,6 +39,7 @@
 """
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -256,6 +263,67 @@ def lot_list(env):
     return r, content_of(r)
 
 
+def register_member(brand, env):
+    """账号还不是该品牌会员时自动注册（照抄小程序页面源码 registerVip 的入参）。
+
+        POST /api/member/register
+        data = {mobile, gameId, thirdShopId, byInviteCode}
+
+    mobile 是**明文手机号** —— 加密串只有在走微信弹窗授权时才需要。
+    `/api/member/register` 在**每个吾享游戏型包里都有**（实测 6/6），所以这条能通用。
+
+    手机号来源（按优先级）：
+      1. brands/<slug>.env 的 WX_REGISTER_PHONE（单品牌专属号）
+      2. 进程环境变量 WXSIGN_REGISTER_PHONE（青龙里配一次，所有品牌共用）
+    方式 WX_REGISTER_MODE：api（默认，有号就直连注册）| ui（走微信授权弹窗）| auto
+    同一个人可以在多个品牌各注册一次会员，互不影响。
+    """
+    mode = (env.get("WX_REGISTER_MODE") or os.environ.get("WXSIGN_REGISTER_MODE") or "auto").lower()
+    phone = (env.get("WX_REGISTER_PHONE") or os.environ.get("WXSIGN_REGISTER_PHONE") or "").strip()
+    if mode == "auto":
+        mode = "api" if phone else "ui"
+    log("  [register] 还不是会员 → 方式=%s 手机号=%s"
+        % (mode, "已设" if phone else "(未设)"))
+
+    if mode == "api":
+        if not re.fullmatch(r"1\d{10}", phone):
+            return False, "走 API 注册需要 11 位手机号（WX_REGISTER_PHONE 或 WXSIGN_REGISTER_PHONE）"
+        r = api_post(env, "/api/member/register", {
+            "mobile": phone,
+            "gameId": env.get("WX_GAMEID", ""),
+            "thirdShopId": env.get("WX_THIRDSHOPID", ""),
+            "byInviteCode": "",
+        })
+        c = str(r.get("code"))
+        log("  [register] /api/member/register → code=%s msg=%s" % (c, r.get("msg")))
+        if c in ("200", "0"):
+            return True, "API 注册成功"
+        return False, "API 注册失败：%s（可改 WX_REGISTER_MODE=ui 走微信弹窗）" % r.get("msg")
+
+    # UI 兜底：驱动微信的手机号授权弹窗。脚本在各项目里都不一样，所以用环境变量指过去。
+    ui_py = os.environ.get("WXSIGN_UI_REGISTER_PY", "")
+    if not ui_py or not os.path.exists(ui_py):
+        return False, ("UI 注册需要 WXSIGN_UI_REGISTER_PY 指向 ui_register.py"
+                       "（辣可可项目里那份，会点微信手机号授权弹窗）")
+    if not INSTANCE:
+        return False, "UI 注册需要 WOC_INSTANCE（要操作微信界面）"
+    inner = ("cd %s && SHOT_DIR=%s REG_PHONE_INDEX=%s REG_PHONE=%s python3 %s"
+             % (CTMP, CTMP + "/shots",
+                env.get("WX_REGISTER_PHONE_INDEX", "0") or "0", phone,
+                cpath(CTMP, "ui_register.py")))
+    try:
+        subprocess.run(["docker", "cp", ui_py, "%s:%s" % (INSTANCE, cpath(CTMP, "ui_register.py"))],
+                       capture_output=True, text=True, timeout=120)
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", "-e", "SHOT_DIR=" + CTMP + "/shots",
+                            INSTANCE, "sh", "-c", inner],
+                           capture_output=True, text=True, timeout=900)
+        for line in ((p.stdout or "") + (p.stderr or "")).splitlines()[-25:]:
+            log("     " + line[:200])
+    except Exception as e:
+        return False, "UI 注册异常：%s" % e
+    return True, "UI 注册流程已跑（结果看上面的日志/截图）"
+
+
 def pick_activity(items, want=("签到", "打卡", "sign")):
     """从活动列表里挑签到类活动（type/名称命中关键词）。返回 (activity, 命中理由)。"""
     if isinstance(items, dict):
@@ -287,7 +355,18 @@ def do_sign(brand, env):
     if code in (CODE_AUTH_BAD, CODE_AUTH_EXP):
         return False, code, "token 失效（%s）→ 重跑 wxrefresh.js" % r.get("msg")
     if code == CODE_NOT_MEMBER:
-        return False, code, "该账号还不是「%s」会员 → 先在小程序里走一次注册" % brand["name"]
+        # 还不是会员 → 自动注册（照抄页面源码的 registerVip）。同一个人可在多个品牌各注册一次。
+        ok, msg = register_member(brand, env)
+        log("  [register] %s" % msg)
+        if not ok:
+            return False, code, "「%s」自动注册未成功：%s" % (brand["name"], msg)
+        time.sleep(2)
+        r, mem = member_info(env, game_id, third)
+        code = str(r.get("code"))
+        if code != CODE_OK:
+            return False, code, "注册后复查 /api/member/single 仍失败（code=%s msg=%s）" % (
+                code, r.get("msg"))
+        log("  [register] 复查通过，已是「%s」会员" % brand["name"])
     if code != CODE_OK:
         log("  [member] code=%s msg=%s" % (code, r.get("msg")))
     else:
@@ -363,7 +442,7 @@ def notify(title, text, status="ok"):
 
 # ───────────────────────── 主流程 ─────────────────────────
 
-def run_brand(brand, do_ensure=False, probe=False, discover=False):
+def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only=False):
     slug, name = brand["slug"], brand["name"]
     log("\n===== %s（%s） appid=%s =====" % (name, slug, brand["appid"]))
     env = load_env(slug)
@@ -390,6 +469,15 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False):
         log(json.dumps(items, ensure_ascii=False, indent=1)[:3000])
         return True, "discover"
 
+    if register_only:
+        ok, msg = register_member(brand, env)
+        log("  [register] %s" % msg)
+        if ok:
+            r, mem = member_info(env, env.get("WX_GAMEID", ""), env.get("WX_THIRDSHOPID", ""))
+            log("  [register] 复查 /api/member/single → code=%s content=%s"
+                % (r.get("code"), json.dumps(mem, ensure_ascii=False)[:300]))
+        return ok, "register"
+
     if probe:
         r, mem = member_info(env, env.get("WX_GAMEID", ""), env.get("WX_THIRDSHOPID", ""))
         log("  [probe·member] code=%s content=%s"
@@ -414,7 +502,8 @@ def main():
                 % (b["slug"], b["name"], b["miniapp"], b["appid"],
                    "启用" if b.get("enabled") else "停用",
                    "（已联调）" if b.get("verified") else ""))
-        log("\n用法：wxsign.py <slug> [--probe|--discover|--ensure]  |  wxsign.py --all [--ensure]")
+        log("\n用法：wxsign.py <slug> [--probe|--discover|--register|--ensure]  |  wxsign.py --all [--ensure]")
+        log("      <slug> 不带参数 = 直接签到（不是会员会自动注册，见 --register）")
         return 0
 
     cfg = load_brands()
@@ -422,6 +511,7 @@ def main():
     do_ensure = "--ensure" in argv
     probe = "--probe" in argv
     discover = "--discover" in argv
+    register_only = "--register" in argv
 
     if "--all" in argv:
         targets = [b for b in cfg["brands"] if b.get("enabled")]
@@ -436,7 +526,8 @@ def main():
     lines = []
     for b in targets:
         try:
-            ok, code = run_brand(b, do_ensure=do_ensure, probe=probe, discover=discover)
+            ok, code = run_brand(b, do_ensure=do_ensure, probe=probe, discover=discover,
+                                 register_only=register_only)
         except Exception as e:
             ok, code = False, "exception"
             log("  [!] 异常：%s" % e)

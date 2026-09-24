@@ -31,8 +31,9 @@
 
 ```
 wxsign/
-├── wxsign.py            引擎：探测 / 签到 / 批量（青龙直接调它）
+├── wxsign.py            引擎：探测 / 注册 / 签到 / 批量（青龙直接调它）
 ├── sign.sh              青龙总入口：自检 → 掉登录就点登录 → 逐品牌签到
+├── wxclean.py           清残留小程序窗口（弹窗挡住关闭按钮时先遣散再关）
 ├── wxident.js           身份采集（hook 容器内跑，按 appId+mpId 挑上下文）
 ├── wxrefresh.js         token 刷新（hook 容器内跑，wx.login 换短效 JWT）
 ├── brands.json          品牌表（静态：品牌名/小程序名/appId/carrier）
@@ -95,6 +96,10 @@ docker exec woc-hook sh -c 'cd /work/wxsign && ENVFILE=/work/wxsign/brands/<slug
 python3 wxsign.py <slug> --probe
 python3 wxsign.py <slug> --discover      # 打活动原始 JSON，用来填 WX_GAMEID
 
+# 4.5) 不是会员？自动注册（要先配好手机号）
+export WXSIGN_REGISTER_PHONE=13800000000   # 或用 brands/<slug>.env 的 WX_REGISTER_PHONE
+python3 wxsign.py <slug> --register
+
 # 5) 联调签到
 python3 wxsign.py <slug>
 ```
@@ -117,9 +122,12 @@ python3 wxsign.py <slug>
 
 ## 六、已知限制 / 待联调（**重要，别当已完成**）
 
-1. **账号必须先是该品牌的会员**。辣可可的账号在别家不是会员，接口会返 `401`。
-   要么用各品牌的手机号授权走一次注册（`/api/member/register`，收明文手机号），
-   要么放弃该品牌。同一手机号可在多个品牌各注册一次会员。
+1. ~~账号必须先是该品牌的会员~~ → **已自动化**。签到接口要 `memberId/cardId/cardNo`，只有会员才有；
+   不是会员时脚本会自己走注册（`POST /api/member/register`，明文手机号，该接口在每个吾享游戏型包里都有）。
+   手机号配 `WX_REGISTER_PHONE`（单品牌）或青龙环境变量 `WXSIGN_REGISTER_PHONE`（所有品牌共用）。
+   同一个人可以在多个品牌各注册一次会员，互不影响。
+   > ⚠️ 注册分支的接线已单测过（无号/格式错/落 UI 三种都按预期拦住），但**没有真的打过一次注册请求**——
+   > 那会在你账号上真实建会员，需要你自己填手机号后跑 `wxsign.py <slug> --register` 验证。
 2. **`lot` 型的「签到」动作参数结构尚未真机联调**。`/api/game/lot/check` 已知存在、
    包裹体已知，但它要的 `data` 字段（是否要 `gameId` + `activityId` + 更多）还没在真机上验证过。
    现有实现是**尽力而为**，请先用 `--probe` / `--discover` 看清活动结构再开定时任务。

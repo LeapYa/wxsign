@@ -3,7 +3,7 @@
   "engine_version": 1,
   "crm_base": "https://scrm.wuuxiang.com/crm7game-api",
   "login_url": "https://wechat.wuuxiang.com/i5xforyou/auth/login",
-  "_carrier": "sign = 该号包内含 /api/game/sign/*（专用签到模块）；lot = 只含 /api/game/lot/*（活动/抽奖壳，签到是其中一种活动类型）",
+  "_carrier": "已弃用（2026-09-24）：原按「包内是否含 game/sign 字面串」分 sign/lot，实测不成立（来菜包里没有该字面串，运行时却走 sign 接口）。引擎已改为运行时判断，本字段仅作历史记录，不再被读取。",
   "_types": "sign 游戏型(签到/大转盘) | card 会员卡型 | mall 微商城型",
   "brands": [
     {
@@ -17,7 +17,7 @@
       "type": "sign",
       "enabled": true,
       "verified": true,
-      "note": "参照实现，已真机联调通过（RESULT=200/415）。gameid 放在这里而不是 env：它不是凭证、是公开的活动常量（档期到 2028-01），这样 clone 下来就有，新用户零手工。"
+      "note": "已真机跑通（注册 + 签到，415 今日已签到）。gameid 放在这里而不是 env：它不是凭证、是公开的活动常量（档期到 2028-01），这样 clone 下来就有，新用户零手工。"
     },
     {
       "slug": "shudaxia",
@@ -27,9 +27,9 @@
       "miniapp": "蜀大侠活动号",
       "carrier": "lot",
       "type": "sign",
-      "enabled": true,
+      "enabled": false,
       "verified": false,
-      "note": "首页在跑「周三会员日…赢大奖」幸运抽奖（大转盘）"
+      "note": "活动是「周三会员日…抽奖」，不是签到（sign/survey 406、isCumulativeSign=null）→ 无签到可做"
     },
     {
       "slug": "jiucun",
@@ -40,8 +40,8 @@
       "carrier": "lot",
       "type": "sign",
       "enabled": true,
-      "verified": false,
-      "note": "首页在跑「26年会员签到」打卡签到（2026-09-01 ~ 2026-12-31）"
+      "verified": true,
+      "note": "已真机跑通（注册 + 签到，415 今日已签到）。"
     },
     {
       "slug": "nonggengji",
@@ -51,9 +51,9 @@
       "miniapp": "农耕记转盘",
       "carrier": "lot",
       "type": "sign",
-      "enabled": true,
+      "enabled": false,
       "verified": false,
-      "note": "首页在跑「积分秒杀菜品券」幸运抽奖（大转盘）"
+      "note": "活动是「积分秒杀菜品券」，不是签到（sign/survey 406、isCumulativeSign=null）→ 无签到可做"
     },
     {
       "slug": "laicai",
@@ -64,8 +64,8 @@
       "carrier": "lot",
       "type": "sign",
       "enabled": true,
-      "verified": false,
-      "note": "首页在跑「【26】每日签到，半价吃招牌菜」打卡签到"
+      "verified": true,
+      "note": "已真机跑通（注册 + 签到，415 今日已签到）。"
     },
     {
       "slug": "jiuzhujianghu",
@@ -76,8 +76,8 @@
       "carrier": "lot",
       "type": "sign",
       "enabled": true,
-      "verified": false,
-      "note": "首页在跑「酒煮江湖日常积签到活动」打卡签到"
+      "verified": true,
+      "note": "已真机跑通（注册 + 签到，415 今日已签到）。"
     },
     {
       "slug": "rouchuanwang",
@@ -87,9 +87,9 @@
       "miniapp": "肉串汪活动入口",
       "carrier": "lot",
       "type": "sign",
-      "enabled": true,
+      "enabled": false,
       "verified": false,
-      "note": "同款活动壳；活动列表加载较慢，首页当次为空"
+      "note": "服务端未配活动（lot/list 405），首页只有空壳会员卡 → 既无入口也无内容"
     },
     {
       "slug": "guliantian",
@@ -99,9 +99,9 @@
       "miniapp": "谷连天+",
       "carrier": "lot",
       "type": "sign",
-      "enabled": true,
+      "enabled": false,
       "verified": false,
-      "note": "游戏型（分包仅 _pages_home_，含 pages/sign + game/lot）；同品牌另有会员卡型 wx3bf335ac37718c20、微商城型 wxdd54752712979943"
+      "note": "服务端未配活动（lot/list 405）→ 同上"
     },
     {
       "slug": "malakongjian",
@@ -111,9 +111,9 @@
       "miniapp": "麻辣空间趣玩",
       "carrier": "lot",
       "type": "sign",
-      "enabled": true,
+      "enabled": false,
       "verified": false,
-      "note": "游戏型（分包仅 _pages_home_，含 pages/sign + game/lot）；同品牌另有会员卡型 wx8bf3fcfb69920f74 / wx79c1803a7c8bedb6"
+      "note": "服务端未配活动（lot/list 405）→ 同上"
     },
     {
       "slug": "xujiaca",

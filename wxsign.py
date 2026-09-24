@@ -365,26 +365,26 @@ def discover_appid(kw, max_cards=6):
 
     rows = data.get("found", [])
     log("\n发现 %d 个号：" % len(rows))
-    log("  %-4s %-24s %-14s %-8s %-10s %s" % ("#", "小程序名", "appId", "供应商", "载体", "签到能力"))
+    log("  %-4s %-24s %-14s %-8s %s" % ("#", "小程序名", "appId", "供应商", "包内特征"))
     for i, f in enumerate(rows, 1):
         sup = "吾享" if f.get("wuuxiang") else "其他"
         sign = ("有签到接口" if f.get("sign_api") else
                 "有签到页" if f.get("sign_page") else
                 "仅活动壳" if f.get("lot_api") else "无")
-        log("  %-4s %-24s %-14s %-8s %-10s %s"
-            % (i, f.get("name", "?"), f.get("appid", "?"), sup, f.get("carrier", "?"), sign))
+        log("  %-4s %-24s %-14s %-8s %s"
+            % (i, f.get("name", "?"), f.get("appid", "?"), sup, sign))
+    log("  （包内特征只是**初筛**，判断能不能签到要跑 --probe）")
 
     # 直接给出可以粘贴进 brands.json 的条目
     best = rows[0] if rows else None
     if best:
-        log("\n最像签到载体的那个（按名字规律 + 包能力排序）（复制进 brands.json 的 brands 数组）：")
+        log("\n最像签到载体的那个（按名字规律 + 包内特征排序）（复制进 brands.json 的 brands 数组）：")
         log(json.dumps({
             "slug": kw.replace(" ", ""),
             "name": kw,
             "appid": best.get("appid", ""),
             "keyword": kw,
             "miniapp": best.get("name", ""),
-            "carrier": "sign" if best.get("sign_api") else "lot",
             "type": "sign",
             "enabled": True,
             "verified": False,
@@ -704,8 +704,9 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         log("RESULT %s code=noident msg=拿不到身份" % slug)
         return False, "noident"
 
-    # sign 型号的 activity id 不在活动列表接口里（辣可可那条返回 405），得从页面 data 抓一次
-    if brand.get("carrier") == "sign" and not (env.get("WX_GAMEID") or brand.get("gameid")):
+    # 缺 gameId 时补抓一次（wxident.js 会读页面 data 取 gameId）。
+    # 不判 carrier：那个分类已证伪（来菜包里没有 sign 字面串，运行时走的却是 sign 接口）。
+    if not (env.get("WX_GAMEID") or brand.get("gameid")):
         harvest_ident(brand)
         env = load_env(slug)
 

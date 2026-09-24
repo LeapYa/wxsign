@@ -2,11 +2,13 @@
 # 微信小程序签到合集 · 青龙面板总入口
 #
 # 在青龙「定时任务」里写：
-#   bash /ql/data/scripts/wxsign/sign.sh              # 所有启用品牌
-#   bash /ql/data/scripts/wxsign/sign.sh <slug>       # 只签某一个
-#   bash /ql/data/scripts/wxsign/sign.sh --ensure-only # 只自检保活，不签到
+#   bash /ql/data/scripts/wxsign/sign.sh                        # 默认 all（brands.json 里 enabled 的）
+#   bash /ql/data/scripts/wxsign/sign.sh --apps lakeke,laicai   # 只签这两个（多选）
+#   bash /ql/data/scripts/wxsign/sign.sh --exclude jiucun       # 不签这个（多选）
+#   bash /ql/data/scripts/wxsign/sign.sh lakeke                 # 位置参数 = 只签它
+#   bash /ql/data/scripts/wxsign/sign.sh --ensure-only          # 只自检保活，不签到
 #
-# 做的事：docker/hook/微信 自检 → 掉登录就点登录 → 逐个品牌（开小程序 → 刷 token → 签到）
+# 做的事：docker/hook/微信 自检 → 掉登录就点登录 → 逐品牌（开小程序 → 刷 token → 签到）
 #
 # ⚠️ 登录是一次性配置：首次扫码登录一次，之后只要不重启就一直有效，运行期全自动。
 #    唯一要留意的是**别让微信掉登录** —— 一旦因重启掉登录，点完「登录」还需**在手机上确认**
@@ -17,6 +19,8 @@
 #   WOC_INSTANCE=<微信实例容器名>    WOC_HOOK=woc-hook
 #   WXSIGN_PYTHON=/usr/bin/python3
 #   WXSIGN_HOME_CONTAINER=/ql/data/scripts/wxsign   （脚本在容器里的路径）
+#   WXSIGN_APPS=lakeke,laicai        可选：白名单，只签这几个（默认 all）
+#   WXSIGN_EXCLUDE=jiucun            可选：黑名单，永不签这几个（优先级最高）
 set -u
 export PATH="/usr/bin:/bin:/usr/local/bin:$PATH"
 
@@ -27,6 +31,11 @@ HOOK="${WOC_HOOK:-woc-hook}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { log "FAIL: $1"; exit 1; }
+
+# 只读命令直接透传，不要求 docker / 微信环境（想在青龙控制台随手查一下时很有用）
+case "${1:-}" in
+  --list|--find) exec "$PY" "$HERE/wxsign.py" "$@" ;;
+esac
 
 log "===== 签到合集 开始 ====="
 
@@ -77,11 +86,16 @@ fi
 [ "${1:-}" = "--ensure-only" ] && { log "仅保活，退出"; exit 0; }
 
 # 4. 签到（其余辅助脚本由 wxsign.py 的 ensure_helpers() 自动投递到微信容器）
-if [ -n "${1:-}" ]; then
-  "$PY" "$HERE/wxsign.py" "$1" --ensure
-else
-  "$PY" "$HERE/wxsign.py" --all --ensure
-fi
+#    参数原样透传给引擎：--apps / --exclude / 位置 slug 都能用（见文件头）。
+#    没显式给 --ensure 就补一个 —— 定时任务里要的就是「先开小程序再签」。
+CMD=("$PY" "$HERE/wxsign.py")
+HAS_ENSURE=""
+for a in ${1+"$@"}; do
+  [ "$a" = "--ensure" ] && HAS_ENSURE=1
+  CMD+=("$a")
+done
+[ -n "$HAS_ENSURE" ] || CMD+=(--ensure)
+"${CMD[@]}"
 RC=$?
 log "===== 结束（退出码 $RC）====="
 exit $RC

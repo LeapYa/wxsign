@@ -390,6 +390,18 @@ docker exec woc-hook tail -5 /tmp/wmpf.log     # 期望看到 [frida] script loa
 | `WXSIGN_PYTHON` | `/usr/bin/python3`（青龙自带的） |
 | `WXSIGN_HOME_CONTAINER` | 脚本在**青龙容器里**的路径，即 `/ql/data/scripts/wxsign` |
 | `WXSIGN_REGISTER_PHONE` | 可选。配了走 API 直连注册；不配则走微信授权弹窗（不需要手机号） |
+| `WXSIGN_APPS` | 可选。只签这几个，逗号分隔的 slug 多选（如 `lakeke,laicai`）。**不配 = all** |
+| `WXSIGN_EXCLUDE` | 可选。永不签这几个，逗号分隔的多选（如 `jiucun`）。**优先级最高** |
+
+`WXSIGN_APPS` / `WXSIGN_EXCLUDE` 填的是 **slug**（`wxsign.py --list` 第一列）：
+`lakeke` 辣可可 · `laicai` 来菜 · `jiucun` 九村烤脑花 · `jiuzhujianghu` 酒煮江湖。
+
+- 白名单收窄范围，黑名单从范围里剔人 —— 两个可以同时用。
+- 黑名单**盖过白名单和 `--all`**：`WXSIGN_APPS` 里写了、或者命令行加了 `--all`，照样排除掉。
+  所以「这个号我永远不签」只写一条就够。
+- 写 `all` 或不配，都等于不限制。
+- slug 拼错不会静默忽略，日志里会打一行 ⚠️ —— 免得「配了却什么都没跑」查半天。
+- 想看当前到底会签哪些：`bash /ql/data/scripts/wxsign/sign.sh --list`。
 
 > 本合集**不需要** `WXSIGN_MINIAPP_PY` —— 打开小程序用的 `wxopen.py` 就在仓库里，
 > 引擎每次跑会自动投递到微信容器（`ensure_helpers()`）。
@@ -402,6 +414,10 @@ docker exec woc-hook tail -5 /tmp/wmpf.log     # 期望看到 [frida] script loa
 |---|---|---|
 | 小程序签到合集 | `bash /ql/data/scripts/wxsign/sign.sh` | `10 8 * * *` |
 | 保活（可选） | `bash /ql/data/scripts/wxsign/sign.sh --ensure-only` | `0 */2 * * *` |
+
+> `sign.sh` 把参数**原样透传**给引擎，所以想临时换范围不用改环境变量：
+> `bash .../sign.sh --apps lakeke,laicai` / `--exclude jiucun` / `lakeke` 都能用。
+> 影响范围的口径见[上面那张表](#5-配青龙)的 `WXSIGN_APPS` / `WXSIGN_EXCLUDE`。
 
 > 「保活」只保**进程活着**，**保不了登录态** —— 微信一掉登录就得人拿手机确认（[第 6 节](#6-微信侧常见故障这部分是运维的大头) 开头）。
 > 掉登录时 `sign.sh` 会以退出码 2 / 3 中止，不会假装成功。

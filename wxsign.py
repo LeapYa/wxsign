@@ -15,12 +15,18 @@
                               —— 大转盘/抽奖活动壳，签到属于其中一种活动类型
 
 用法（在青龙「定时任务」里写命令）：
-    python3 <脚本目录>/wxsign.py --list              看品牌表
+    python3 <脚本目录>/wxsign.py --list              看品牌表 + 本次生效范围
     python3 <脚本目录>/wxsign.py <slug> --probe      只探测（会员 + 活动列表），不签到
     python3 <脚本目录>/wxsign.py <slug> --discover   把该租户所有活动的原始 JSON 打出来
     python3 <脚本目录>/wxsign.py <slug> --register   只做会员注册（不是会员时用）
     python3 <脚本目录>/wxsign.py <slug>              该品牌签到（不是会员会自动注册再签）
     python3 <脚本目录>/wxsign.py --all [--ensure]    所有 enabled 品牌（--ensure 会先开小程序并刷 token）
+
+签哪几个（可选，默认 all）—— 详见 resolve_targets()：
+    --apps a,b,c / WXSIGN_APPS=a,b,c        白名单：只签这几个（逗号分隔的多选；写 all / * 等于不限制）
+    --exclude a,b / WXSIGN_EXCLUDE=a,b      黑名单：永不签这几个（优先级最高，白名单/--all 都排除得掉）
+    都不配 = all（brands.json 里 enabled 的品牌）。位置参数（`wxsign.py a b`）等同白名单，
+    且盖过 WXSIGN_APPS —— 命令行是当场意图，比环境变量优先。
 
 会员注册：签到接口要求 memberId/cardId/cardNo，只有会员才有。不是会员时脚本会**自动注册**
     （POST /api/member/register，明文手机号；该接口在每个吾享游戏型包里都有）。
@@ -33,6 +39,8 @@
     WXSIGN_HOME                 配置根目录，默认本脚本所在目录
     WXSIGN_NOTIFY_PY            可选：notify.py 绝对路径（复用多渠道通知）
     WXSIGN_PYTHON               容器内 python3 路径，默认 python3
+    WXSIGN_APPS                 可选：只签这几个（slug，逗号分隔，可多选；默认 all）
+    WXSIGN_EXCLUDE              可选：不签这几个（slug，逗号分隔，可多选；优先级最高）
 
 退出码：0 = 全部成功（含「今日已签到」）；1 = 有失败。
 每个品牌收尾打印一行便于 grep：  RESULT <slug> code=<业务码> msg=<说明>
@@ -157,6 +165,115 @@ def reset_identity(slug, dry_run=False):
         return len(drop)
     save_env(slug, keep)
     return len(drop)
+
+
+# ───────────────────── 选哪些小程序（默认 all，可白名单 / 可排除） ─────────────────────
+
+# 这些 flag 后面跟一个值（值**不是**品牌 slug），解析位置参数时要跳过。
+_FLAGS_WITH_VALUE = ("apps", "only", "exclude", "skip", "find")
+
+
+def split_list(v):
+    """逗号/分号/空白/中文逗号分隔 → 去重保序的列表。这样 `a,b`、`a b`、`a，b` 都认。"""
+    out = []
+    for x in re.split(r"[,，;；\s]+", str(v or "")):
+        x = x.strip()
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def positional(argv):
+    """取位置参数（品牌 slug），跳过 `--flag` 与 `--flag value` 里的那个 value。
+
+    为什么必须跳：`--exclude guliantian` 里的 `guliantian` 不是要签的品牌，
+    当成位置参数就会反着来（本想排除，结果变成只签它）。
+    """
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("--"):
+            name = a[2:].split("=", 1)[0]
+            if name in _FLAGS_WITH_VALUE and "=" not in a:
+                skip = True            # 它的下一个 token 是值，不是品牌名
+            continue
+        out.append(a)
+    return out
+
+
+def pick_opt(argv, flags, envs):
+    """取「多选列表」型配置：命令行优先于环境变量。
+    支持 `--apps a,b` 与 `--apps=a,b` 两种写法。
+    → (列表 或 None, 来源说明)"""
+    for f in flags:
+        for i, a in enumerate(argv):
+            if a == "--" + f:
+                return split_list(argv[i + 1] if i + 1 < len(argv) else ""), "--" + f
+            if a.startswith("--" + f + "="):
+                return split_list(a.split("=", 1)[1]), "--" + f
+    for e in envs:
+        if os.environ.get(e):
+            return split_list(os.environ[e]), e
+    return None, ""
+
+
+def resolve_targets(cfg, argv):
+    """决定这次跑哪些品牌。→ (brands 列表, 说明行列表)
+
+    三层，从上到下依次生效：
+      ① 默认        → brands.json 里 enabled=true 的全部（这就是「默认 all」）
+      ② 白名单      → `--apps a,b` / `WXSIGN_APPS=a,b`（写 all / * 等于不限制）
+                      位置参数 `wxsign.py a b` 也算白名单，且**盖过** WXSIGN_APPS
+                      —— 命令行是当场意图，比环境变量优先
+      ③ 黑名单      → `--exclude a,b` / `WXSIGN_EXCLUDE=a,b`
+                      **永远最高优先级**：白名单写进去、`--all` 也会被排除掉。
+                      这是刻意的 —— 「这个号我永远不签」应该是一条硬约束。
+
+    白名单 / 黑名单里的 slug 在 brands.json 找不到时只警告、不静默忽略
+    （拼错一个字母就什么都不跑、还看不出为什么，很难排查）。
+    """
+    by_slug = {b["slug"]: b for b in cfg["brands"]}
+    all_enabled = [b for b in cfg["brands"] if b.get("enabled")]
+
+    pos = positional(argv)
+    if pos:
+        # 显式点名的品牌不查 enabled —— 想单跑一个停用的号（比如重新探测）应当允许
+        base = [by_slug[s] for s in pos if s in by_slug]
+        unknown_want, how = [s for s in pos if s not in by_slug], "命令行指定"
+    elif "--all" in argv:
+        base, unknown_want, how = list(all_enabled), [], "--all"
+    else:
+        raw, src = pick_opt(argv, ("apps", "only"), ("WXSIGN_APPS", "WXSIGN_ONLY"))
+        if raw and any(x.lower() in ("all", "*") for x in raw):
+            raw, src = None, (src + "（写了 all/*，当成不限制）")
+        if raw is None:
+            base, unknown_want = list(all_enabled), []
+            how = src or "默认（brands.json 里 enabled 的品牌）"
+        else:
+            base = [by_slug[s] for s in raw if s in by_slug]
+            unknown_want = [s for s in raw if s not in by_slug]
+            how = src
+
+    drops, dhow = pick_opt(argv, ("exclude", "skip"), ("WXSIGN_EXCLUDE", "WXSIGN_SKIP"))
+    drops = drops or []
+    unknown_drop = [s for s in drops if s not in by_slug]
+    kept = [b for b in base if b["slug"] not in drops]
+    cut = [b for b in base if b["slug"] in drops]
+
+    lines = ["范围：%s → 选中 %d 个：%s"
+             % (how, len(kept), "、".join(b["name"] for b in kept) or "(空)")]
+    if cut:
+        lines.append("排除：%s → 去掉 %d 个：%s"
+                     % (dhow or "WXSIGN_EXCLUDE", len(cut), "、".join(b["name"] for b in cut)))
+    elif dhow:
+        lines.append("排除：%s 已配，但不在本次范围内" % dhow)
+    for s in unknown_want:
+        lines.append("⚠️ 白名单里的「%s」不在 brands.json（拼错了？），已忽略" % s)
+    for s in unknown_drop:
+        lines.append("⚠️ 排除名单里的「%s」不在 brands.json（拼错了？），已忽略" % s)
+    return kept, lines
 
 
 def jwt_exp(tok):
@@ -825,50 +942,54 @@ def main():
                 % (b["slug"], b["name"], b["miniapp"], b["appid"],
                    "启用" if b.get("enabled") else "停用",
                    "（已联调）" if b.get("verified") else ""))
+        log("")
+        for line in resolve_targets(cfg, argv)[1]:
+            log("  " + line)
         log("\n用法：wxsign.py --find <关键词>                     自动发现该品牌的 appId（不用手抄）")
         log("      wxsign.py <slug> [--probe|--discover|--register|--ensure]")
-        log("      wxsign.py --all [--ensure]")
-        log("      wxsign.py <slug> --reset-identity     换了微信账号后清掉旧凭证")
+        log("      wxsign.py --all [--ensure]                    所有 enabled 品牌")
+        log("      wxsign.py --apps a,b [--exclude c]            只签 a、b（可多选），不签 c（可多选）")
+        log("      wxsign.py <slug> --reset-identity             换了微信账号后清掉旧凭证")
         log("      <slug> 不带参数 = 直接签到（不是会员会自动注册，见 --register）")
+        log("\n  签哪几个也可以用环境变量配（青龙「环境变量」页）：")
+        log("      WXSIGN_APPS=a,b        白名单，逗号分隔的多选；不配 = all")
+        log("      WXSIGN_EXCLUDE=c,d     黑名单，优先级最高，谁都排除得掉")
         return 0
 
     # 换微信账号（小号验证完换大号）后，旧账号的 openId 等会一直粘在 env 里，
     # 症状是「抓不到身份 / invalid code」且看不出跟换号有关 —— 用这条清掉。
     if "--reset-identity" in argv:
         cfg = load_brands()
-        by_slug = {b["slug"]: b for b in cfg["brands"]}
-        if "--all" in argv:
-            targets = [b["slug"] for b in cfg["brands"] if b.get("enabled")]
-        else:
-            targets = [s for s in argv if not s.startswith("--") and s in by_slug]
+        targets, scope = resolve_targets(cfg, argv)
         if not targets:
             log("用法：wxsign.py <slug> --reset-identity   # 清该品牌的账号凭证")
             log("      wxsign.py --all --reset-identity   # 所有启用的品牌")
             log("      （加 --dry-run 只看会清什么，不写文件）")
             return 2
+        for line in scope:
+            log("  " + line)
         log("换微信账号后要清掉这些字段：它们是绑在账号上的，且脚本不会自动覆盖。")
-        for s in targets:
-            reset_identity(s, dry_run="--dry-run" in argv)
+        for b in targets:
+            reset_identity(b["slug"], dry_run="--dry-run" in argv)
         log("\n清完 %d 个品牌。接着跑一次就会重新抓身份：" % len(targets))
         log("  python3 wxsign.py --all --ensure")
         log("  新账号在各品牌都不是会员 → 会自动走一遍注册（微信授权弹窗，不用手机号）。")
         return 0
 
     cfg = load_brands()
-    by_slug = {b["slug"]: b for b in cfg["brands"]}
     do_ensure = "--ensure" in argv
     probe = "--probe" in argv
     discover = "--discover" in argv
     register_only = "--register" in argv
 
-    if "--all" in argv:
-        targets = [b for b in cfg["brands"] if b.get("enabled")]
-    else:
-        slugs = [a for a in argv if not a.startswith("--")]
-        targets = [by_slug[s] for s in slugs if s in by_slug]
-        if not targets:
-            log("[ERROR] 不认识的品牌 slug：%s" % slugs)
-            return 2
+    # 默认 all（enabled 的），可用白名单收窄、黑名单排除 —— 见 resolve_targets()
+    targets, scope = resolve_targets(cfg, argv)
+    for line in scope:
+        log("  " + line)
+    if not targets:
+        log("[ERROR] 本次没有要跑的小程序 —— 看上面「范围 / 排除」两行。")
+        log("        可选 slug：%s" % "、".join(b["slug"] for b in cfg["brands"]))
+        return 2
 
     okc = failc = 0
     lines = []

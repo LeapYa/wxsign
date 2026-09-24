@@ -64,7 +64,7 @@
 ## 三、常用命令
 
 ```bash
-python3 wxsign.py --list              # 看品牌表（含启用 / 已联调状态）
+python3 wxsign.py --list              # 看品牌表（含启用 / 已联调状态）+ 本次生效范围
 python3 wxsign.py --find <关键词>      # 自动搜出该品牌名下的小程序并读出 appId（不用手抄）
 python3 wxsign.py <slug> --probe      # 探测：直接告诉你这个号能不能签，不签到
 python3 wxsign.py <slug> --discover   # 打活动原始 JSON（接入新品牌时用来找 gameId）
@@ -84,6 +84,26 @@ python3 wxsign.py --all --ensure      # 所有启用的品牌
 RESULT lakeke code=415 msg=今日已签到
 ```
 
+### 签哪几个（默认 all）
+
+不配就是 **all** —— `brands.json` 里 `enabled` 的全部。想收窄就加白名单，想永久跳过某个就加黑名单：
+
+```bash
+python3 wxsign.py --apps lakeke,laicai --ensure   # 只签辣可可、来菜（多选）
+python3 wxsign.py --exclude jiucun --ensure       # 除九村烤脑花以外，其余全签
+python3 wxsign.py --apps all                      # 明确不限制
+```
+
+- slug 是 `--list` 第一列那个；逗号分隔，可多选（中文逗号 / 空格 / 分号也能当分隔符）。
+- **黑名单优先级最高** —— 白名单里写了、或者用了 `--all`，照样排除掉。
+- 命令行盖过环境变量；直接写 slug（`wxsign.py lakeke`）等同于白名单。
+- 拼错的 slug 会打警告、不静默忽略（否则「配了却什么都没跑」很难查）。
+- 起跑前会把「范围 / 排除」两行打进日志，跑完看日志就能确认这次到底签了哪些。
+
+定时任务要同样的效果：`sign.sh` 的参数**原样透传**（`bash sign.sh --apps lakeke,laicai`），
+也可以做成青龙环境变量 `WXSIGN_APPS` / `WXSIGN_EXCLUDE` ——
+写法见 [DEPLOY.md 第 5 节](docs/DEPLOY.md#5-配青龙)。
+
 ---
 
 ## 四、目录
@@ -92,6 +112,7 @@ RESULT lakeke code=415 msg=今日已签到
 wxsign/
 ├── wxsign.py            引擎：发现 appId / 探测 / 注册 / 签到 / 批量（青龙直接调它）
 ├── sign.sh              青龙总入口：自检 → 掉登录就点登录（要手机确认）→ 逐品牌签到
+│                        参数原样透传（`--apps` / `--exclude` / 位置 slug）
 ├── brands.json          品牌表（品牌名 / 小程序名 / appId / gameId / 启用状态）
 ├── brands/              每品牌凭证（自动生成，含 token，别提交）
 │   └── _template.env
@@ -308,7 +329,8 @@ python3 wxsign.py <slug>
    详见 [DEPLOY.md 第 6 节](docs/DEPLOY.md#6-微信侧常见故障这部分是运维的大头)。
 2. **青龙与微信必须同机**（[上面那节](#二跑起来)的前提）—— token 靠微信客户端产生，服务端自举不了。
    除此之外**零手工**：身份、token、会员信息、活动 id 都由脚本自己取。
-3. **同一时刻只能开一个小程序** → `--all` 是串行的，每个品牌约 1~2 分钟。
+3. **同一时刻只能开一个小程序** → 多个品牌是**串行**的，每个约 1~2 分钟。要提速就用
+   [上面那节](#签哪几个默认-all)把范围收窄。
 4. **注册走微信授权弹窗，不需要手机号**（已真机跑通）。配 `WXSIGN_REGISTER_PHONE`
    可改走 API 直连，但那条路**没真发过请求** —— 发出去就在账号上真实建会员。
 5. **扫码登录的过期检测是启发式的**：脚本只能判断「屏幕上有二维码」，
@@ -332,6 +354,3 @@ python3 wxsign.py <slug>
 
 本项目仅供个人学习与技术研究，只应用于**你自己的账号**，请遵守微信与各商户的用户协议。
 脚本刷出来的积分**可能被风控清零**，账号也可能受影响 —— 建议用闲置小号，风险自担。
-
-> ⚠️ 唯一要留意的：**别让微信掉登录** —— 一旦因重启掉登录，恢复时需要在手机上确认一次
-> （登录本身是一次性配置，见[第七节](#七已知限制)第 1 条）。

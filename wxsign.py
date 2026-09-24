@@ -45,6 +45,17 @@ HOME = os.environ.get("WXSIGN_HOME", HERE)
 # 同一个目录在宿主机与容器里的挂载点不同（青龙一般是 /ql/data/scripts/... ↔ /work/...），
 # 所以「容器内路径」单独一个变量；不设则与 HOME 相同。
 HOME_C = os.environ.get("WXSIGN_HOME_CONTAINER", HOME)
+# 微信实例容器里放辅助脚本的目录（reopen_miniapp.py / wxclean.py）
+CTMP = os.environ.get("WXSIGN_CTMP", "/tmp")
+
+
+def cpath(*parts):
+    """拼**容器内**路径：必须用正斜杠、且保留开头的 /。
+    ⚠️ 两个坑都踩过：
+      · 用 os.path.join 时，Windows 上会拼出反斜杠（/tmp\\x.py）→ 容器里「找不到文件」（exit 2）
+      · 对首段做 strip('/') → 变成相对路径（work/wxsign/...）→ ENOENT
+    """
+    return "/".join(str(p).rstrip("/") for p in parts if p not in ("", None))
 BRANDS_JSON = os.path.join(HOME, "brands.json")
 ENV_DIR = os.path.join(HOME, "brands")
 
@@ -170,11 +181,25 @@ def ensure_miniapp(brand):
     if not INSTANCE:
         log("  [ensure] 未设 WOC_INSTANCE，跳过自动开小程序")
         return False
+    # 先清残留的小程序窗口：上一次没关掉的窗口会盖在微信上，导致侧边栏点不中、面板认不出
+    # （实测：残留窗口上有隐私弹窗/悬浮提示时，关闭按钮点不中）
+    try:
+        c = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE,
+                            CPY, cpath(CTMP, "wxclean.py")],
+                           capture_output=True, text=True, timeout=300)
+        for line in ((c.stdout or "") + (c.stderr or "")).splitlines():
+            if line.startswith("[clean]") or c.returncode not in (0, 1):
+                log("  " + line)
+        if c.returncode not in (0, 1):
+            log("  [clean] rc=%s（不影响后续，继续试）" % c.returncode)
+    except Exception as e:
+        log("  [clean] 跳过（%s）" % e)
+
     # 用参数列表而非拼字符串：小程序名里有中文，拼命令行容易被引号吃掉
     args = ["docker", "exec", "-e", "DISPLAY=:1",
             "-e", "LAKEKE_MINIAPP=" + brand["miniapp"],
             "-e", "LAKEKE_KEYWORD=" + brand["keyword"],
-            INSTANCE, CPY, "/tmp/reopen_miniapp.py", "--loose"]
+            INSTANCE, CPY, cpath(CTMP, "reopen_miniapp.py"), "--loose"]
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=300)
         rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -184,8 +209,9 @@ def ensure_miniapp(brand):
     ok = rc in (0, 4)
     log("  [ensure] %s → rc=%s %s" % (brand["miniapp"], rc, "(已就绪)" if ok else "(可能没开成)"))
     for line in out.splitlines():
-        if line.startswith("[reopen]"):
-            log("     " + line)
+        # 出错了就把所有输出都打出来 —— 只过滤 [reopen] 会把真正的报错吞掉（踩过）
+        if line.startswith("[reopen]") or (not ok and line.strip()):
+            log("     " + line[:200])
     return ok
 
 
@@ -196,11 +222,18 @@ def refresh_token(brand, env, force=False):
     if not force and exp and exp - time.time() > 120:
         log("  [token] 仍有效（剩 %d 分钟），跳过刷新" % ((exp - time.time()) / 60))
         return True
-    cmd = ("docker exec %s sh -c 'cd %s && ENVFILE=%s WX_APPID=%s WX_MPID=%s "
-           "NODE_PATH=/opt/wmpf/node_modules node wxrefresh.js%s'"
-           % (HOOK, HOME_C, os.path.join(HOME_C, "brands", "%s.env" % brand["slug"]),
-              brand["appid"], env.get("WX_MPID", ""), " force" if force else ""))
-    rc, out = sh(cmd)
+    # ⚠️ 必须用参数列表：在 Windows 上 subprocess(shell=True) 走的是 cmd.exe，
+    #    它不认 POSIX 单引号，`sh -c '...'` 会被拆错（实测报 Unterminated quoted string）。
+    inner = ("cd %s && ENVFILE=%s WX_APPID=%s WX_MPID=%s "
+             "NODE_PATH=/opt/wmpf/node_modules node wxrefresh.js%s"
+             % (HOME_C, cpath(HOME_C, "brands", "%s.env" % brand["slug"]),
+                brand["appid"], env.get("WX_MPID", ""), " force" if force else ""))
+    args = ["docker", "exec", HOOK, "sh", "-c", inner]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=300)
+        rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        rc, out = 1, str(e)
     log("  [token] 刷新 rc=%s" % rc)
     for line in out.splitlines():
         if line.strip():

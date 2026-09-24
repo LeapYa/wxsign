@@ -95,7 +95,7 @@ wxsign/
 ├── brands.json          品牌表（品牌名 / 小程序名 / appId / gameId / 启用状态）
 ├── brands/              每品牌凭证（自动生成，含 token，别提交）
 │   └── _template.env
-├── docs/DEPLOY.md       从零部署：微信容器 + hook + 青龙 + 微信侧故障处理
+├── docs/DEPLOY.md       从零部署 + 后续运维：微信侧故障、多开实例、卸干净、换微信账号
 ├── wmpf/                hook 挂不上时的自救工具（部署阶段就要用一次）
 │   ├── check_wmpf.sh       验 WMPF 版本有没有对应偏移配置（纯只读）
 │   ├── hook_patch.sh       给上游打那两个必需的补丁（幂等，见 [DEPLOY.md 第 4.1 节](docs/DEPLOY.md#41-必须打的两个补丁)）

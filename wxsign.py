@@ -909,8 +909,25 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         if ensure_miniapp(brand):
             time.sleep(3)
             ok_token = refresh_token(brand, env, force=True)
+    if not ok_token and INSTANCE:
+        # 第二级（必须有，否则会「一崩到底」）：硬清小程序运行时 + 重启 hook + 重开。
+        #
+        # 为什么这一级不可省：WMPFDebugger **只在启动时 attach 一次**，而且只挂在**某一个**
+        # WeChatAppEx 进程上；而微信会为小程序起多个运行时进程。残留窗口一多，新开的小程序
+        # 就可能落在**没被挂上**的那个进程里 —— 表现是 `[enum] 有 wx 的上下文=[3,6,8]` 里
+        # 压根没有目标小程序、每个 ctx 都「拿不到 mpId」，然后报「token 刷新失败」。
+        # 实测：一批 52 个号里 80% 死在这一步，而只要硬清一次 + 重启 hook 就立刻正常。
+        # （日志里那句「没能换到 token（确认目标小程序已打开、且 appId 配置正确）」是**误导**的，
+        #   小程序其实开着、appId 也没错，只是 hook 没挂上它。）
+        log("  [retry] 还是换不到 → 硬清小程序运行时 + 重启 hook，再开一次")
+        clean_leftovers(hard=True)              # 内部会在杀掉运行时后自动重启 hook
+        if ensure_miniapp(brand):
+            time.sleep(3)
+            ok_token = refresh_token(brand, env, force=True)
     if not ok_token:
-        log("  [!] token 刷新失败——小程序没开成，或 appId 配错了（当前 %s）" % brand["appid"])
+        log("  [!] token 刷新失败 —— 三种可能：① 小程序没开成；② appId 配错；"
+            "③ **hook 没挂上这个运行时**（看上面几行 [enum]/[try] 里有没有目标 appId 的 ctx，"
+            "全是「拿不到 mpId」就是这种）。第 ③ 种脚本已自动硬清+重启 hook 重试过一轮。")
         log("RESULT %s code=notoken msg=token 不可用" % slug)
         return False, "notoken"
     env = load_env(slug)          # 刷新后重新读（身份可能刚被写进来）

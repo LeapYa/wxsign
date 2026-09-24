@@ -284,21 +284,85 @@ def in_wechat_main(buf, W, H):
     return len([b for b in bands if len(b) >= 8]) >= 6
 
 
-def entry_point(W, H):
-    """进入注册流程要点的那个按钮（签到/参与入口）。
-    品牌差异就在这里 —— 默认取「居中偏下」，可用 WXSIGN_REG_CLICK 覆盖。"""
+def color_density(buf, W, pred, box, step=2):
+    """bbox 内该颜色的像素占比 —— 用来区分「实心按钮」和「文字/线条/图片」。"""
+    x0, y0, x1, y1 = box
+    hit = tot = 0
+    for y in range(y0, y1 + 1, step):
+        base = y * W * 3
+        for x in range(x0, x1 + 1, step):
+            i = base + x * 3
+            tot += 1
+            if pred((buf[i], buf[i + 1], buf[i + 2])):
+                hit += 1
+    return (hit / float(tot)) if tot else 0.0
+
+
+def is_button(box, buf, W, pred, min_wf=0.25, min_ratio=2.5, min_density=0.45):
+    """按钮 = 够宽 + 够扁 + 实心。
+
+    三个条件缺一不可，因为实测踩过：
+      · 卡片里的**绿色农田图片**（320×380）会被当成绿按钮 → 用「够扁」(宽高比≥2.5) 排除；
+      · 页面上的**橙色文字行**（+1 / 日期）bbox 又宽又扁，会被当成大按钮 → 用「实心」(密度) 排除；
+      · 窄的橙色标签（如「打卡签到」110px）→ 用「够宽」(≥0.25W) 排除。
+    """
+    if not box:
+        return False
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    if w < W * min_wf or h <= 0 or (w / float(h)) < min_ratio:
+        return False
+    return color_density(buf, W, pred, box) >= min_density
+
+
+def page_hash(buf, W, H, step=16):
+    """页面的稀疏指纹 —— 用来判断「点完之后页面到底有没有变」。
+
+    为什么需要：实测踩过 —— 小程序**刚打开 ~2 秒**时页面已经渲染好（截图看着正常），
+    但点击会被丢掉（事件还没就绪）。不验证的话，脚本会以为「点了但没反应」，
+    接着一路滚动，最后什么也没发生。
+    """
+    h = 0
+    for y in range(0, H, step):
+        base = y * W * 3
+        for x in range(0, W, step):
+            i = base + x * 3
+            h = (h * 31 + buf[i] + buf[i + 1] * 3 + buf[i + 2] * 7) & 0xFFFFFFFF
+    return h
+
+
+def entry_points(W, H):
+    """「进入注册流程」要点的候选位置，**按顺序**尝试。
+
+    为什么是多个：吾享的注册入口通常是**两跳** ——
+      ① 活动列表页的第一张活动卡（点进去）
+      ② 签到/活动页里滚出来的「立即签到 / 参与」按钮
+    实测（来菜）：①在约 (0.50, 0.31)，②在约 (0.42, 0.43)。两者位置不固定，
+    所以做成候选列表 + 滚动兜底；页面上的**橙色大按钮**会优先被识别并点击（见 main）。
+
+    可用 WXSIGN_REG_CLICK="0.50,0.31;0.42,0.43" 覆盖（分号分隔多个，比例或像素）。
+    """
     raw = envv("WXSIGN_REG_CLICK").replace(" ", "")
+    pts = []
     if raw:
-        parts = raw.split(",")
-        if len(parts) == 2:
+        for seg in raw.split(";"):
+            if not seg:
+                continue
+            parts = seg.split(",")
+            if len(parts) != 2:
+                continue
             try:
                 x, y = float(parts[0]), float(parts[1])
             except ValueError:
-                x = y = 0
-            if x and y:
-                return (int(x * W) if x < 1 else int(x),
-                        int(y * H) if y < 1 else int(y))
-    return int(W * 0.50), int(H * 0.64)
+                continue
+            pts.append((int(x * W) if x < 1 else int(x),
+                        int(y * H) if y < 1 else int(y)))
+    if pts:
+        return pts
+    # 默认只给一个候选（活动列表的第一张卡）。给多个反而危险 ——
+    # 页面切换后同一个坐标的含义会变（实测：在签到页点 (0.42,0.43) 会落到日历区）。
+    # 剩下交给「橙色大按钮识别 + 滚动」，那两条比猜坐标可靠。
+    return [(int(W * 0.50), int(H * 0.31))]
 
 
 # ───────────────────────────── 检测 ─────────────────────────────
@@ -366,9 +430,9 @@ def main():
         return
 
     W, H = display_size()
-    print("[ui] 屏幕 %dx%d INDEX=%s PHONE=%s OCR=%s 入口=%s"
+    print("[ui] 屏幕 %dx%d INDEX=%s PHONE=%s OCR=%s"
           % (W, H, a.index or "(未设)", a.phone or "(未设)",
-             "有" if ocr_ok() else "无", entry_point(W, H)))
+             "有" if ocr_ok() else "无"))
 
     if in_wechat_main(grab(W, H), W, H):
         print("[ui] ✗ 当前是**微信主窗口**，不在小程序页面 ——"
@@ -376,24 +440,35 @@ def main():
         grab_png(W, H, "reg_wrong_page.png")
         sys.exit(4)
 
-    scroll = int(envv("WXSIGN_REG_SCROLL", default="6") or 0)
+    scroll = int(envv("WXSIGN_REG_SCROLL", default="0") or 0)
     if scroll:
-        scroll_down(scroll, W, H)      # 把注册入口滚进视野
+        scroll_down(scroll, W, H)      # 有些品牌一进来就要先滚（默认不滚，交给轮次逻辑）
         time.sleep(0.6)
     grab_png(W, H, "reg_00_start.png")
 
-    for step in range(1, 8):
+    cands = entry_points(W, H)
+    print("[ui] 入口候选=%s" % (cands,))
+    granted = False          # 是否已点过手机号弹窗的「允许」
+
+    # 能力升级：**优先按文案找元素**（CDP 读小程序渲染层 DOM），像素识别降级为兜底。
+    # 原因：颜色 + 宽高比 + 密度的判据跨品牌必然失效 —— 实测调了三轮仍在补漏洞
+    # （把卡片里的绿色农田图当按钮、把橙色文字行当按钮）。文案是同一套模板的，可靠得多。
+    # 注意边界：**微信原生弹窗不在小程序 DOM 里**（手机号授权的「允许」），那部分仍走像素。
+    ws = ctx = None
+    try:
+        import wxdom
+        ws, ctx = wxdom.open_dom()
+        print("[ui] CDP DOM %s" % ("可用（ctx=%d）→ 按文案定位按钮" % ctx if ws
+                                   else "不可用 → 退回像素识别"))
+    except Exception as e:
+        print("[ui] wxdom 不可用（%s）→ 退回像素识别" % e)
+    clicked = set()
+
+    for step in range(1, 11):
         buf = grab(W, H)
         d = detect(buf, W, H)
 
-        if not d["card"]:
-            x, y = entry_point(W, H)      # 签到 / 参与入口
-            print("[ui] 第%d步：无弹窗 → 点入口 (%d,%d)" % (step, x, y))
-            if not a.dry_run:
-                click(x, y)
-            time.sleep(3.5)
-            continue
-
+        # ① 手机号授权弹窗（最优先 —— 它出现说明流程就快完了）
         if d["phone_popup"]:
             png = grab_png(W, H, "reg_phone_popup.png")
             rows = d["rows"]
@@ -440,11 +515,36 @@ def main():
                 time.sleep(0.8)
                 g = d["green"]
                 click((g[0] + g[2]) // 2, (g[1] + g[3]) // 2)
+                granted = True
                 time.sleep(6)
             continue
 
+        # ② 小程序自己渲染的元素 → 按**文案**定位（跨品牌通用，完全不看颜色/尺寸）
+        if ws:
+            # ⚠️ 每轮都要重探 context：页面切换后是新 WebView（新 ctx），旧 ctx 的 DOM 还留着 ——
+            #    硬编码 ctx 会一直读到过期页面，然后在错误坐标上反复空点（踩过）。
+            now = wxdom.find_dom_ctx(ws, 20)
+            if now:
+                ctx = now
+            dd = wxdom.scan(ws, ctx)
+            target = None
+            for kw in wxdom.TARGETS:
+                cand = [it for it in wxdom.find(dd, (kw,))
+                        if (it["text"], it["cx"], it["cy"]) not in clicked]
+                if cand:
+                    target = cand[0]
+                    break
+            if target:
+                print("[ui] DOM 文案「%s」→ 点 (%d,%d)"
+                      % (target["text"].replace("\n", " ")[:24], target["cx"], target["cy"]))
+                if not a.dry_run:
+                    click(target["cx"], target["cy"])
+                clicked.add((target["text"], target["cx"], target["cy"]))
+                time.sleep(3)
+                continue
+
         g = d["green"]
-        if g and (g[2] - g[0]) >= W * 0.25:            # 隐私协议「同意并继续」
+        if is_button(g, buf, W, is_green):             # 隐私协议「同意并继续」
             print("[ui] 点「同意并继续」(%d,%d)" % ((g[0] + g[2]) // 2, (g[1] + g[3]) // 2))
             if not a.dry_run:
                 click((g[0] + g[2]) // 2, (g[1] + g[3]) // 2)
@@ -452,18 +552,48 @@ def main():
             continue
 
         o = d["orange"]
-        if o and (o[2] - o[0]) >= W * 0.25:            # 授权说明「授权」
-            print("[ui] 点「授权」(%d,%d)" % ((o[0] + o[2]) // 2, (o[1] + o[3]) // 2))
+        if is_button(o, buf, W, is_orange, min_density=0.5):
+            # 弹窗里的「授权」/ 页面上的「立即签到」「参与」—— 都是同一类大按钮
+            print("[ui] 点橙色大按钮「授权 / 立即签到」(%d,%d)"
+                  % ((o[0] + o[2]) // 2, (o[1] + o[3]) // 2))
             if not a.dry_run:
                 click((o[0] + o[2]) // 2, (o[1] + o[3]) // 2)
                 time.sleep(4)
             continue
 
-        print("[ui] 未识别的弹窗，停止（截图见 %s）" % SHOT_DIR)
-        grab_png(W, H, "reg_unknown.png")
-        sys.exit(3)
+        # ④ 没识别到按钮 —— 已点过「允许」且页面安静了，就认为流程结束
+        if granted:
+            print("[ui] 已点过「允许」，页面不再有弹窗 → 流程结束（结果以接口复查为准）")
+            grab_png(W, H, "reg_done.png")
+            return
 
-    print("[ui] 流程走完（截图见 %s）" % SHOT_DIR)
+        # 否则：先按候选入口推进（活动卡 → 签到页），候选用完就滚动把按钮露出来
+        if step <= len(cands):
+            x, y = cands[step - 1]
+            print("[ui] 第%d步：无按钮 → 点入口候选#%d (%d,%d)" % (step, step, x, y))
+            if not a.dry_run:
+                h0 = page_hash(buf, W, H)
+                changed = False
+                for attempt in range(1, 4):
+                    click(x, y)
+                    time.sleep(2.5)
+                    buf2 = grab(W, H)
+                    if page_hash(buf2, W, H) != h0:
+                        print("     → 页面已变化（第 %d 次点击生效）" % attempt)
+                        changed = True
+                        break
+                    print("     → 页面没变，重试点击（%d/3）" % attempt)
+                if not changed:
+                    print("     ⚠️ 点 3 次页面都没变 —— 坐标可能不对，可调 WXSIGN_REG_CLICK")
+        else:
+            print("[ui] 第%d步：无按钮 → 滚动找「立即签到」" % step)
+            if not a.dry_run:
+                scroll_down(3, W, H)
+        time.sleep(3.5)
+
+    print("[ui] 轮次用尽 —— 若没注册成功，看 %s/reg_*.png 调 WXSIGN_REG_CLICK" % SHOT_DIR)
+    grab_png(W, H, "reg_end.png")
+    sys.exit(3)
 
 
 if __name__ == "__main__":

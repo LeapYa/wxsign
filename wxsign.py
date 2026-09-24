@@ -311,7 +311,8 @@ def ensure_helpers():
     if not INSTANCE:
         return False
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
-            ("wxfind.py", "wxcdp.py", "pkgprobe.py", "wxclean.py", "wxopen.py", "wxreg.py")]
+            ("wxfind.py", "wxcdp.py", "wxdom.py", "pkgprobe.py", "wxclean.py",
+             "wxopen.py", "wxreg.py")]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖
@@ -496,6 +497,21 @@ def pick_activity(items, want=("签到", "打卡", "sign")):
     return None, "列表里没有签到类活动（共 %d 个）" % len(items)
 
 
+def discover_lot_gameid(env):
+    """lot 型：从活动列表里认出签到活动的 id —— 这个能自动，不用进页面抄。
+    返回 (gameId, 说明)。只有一个活动时直接用那一个。"""
+    r, items = lot_list(env)
+    if str(r.get("code")) != CODE_OK:
+        return "", "活动列表接口 code=%s msg=%s" % (r.get("code"), r.get("msg"))
+    act, why = pick_activity(items)
+    if not act:
+        return "", why
+    for k in ("gameId", "id"):
+        if act.get(k):
+            return str(act[k]), "%s「%s」" % (why, act.get("name") or act.get("title") or "")
+    return "", "活动项里没有 id 字段"
+
+
 def do_sign(brand, env):
     """返回 (是否成功, 业务码, 说明)"""
     slug = brand["slug"]
@@ -504,22 +520,35 @@ def do_sign(brand, env):
     game_id = env.get("WX_GAMEID") or brand.get("gameid", "")
     third = env.get("WX_THIRDSHOPID", "")
 
+    # lot 型的 gameId 能直接从活动列表认出来（sign 型不行，得进签到页抄一次）。
+    # ⚠️ 必须放在「查会员 / 注册」**之前** —— 注册接口要 gameId；
+    #    否则非会员的品牌会拿着空 gameId 去注册（实测来菜就是这个情况）。
+    if not game_id and brand.get("carrier") == "lot":
+        gid, why = discover_lot_gameid(env)
+        if gid:
+            game_id = gid
+            env["WX_GAMEID"] = gid
+            save_env(slug, env)
+            log("  [discover] %s → gameId=%s" % (why, gid))
+        else:
+            log("  [discover] 没能从活动列表认出 gameId（%s）" % why)
+
     r, mem = member_info(env, game_id, third)
     code = str(r.get("code"))
     if code in (CODE_AUTH_BAD, CODE_AUTH_EXP):
         return False, code, "token 失效（%s）→ 重跑 wxrefresh.js" % r.get("msg")
     if code == CODE_NOT_MEMBER:
-        # 还不是会员 → 自动注册（照抄页面源码的 registerVip）。同一个人可在多个品牌各注册一次。
+        # 还不是会员 → 自动注册。同一个人可在多个品牌各注册一次。
         ok, msg = register_member(brand, env)
         log("  [register] %s" % msg)
-        if not ok:
-            return False, code, "「%s」自动注册未成功：%s" % (brand["name"], msg)
+        # ⚠️ 不管注册那条路报什么，都复查一次接口：UI 脚本的退出码只能说明
+        #    「流程有没有跑完」，不能证明注册结果（页面可能已经注册成功，而它没识别到）。
         time.sleep(2)
         r, mem = member_info(env, game_id, third)
         code = str(r.get("code"))
         if code != CODE_OK:
-            return False, code, "注册后复查 /api/member/single 仍失败（code=%s msg=%s）" % (
-                code, r.get("msg"))
+            return False, code, ("自动注册未成功（%s）→ 复查 /api/member/single 仍 code=%s msg=%s"
+                                 % (msg, code, r.get("msg")))
         log("  [register] 复查通过，已是「%s」会员" % brand["name"])
     if code != CODE_OK:
         log("  [member] code=%s msg=%s" % (code, r.get("msg")))

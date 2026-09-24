@@ -41,12 +41,11 @@
 
 ### 前提
 
-青龙与微信容器必须在**同一台宿主机**上 —— 青龙要调宿主 docker 去操作微信容器
-（token 靠微信客户端产生，服务端没法自己生成）。
+青龙、微信容器、hook 容器必须在**同一台宿主机**上 —— 青龙要调宿主 docker 去操作微信容器
+（token 靠微信客户端当场产生，服务端没法自己生成）。
 
-微信容器用[云微 WechatOnCloud](https://github.com/Gloridust/WechatOnCloud) 起，
-再按辣可可项目（`lakeke-sign`）的 `DEPLOY-QINGLONG.md` 挂好 `woc-hook`
-（WMPFDebugger 旁挂容器，用来抓 jsCode）。这部分比较长，一次配好就不用再动。
+从零怎么搭（装 Docker、起微信容器、验 WMPF 版本、挂 hook、打补丁、建青龙）
+见 **[docs/DEPLOY.md](docs/DEPLOY.md)**，本仓库自带，一次配好就不用再动。
 
 ### 青龙环境变量
 
@@ -54,11 +53,12 @@
 WOC_INSTANCE=woc-wx-xxxxxxxx      # 微信实例容器名
 WOC_HOOK=woc-hook                 # 旁挂 hook 容器名
 WXSIGN_PYTHON=/usr/bin/python3
-WXSIGN_HOME_CONTAINER=/ql/data/scripts/wxsign    # 脚本在容器里的路径
-WXSIGN_MINIAPP_PY=/ql/data/scripts/lakeke-sign/reopen_miniapp.py   # 复用辣可可那份开小程序脚本
-LAKEKE_HOOK_DIR=/ql/data/scripts/lakeke-sign                       # 复用它的 hook_up.sh / wxlogin.py
+WXSIGN_HOME_CONTAINER=/ql/data/scripts/wxsign   # 脚本在容器里的路径
 WXSIGN_REGISTER_PHONE=13800000000   # 可选：不是会员时自动注册用
 ```
+
+> 打开小程序用的 `wxopen.py`、读 appId 用的 `wxcdp.py` 等都在仓库里，
+> 引擎每次跑会**自动投递**到微信容器，不需要额外配置路径。
 
 ### 青龙定时任务
 
@@ -115,20 +115,24 @@ RESULT lakeke code=415 msg=今日已签到
 wxsign/
 ├── wxsign.py            引擎：发现 appId / 探测 / 注册 / 签到 / 批量（青龙直接调它）
 ├── sign.sh              青龙总入口：自检 → 掉登录就点登录 → 逐品牌签到
+├── brands.json          品牌表（品牌名 / 小程序名 / appId / gameId / 载体类型）
+├── brands/              每品牌凭证（自动生成，含 token，**别提交**）
+│   └── _template.env
+├── docs/
+│   └── DEPLOY.md        从零部署：微信容器 + hook + 青龙 + 微信侧故障处理
+├── wxopen.py            （容器内跑）开指定小程序；窗口/点击/安全关窗原语都在这里
 ├── wxfind.py            （容器内跑）按关键词搜小程序并读出 appId
 ├── wxident.js           （hook 容器内跑）身份采集，按 appId + mpId 挑上下文
 ├── wxrefresh.js         （hook 容器内跑）token 刷新，wx.login 换短效 JWT
 ├── wxcdp.py             （容器内跑）纯标准库 WebSocket + CDP，读小程序 appId
 ├── pkgprobe.py          （容器内跑）拆小程序包判供应商 / 签到能力
 ├── wxclean.py           （容器内跑）清残留小程序窗口（弹窗挡住关闭按钮时先遣散再关）
-├── brands.json          品牌表（品牌名 / 小程序名 / appId / gameId / 载体类型）
-├── brands/              每品牌凭证（自动生成，含 token，**别提交**）
-│   └── _template.env
+├── wxlogin.py           （容器内跑）微信掉登录时点登录 + 拉全屏
 └── README.md
 ```
 
-> 上面 5 个「容器内跑」的脚本不用你手动投递 —— 引擎每次跑都会自动
-> `docker cp` 到微信实例容器里（`ensure_helpers()`），改了代码立刻生效。
+> 标「容器内跑」的那些脚本不用你手动投递 —— 引擎每次跑都会自动
+> `docker cp` 到微信容器（`ensure_helpers()`），改了代码立刻生效。
 
 ---
 
@@ -228,10 +232,9 @@ python3 wxsign.py <slug>
 
 ---
 
-## 八、相关
+## 八、来历
 
-- 本仓库是从 **辣可可自动签到**（`lakeke-sign`）泛化出来的：
-  `wxident.js` / `wxrefresh.js` 是那边 `cdp_lakeke_ident.js` / `auth_refresh_node.js` 的去品牌化版本，
-  「打开指定小程序」复用那边的 `reopen_miniapp.py`。
-- 微信容器 + hook 的运维细节（WMPF 版本、场景号白名单、登录掉了怎么救）
-  见辣可可项目的 `DEPLOY-QINGLONG.md`。
+本仓库最早是给辣可可写单个签到脚本时攒下的一套微信侧自动化，后来发现吾享系品牌共用同一套后端，
+就把它泛化成了这个合集。所以 `wxident.js` / `wxrefresh.js` / `wxopen.py` 这些文件
+在早期的单品牌项目里都有对应的前身 —— 但**本仓库是自包含的**：
+跑起来只需要本目录 + 一个微信容器，不需要另一个仓库。

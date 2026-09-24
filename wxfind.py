@@ -21,7 +21,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, "/tmp")
-import reopen_miniapp as R      # noqa: E402
+
+import wxopen as R      # noqa: E402
 import wxcdp                    # noqa: E402
 import pkgprobe as P            # noqa: E402
 

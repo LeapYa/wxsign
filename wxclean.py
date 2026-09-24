@@ -11,7 +11,11 @@
   · 微信主窗口（WM_CLASS 含 wechat）一律不碰
   · 关窗走微信自己的关闭按钮（三道防线），**绝不 xdotool windowclose**
 
-用法（容器内）：DISPLAY=:1 python3 wxclean.py
+用法（容器内）：DISPLAY=:1 python3 wxclean.py [--restart-runtime]
+  --restart-runtime  常规手段都关不掉时，**杀掉小程序运行时进程（WeChatAppEx）**。
+                     ⚠️ 这会清掉所有小程序窗口，而且 hook 需要跟着重启（WMPFDebugger 是
+                     启动时 attach 一次的）—— 主进程 wechat 与登录态**不受影响**，
+                     比「重启微信」轻得多。实测这招能清掉用关闭按钮点不掉的卡死窗口。
 退出码：0 = 全部清掉（或本来就没有）；1 = 有没关掉的
 """
 import os
@@ -20,10 +24,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    import reopen_miniapp as R
+    import wxopen as R
 except ImportError:
     sys.path.insert(0, "/tmp")
-    import reopen_miniapp as R
+    import wxopen as R
 
 
 def leftover(wid, title):
@@ -92,8 +96,27 @@ def main():
             bad += 1
         time.sleep(1)
     left = [t for w, t in R.windows() if leftover(w, t)]
+    if left and "--restart-runtime" in sys.argv:
+        print("[clean] 常规手段清不掉 → 杀小程序运行时 WeChatAppEx（主进程与登录态不受影响）")
+        killed = 0
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open("/proc/%s/comm" % pid) as f:
+                    if f.read().strip() == "WeChatAppEx":
+                        os.kill(int(pid), 9)
+                        killed += 1
+            except Exception:
+                pass
+        print("[clean] 已杀 %d 个 WeChatAppEx 进程" % killed)
+        time.sleep(8)
+        left = [t for w, t in R.windows() if leftover(w, t)]
+        if killed:
+            print("[clean] ⚠️ 记得重启 hook 里的 WMPFDebugger（它启动时 attach 一次）")
     if left:
         print("[clean] ⚠️ 仍有残留：%s" % "、".join(left))
+        print("[clean]    加 --restart-runtime 可以硬清（会连带需要重启 hook）")
     return 1 if bad else 0
 
 

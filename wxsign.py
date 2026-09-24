@@ -232,9 +232,9 @@ def ensure_miniapp(brand):
 
     # 用参数列表而非拼字符串：小程序名里有中文，拼命令行容易被引号吃掉
     args = ["docker", "exec", "-e", "DISPLAY=:1",
-            "-e", "LAKEKE_MINIAPP=" + brand["miniapp"],
-            "-e", "LAKEKE_KEYWORD=" + brand["keyword"],
-            INSTANCE, CPY, cpath(CTMP, "reopen_miniapp.py"), "--loose"]
+            "-e", "WXSIGN_MINIAPP=" + brand["miniapp"],
+            "-e", "WXSIGN_KEYWORD=" + brand["keyword"],
+            INSTANCE, CPY, cpath(CTMP, "wxopen.py"), "--loose"]
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=300)
         rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -311,12 +311,10 @@ def ensure_helpers():
     if not INSTANCE:
         return False
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
-            ("wxfind.py", "wxcdp.py", "pkgprobe.py", "wxclean.py")]
-    mini = os.environ.get("WXSIGN_MINIAPP_PY", "") or os.path.join(HERE, "reopen_miniapp.py")
-    if os.path.exists(mini):
-        srcs.append((mini, cpath(CTMP, "reopen_miniapp.py")))
-    else:
-        log("  [helpers] 找不到 reopen_miniapp.py（设 WXSIGN_MINIAPP_PY 指过去）")
+            ("wxfind.py", "wxcdp.py", "pkgprobe.py", "wxclean.py", "wxopen.py")]
+    extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
+    if extra and os.path.exists(extra):
+        srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖
     ok = True
     for s, d in srcs:
         if not os.path.exists(s):

@@ -79,6 +79,74 @@ def screen():
     return (int(out[0]), int(out[1])) if len(out) == 2 else (1280, 1024)
 
 
+# ─────────────────── 标题栏字形探测 ───────────────────
+# 标题栏是**微信画的覆盖层**（不在小程序 DOM 里），所以只能按坐标点它 ——
+# 但**别写死坐标**：只要「标题栏某端有个图标」这个结构还在，探测就有效，
+# 换图标样式（`<` / `⌂`）、换字号、换主题色都不影响。
+#
+# 算法与 wxopen.probe_close_glyph 同源：逐像素与**本地底色**比
+# （同一行左右各 8~16 列的中位数），而不是用整条带的中位数 ——
+# 标题栏常常是**整条品牌色**（实测：来菜黄、酒煮江湖橙、签到页深红），
+# 全局底色会把浅色药丸和里面的字形并成一整块，直接检不出来。
+def _lum(buf, W, x, y):
+    o = (y * W + x) * 3
+    return (buf[o] + buf[o + 1] + buf[o + 2]) / 3.0
+
+
+def glyphs(buf, W, H, x0, y0, x1, y1, thr=40, dmin=8, dmax=16,
+           min_n=16, max_n=420, min_w=5, max_w=30, min_h=5, max_h=26):
+    """在像素矩形 [x0,x1]×[y0,y1] 内找「紧凑字形块」。
+
+    返回 [{'x','y','w','h','n','bbox'}]，按 x 升序（所以 [0] 就是**最靠左**的那个）。
+    尺寸筛选（默认 16~420 像素、宽 5~30、高 5~26）是用来排除背景噪点和整条色带的。
+    """
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(W - 1, int(x1)), min(H - 1, int(y1))
+    if x1 <= x0 or y1 <= y0:
+        return []
+
+    fg = set()
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            nb = []
+            for d in range(dmin, dmax + 1):
+                for xx in (x - d, x + d):
+                    if x0 <= xx <= x1:
+                        nb.append(_lum(buf, W, xx, y))
+            if len(nb) < 6:
+                continue
+            nb.sort()
+            if abs(_lum(buf, W, x, y) - nb[len(nb) // 2]) > thr:
+                fg.add((x, y))
+    if not fg:
+        return []
+
+    seen, out = set(), []
+    for p in fg:
+        if p in seen:
+            continue
+        stack, comp = [p], []
+        seen.add(p)
+        while stack:
+            cx, cy = stack.pop()
+            comp.append((cx, cy))
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                q = (cx + dx, cy + dy)
+                if q in fg and q not in seen:
+                    seen.add(q)
+                    stack.append(q)
+        xs = [c[0] for c in comp]
+        ys = [c[1] for c in comp]
+        w, h = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+        if not (min_n <= len(comp) <= max_n and min_w <= w <= max_w and min_h <= h <= max_h):
+            continue
+        out.append({"x": (min(xs) + max(xs)) // 2, "y": (min(ys) + max(ys)) // 2,
+                    "w": w, "h": h, "n": len(comp),
+                    "bbox": (min(xs), min(ys), max(xs), max(ys))})
+    out.sort(key=lambda g: g["x"])
+    return out
+
+
 if __name__ == "__main__":
     for w in windows():
         print("  %-8s %-16s %4d,%-4d %dx%d"

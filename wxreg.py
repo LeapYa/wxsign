@@ -33,6 +33,7 @@
 用法：python3 wxreg.py [--index N] [--phone X] [--dry-run] [--analyze a.png]
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -82,36 +83,84 @@ def display_size():
 # window.screenX/screenY = (435,124) 与窗口原点**完全一致**，
 # 且 innerHeight(779) > outerHeight(776) —— 顶部那条「⌂ 首页 ●●● ─ ⊙」
 # 是**覆盖层**，不占视口。所以：屏幕 = 窗口原点 + 页面坐标（DPR=1）。
-_WIN = [0, 0, 0, 0]
+_PAGE = {"x": 0, "y": 0, "w": 0, "h": 0, "dpr": 1.0, "src": "none"}
+
+_PAGE_JS = ("(function(){try{return JSON.stringify({sx:screenX,sy:screenY,"
+            "w:innerWidth,h:innerHeight,dpr:devicePixelRatio});}"
+            "catch(e){return 'ERR:'+(e.message||e)}})()")
+
+
+def refresh_page(ws=None, ctx=0):
+    """刷新「页面视口在哪、多大」。拿到返回 True。
+
+    ⭐ **优先问页面自己**（CDP 的 window.screenX/screenY/innerWidth/innerHeight）。
+    这一条同时兼容小程序的**两种形态**：
+
+      · **独立窗口**（现在的形态）：screenX/screenY 与 xdotool 报的窗口原点完全一致
+        （实测 410x776 @ (435,124)）。
+      · **侧边栏 / 分栏**（Windows 版微信那样，小程序嵌在主窗口里、不居中）：
+        按「窗口标题不是微信」去找独立小程序窗口会**直接失败**，但页面自己照样
+        报得出自己的位置与大小 —— 所以这条是向前兼容的关键。
+
+    CDP 拿不到时回退到「找独立小程序窗口」。两条都拿不到才算不知道页面在哪。
+    """
+    if ws and ctx:
+        try:
+            import wxdom
+            raw = wxdom.evaluate(ws, _PAGE_JS, ctx=ctx, timeout=3.0)
+            if raw and not str(raw).startswith("ERR"):
+                g = json.loads(raw)
+                if g.get("w") and g.get("h"):
+                    _PAGE.update(x=int(g["sx"]), y=int(g["sy"]),
+                                 w=int(g["w"]), h=int(g["h"]),
+                                 dpr=float(g.get("dpr") or 1), src="cdp")
+                    return True
+        except Exception:
+            pass
+    r = wxwin.rect()
+    if r:
+        _PAGE.update(x=r[0], y=r[1], w=r[2], h=r[3], dpr=1.0, src="window")
+        return True
+    _PAGE.update(src="none")
+    return False
+
+
+def page_rect():
+    """页面视口矩形 (x,y,w,h) —— 屏幕坐标 + 页面逻辑尺寸。"""
+    p = _PAGE
+    return (p["x"], p["y"], p["w"], p["h"])
 
 
 def win_rect():
-    """当前小程序窗口 (x,y,w,h)；没有则 None。"""
-    r = wxwin.rect()
-    if r:
-        _WIN[:] = r
-    return r
+    """（兼容旧名）刷新后再返回页面矩形；拿不到返回 None。"""
+    return page_rect() if refresh_page() else None
 
 
 def origin():
-    """页面 (0,0) 对应的屏幕坐标。没有小程序窗口时退化为 (0,0)。"""
-    r = win_rect()
-    return (r[0], r[1]) if r else (0, 0)
+    """页面 (0,0) 对应的屏幕坐标。"""
+    return (_PAGE["x"], _PAGE["y"])
 
 
 def win_size():
-    """页面坐标系下的尺寸（就是小程序窗口尺寸）。没有窗口时退化为屏幕。"""
-    r = win_rect()
-    return (r[2], r[3]) if r else display_size()
+    """页面逻辑尺寸（CSS 像素，与 DOM 坐标同一空间）；拿不到时退化为整屏。
+
+    DPR=1 时它就等于帧的像素尺寸（实测现在就是 1）。
+    """
+    p = _PAGE
+    return (p["w"], p["h"]) if p["w"] and p["h"] else display_size()
 
 
 def grab(W=0, H=0, win=True):
-    """抓一帧。win=True 抓**小程序窗口区域**（页面坐标空间），False 抓整屏。"""
+    """抓一帧。win=True 抓**页面视口**区域（页面坐标空间），False 抓整屏。
+
+    ⚠️ 用 `_PAGE`（`refresh_page()` 的结果），**不要**在这里重新探测窗口 ——
+    那样会把 CDP 报出来的侧边栏布局覆盖掉。所以调用前先 `refresh_page()`。
+    """
     if win:
-        r = win_rect()
-        if not r:
-            raise RuntimeError("没有小程序窗口（先把目标小程序打开）")
-        ox, oy, w, h = r
+        p = _PAGE
+        if not p["w"] or p["src"] == "none":
+            raise RuntimeError("不知道页面在哪：没有小程序窗口，也没读到 CDP")
+        ox, oy, w, h = p["x"], p["y"], p["w"], p["h"]
         if not W or not H:
             W, H = w, h
         src = "%s+%d,%d" % (DISPLAY, ox, oy)
@@ -139,13 +188,13 @@ def grab_file(path):
 
 
 def grab_png(W=0, H=0, name="shot.png", win=True):
-    """存一张 PNG。win=True 抓小程序窗口区域（页面坐标空间）。"""
+    """存一张 PNG。win=True 抓页面视口区域（页面坐标空间）。"""
     os.makedirs(SHOT_DIR, exist_ok=True)
     p = os.path.join(SHOT_DIR, name)
     if win:
-        r = win_rect()
-        if r:
-            ox, oy, w, h = r
+        pg = _PAGE
+        if pg["w"] and pg["src"] != "none":
+            ox, oy, w, h = pg["x"], pg["y"], pg["w"], pg["h"]
             src = "%s+%d,%d" % (DISPLAY, ox, oy)
             if not W or not H:
                 W, H = w, h
@@ -296,10 +345,12 @@ def text_bands(buf, W, H, y0, y1, x0, x1):
 
 
 def click(x, y, raw=False):
-    """点击。x,y 是**小程序页面坐标**（自动加窗口原点）；raw=True 时按屏幕坐标点。"""
+    """点击。x,y 是**页面坐标**（CSS 像素，与 DOM 坐标同一空间）→ 自动换算成屏幕坐标。
+    raw=True 时按屏幕坐标点（给主窗口 / 面板用）。"""
     if not raw:
-        ox, oy = origin()
-        x, y = ox + x, oy + y
+        p = _PAGE
+        x = p["x"] + int(round(x * p["dpr"]))
+        y = p["y"] + int(round(y * p["dpr"]))
     run("DISPLAY=%s xdotool mousemove %d %d; sleep 0.4; DISPLAY=%s xdotool click 1"
         % (DISPLAY, x, y, DISPLAY))
 
@@ -312,23 +363,33 @@ def scroll_down(times, W, H):
 
 
 # ── 标题栏左上角的「回去」按钮 ──
-# 页面栈 >1 层时它是「< 返回」，只剩 1 层时是「⌂ 回首页」—— 两者位置相同，
-# 都点它即可。实测（410x776 窗口）按钮中心在窗口内 (24,40)；
-# 按比例写更稳：0.058W / 0.052H。
-# ⚠️ 它是**微信画的覆盖层**，不在小程序 DOM 里，所以只能按坐标点。
-def nav_point():
-    r = win_rect()
-    if not r:
+# 它是**微信画的覆盖层**，不在小程序 DOM 里，所以只能按坐标点；
+# 但**坐标要探测，不要写死** —— 只要「标题栏某端有个图标」这个结构还在就有效，
+# 换图标（`<` / `⌂`）、换字号、换主题色都不影响。
+def nav_point(buf=None, W=0, H=0):
+    """标题栏左上角「返回 / 回首页」按钮的**页面坐标**。
+
+    ① **探测**：在标题栏带里找**最靠左的紧凑字形块**（`wxwin.glyphs`）。
+    ② 探测不到 → 退回实测比例（0.058W / 0.052H；410x776 下 = (23,40)）。
+    """
+    if buf and W and H:
+        g = wxwin.glyphs(buf, W, H, 0, int(H * 0.010), int(W * 0.22), int(H * 0.075))
+        if g:
+            b = g[0]
+            print("[nav] 探测到标题栏左端图标 @(%d,%d) %dx%d（%d 像素 / 共 %d 个候选）"
+                  % (b["x"], b["y"], b["w"], b["h"], b["n"], len(g)))
+            return (b["x"], b["y"])
+        print("[nav] 标题栏左端没探测到图标 → 退回经验比例")
+    if not _PAGE["w"]:
         return None
-    _, _, w, h = r
-    return int(w * 0.058), int(h * 0.052)
+    return (int(_PAGE["w"] * 0.058), int(_PAGE["h"] * 0.052))
 
 
-def go_back():
+def go_back(buf=None, W=0, H=0):
     """点标题栏左上角退回上一层（或回首页）。返回是否发了点击。"""
-    p = nav_point()
+    p = nav_point(buf, W, H)
     if not p:
-        print("[nav] 没有小程序窗口，无法返回")
+        print("[nav] 不知道页面在哪，无法返回")
         return False
     print("[nav] 点标题栏左上角「返回 / 回首页」%s（页面坐标）" % (p,))
     click(p[0], p[1])
@@ -538,15 +599,15 @@ def main():
         analyze(a.analyze)
         return
 
-    if not win_rect():
-        print("[ui] ✗ 没有小程序窗口 —— 注册必须站在目标小程序的签到/活动页上。"
+    if not refresh_page():
+        print("[ui] ✗ 不知道页面在哪 —— 注册必须站在目标小程序的签到/活动页上。"
               "先让引擎开小程序（--ensure），或手工在微信里打开一次。")
         grab_png(0, 0, "reg_wrong_page.png", win=False)
         sys.exit(4)
 
-    W, H = win_size()           # 页面坐标空间（= 小程序窗口尺寸，实测 410x776）
-    print("[ui] 小程序窗口 %dx%d @ %d,%d | 页面(0,0) → 屏幕 %s | INDEX=%s PHONE=%s OCR=%s"
-          % (W, H, win_rect()[0], win_rect()[1], origin(),
+    W, H = win_size()
+    print("[ui] 页面 %dx%d @ %s（来源 %s）| INDEX=%s PHONE=%s OCR=%s"
+          % (W, H, origin(), _PAGE["src"],
              a.index or "(未设)", a.phone or "(未设)", "有" if ocr_ok() else "无"))
 
     scroll = int(envv("WXSIGN_REG_SCROLL", default="0") or 0)
@@ -571,12 +632,22 @@ def main():
                                    else "不可用 → 退回像素识别"))
     except Exception as e:
         print("[ui] wxdom 不可用（%s）→ 退回像素识别" % e)
+    if ws:
+        # ⭐ 有 CDP 就用**页面自己报的**位置/尺寸，别用窗口探测 ——
+        #    这样将来小程序改成侧边栏/分栏（Windows 版那样）时，这条依然成立。
+        refresh_page(ws, ctx)
+        W, H = win_size()
+        print("[ui] 页面视口 %dx%d @ %s（来源 %s）" % (W, H, origin(), _PAGE["src"]))
     clicked = set()
     clicked_px = set()       # 像素捏到的按钮位置，点过就不再点（否则会在同一处反复空点、占着轮次不滚动）
     scroll_rounds = 0        # 连续「没点到任何东西、只能滚」的轮数（用来发现「跑偏了」）
     nav_tries = 0            # 已经「退回上一层重来」了几次（设上限，避免来回绕圈）
 
     for step in range(1, 17):
+        if ws:
+            # 每轮刷新页面几何：窗口可能被拖动；侧边栏形态下布局还可能随内容变化
+            refresh_page(ws, ctx)
+            W, H = win_size()
         buf = grab(W, H)
         d = detect(buf, W, H)
 
@@ -724,7 +795,7 @@ def main():
                 #    否则退回首页后会把同一个「打卡签到」再点一遍、又进签到页、又退回来，
                 #    来回绕圈直到轮次耗尽（实测踩过）。
                 clicked_px.clear()
-                if not a.dry_run and not go_back():
+                if not a.dry_run and not go_back(buf, W, H):
                     break
         time.sleep(3.5)
 

@@ -1,0 +1,130 @@
+{
+  "_comment": "吾享（wuuxiang / 天财商龙 CRM7）系小程序签到·活动合集 —— 品牌表。静态信息在此，凭证在 brands/<slug>.env。",
+  "engine_version": 1,
+  "crm_base": "https://scrm.wuuxiang.com/crm7game-api",
+  "login_url": "https://wechat.wuuxiang.com/i5xforyou/auth/login",
+  "_carrier": "sign = 该号包内含 /api/game/sign/*（专用签到模块）；lot = 只含 /api/game/lot/*（活动/抽奖壳，签到是其中一种活动类型）",
+  "_types": "sign 游戏型(签到/大转盘) | card 会员卡型 | mall 微商城型",
+  "brands": [
+    {
+      "slug": "lakeke",
+      "name": "辣可可",
+      "appid": "wxf8a17a14c0521576",
+      "keyword": "辣可可现炒黄牛肉",
+      "miniapp": "辣可可现炒黄牛肉i",
+      "carrier": "sign",
+      "type": "sign",
+      "enabled": true,
+      "verified": true,
+      "note": "参照实现，已真机联调通过（RESULT=200/415）"
+    },
+    {
+      "slug": "shudaxia",
+      "name": "蜀大侠",
+      "appid": "wx23e20185d7551afc",
+      "keyword": "蜀大侠",
+      "miniapp": "蜀大侠活动号",
+      "carrier": "lot",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "首页在跑「周三会员日…赢大奖」幸运抽奖（大转盘）"
+    },
+    {
+      "slug": "jiucun",
+      "name": "九村烤脑花",
+      "appid": "wx24f657cf389aa2ad",
+      "keyword": "九村烤脑花",
+      "miniapp": "九村烤脑花YX",
+      "carrier": "lot",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "首页在跑「26年会员签到」打卡签到（2026-09-01 ~ 2026-12-31）"
+    },
+    {
+      "slug": "nonggengji",
+      "name": "农耕记",
+      "appid": "wx3e0d5efb7c8e0e2d",
+      "keyword": "农耕记",
+      "miniapp": "农耕记转盘",
+      "carrier": "lot",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "首页在跑「积分秒杀菜品券」幸运抽奖（大转盘）"
+    },
+    {
+      "slug": "laicai",
+      "name": "来菜",
+      "appid": "wx944ea5f5f7c3dc1f",
+      "keyword": "来菜",
+      "miniapp": "来菜",
+      "carrier": "lot",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "首页在跑「【26】每日签到，半价吃招牌菜」打卡签到"
+    },
+    {
+      "slug": "jiuzhujianghu",
+      "name": "酒煮江湖",
+      "appid": "wx5fb9d9352a88e693",
+      "keyword": "酒煮江湖",
+      "miniapp": "积膳餐饮游戏",
+      "carrier": "lot",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "首页在跑「酒煮江湖日常积签到活动」打卡签到"
+    },
+    {
+      "slug": "rouchuanwang",
+      "name": "肉串汪",
+      "appid": "wxba723ab49cb3e098",
+      "keyword": "肉串汪",
+      "miniapp": "肉串汪活动入口",
+      "carrier": "lot",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "同款活动壳；活动列表加载较慢，首页当次为空"
+    },
+    {
+      "slug": "xujiaca",
+      "name": "许家菜",
+      "appid": "wx4a754a0f6e06c359",
+      "keyword": "许家菜",
+      "miniapp": "许家CUISINE",
+      "carrier": "lot",
+      "type": "card",
+      "enabled": false,
+      "verified": false,
+      "note": "会员卡型（另有微商城型 许家菜甄选 wx05d403af04751c58）；未见签到"
+    },
+    {
+      "slug": "xunxiangji",
+      "name": "巡湘记",
+      "appid": "wxad5f932a0f88707d",
+      "keyword": "巡湘记",
+      "miniapp": "巡湘记堂食下单",
+      "carrier": "lot",
+      "type": "card",
+      "enabled": false,
+      "verified": false,
+      "note": "会员卡型（另有 巡湘记点餐 wx17a356a7400eede6）；未见签到"
+    },
+    {
+      "slug": "shimianchangde",
+      "name": "失眠常德",
+      "appid": "wx779f2cf4bb39f142",
+      "keyword": "失眠常德",
+      "miniapp": "失眠常德海鲜大排档",
+      "carrier": "lot",
+      "type": "card",
+      "enabled": false,
+      "verified": false,
+      "note": "会员卡型；未见签到"
+    }
+  ]
+}

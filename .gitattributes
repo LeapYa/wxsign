@@ -1,0 +1,9 @@
+# 青龙跑在 Linux 上，shell / python / node 脚本必须是 LF 换行，
+# 否则 sign.sh 会报 "$'\r': command not found"。Windows 侧一律不转换。
+* text=auto eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.env  text eol=lf
+*.md   text eol=lf

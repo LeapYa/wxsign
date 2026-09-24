@@ -1,0 +1,6 @@
+# 凭证与运行期产物
+brands/*.env
+!brands/_template.env
+state/
+*.log
+__pycache__/

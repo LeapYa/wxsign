@@ -297,7 +297,11 @@ def white_card(buf, W, H):
             cur = [y]
     if len(cur) > len(best):
         best = cur
-    if len(best) < H * 0.15:          # 太薄不算弹窗
+    if len(best) * 3 < H * 0.15:      # 太薄不算弹窗
+        # ⚠️ 注意 `best` 是**行数**（y 步长 3），而阈值是按**像素**给的 ——
+        # 不换算回去的话，实际要求的是 0.45H 像素，比原意严三倍。
+        # 实测：农耕记的手机号弹窗白卡高 312px（占屏 0.40），全屏时代勉强能过，
+        # 换成手机竖版（779 高）就被判成「太薄」整张丢弃 → 后面（✓ 锚点、号码行）全跟着错。
         return None
     y0, y1 = best[0], best[-1]
     xs = []
@@ -373,7 +377,9 @@ def nav_point(buf=None, W=0, H=0):
     ② 探测不到 → 退回实测比例（0.058W / 0.052H；410x776 下 = (23,40)）。
     """
     if buf and W and H:
-        g = wxwin.glyphs(buf, W, H, 0, int(H * 0.010), int(W * 0.22), int(H * 0.075))
+        # 扫描带只取标题栏**垂直居中**那一段：真图标实测 y≈0.055H（410x776 下 = 43）。
+        # 别从 0.010H 起扫 —— 实测蜀大侠那里有个 y=17 的更靠左的噪点，会被误当成返回键。
+        g = wxwin.glyphs(buf, W, H, 0, int(H * 0.028), int(W * 0.22), int(H * 0.072))
         if g:
             b = g[0]
             print("[nav] 探测到标题栏左端图标 @(%d,%d) %dx%d（%d 像素 / 共 %d 个候选）"
@@ -657,8 +663,19 @@ def main():
             rows = d["rows"]
             print("[ui] 手机号弹窗：检测到 %d 个可选号码 %s" % (len(rows), [r[1] for r in rows]))
             if not rows:
-                print("[FAIL] 没识别出号码行，截图 %s（可人工核对后手工点）" % png)
-                sys.exit(3)
+                # **号码行识别不出来时不要放弃**：绝大多数账号只绑了一个号码，
+                # 微信此时**默认已经选中它**，直接点「允许」就行，根本不用点号码行。
+                # 实测农耕记的弹窗就是这样：那个 ✓ 在号码的**右侧**而不是上方
+                # （原实现按「✓ 在按钮上方 + 向下推算行距」找号码，前提就不成立），
+                # 加上页面背景大片青绿色会被 is_green 命中、把锚点带偏 ——
+                # 死守「先找到号码行」就卡在这里了。
+                # 只留一道安全阀：**必须确认这是白色弹窗卡片**，否则不敢盲点。
+                if not d["card"]:
+                    print("[FAIL] 没识别到白色弹窗卡片，不敢盲点「允许」。截图 %s" % png)
+                    sys.exit(3)
+                print("[ui] 号码行没识别出，但白卡在 → 按「只绑了一个号码」处理"
+                      "（微信已默认选中），直接点「允许」")
+                rows = [(1, 0, 0)]
 
             if a.phone:
                 if ocr_ok() and len(rows) > 1:
@@ -680,23 +697,27 @@ def main():
                     print("[ui] 只有 1 个号码 → 直接用（PHONE 仅留档，请核对 %s）" % png)
                     a.index = 1
 
-            if len(rows) > 1 and not a.index:
-                print("[FAIL] 该账号有 %d 个可选号码，脚本不猜：请设 WXSIGN_REGISTER_PHONE_INDEX（1~%d）"
-                      % (len(rows), len(rows)))
-                print("       可选项见 %s" % png)
-                sys.exit(2)
-            idx = a.index or 1
-            if idx > len(rows):
-                print("[FAIL] INDEX=%d 超出范围（只有 %d 个）" % (idx, len(rows)))
-                sys.exit(2)
-
-            _, y, _ = rows[idx - 1]
+            # 号码行检测在手机竖版下不可靠 —— 实测农耕记把「你的手机号码」标题也算成了一行
+            # （✓ 锚点先被页面背景的青绿色带偏，再从锚点往下按行距推算，就把标题收进来了）。
+            # 但**选错行的代价很低**：列出来的都是**你自己账号绑定的**号码，
+            # 选错也只是换成另一个自己的号，注册照样成功 —— 不值得为此中止整个流程。
+            # 所以：设了 INDEX 就按它选；没设就**不点行**，用微信默认选中的那个。
+            y = rows[a.index - 1][1] if (a.index and a.index <= len(rows)) else 0
+            if not y and len(rows) > 1 and not a.index:
+                print("[ui] 检测到 %d 行（可能把标题也算进来了）→ 不猜，"
+                      "用微信默认选中的号码" % len(rows))
             gx = (d["card"][0] + d["card"][2]) // 2 if d["card"] else W // 2
-            print("[ui] 选第 %d 个号码（y=%d），再点「允许」" % (idx, y))
+            if y:
+                print("[ui] 选第 %d 个号码（y=%d）" % (idx, y))
+                if not a.dry_run:
+                    click(gx, y)
+                    time.sleep(0.8)
+            else:
+                # y=0 是「号码行没识别出来」的占位（见上面）→ 不点行，只点「允许」
+                print("[ui] 只绑了一个号码且已默认选中 → 跳过选行")
+            g = d["green"]
+            print("[ui] 点「允许」(%d,%d)" % ((g[0] + g[2]) // 2, (g[1] + g[3]) // 2))
             if not a.dry_run:
-                click(gx, y)
-                time.sleep(0.8)
-                g = d["green"]
                 click((g[0] + g[2]) // 2, (g[1] + g[3]) // 2)
                 granted = True
                 time.sleep(6)
@@ -717,13 +738,26 @@ def main():
             target = (wxdom.pick_action(dd, "confirm", is_clicked)
                       or wxdom.pick_action(dd, "sign", is_clicked))
             if target:
+                key = (target["text"], target["cx"], target["cy"])
                 print("[ui] DOM 文案「%s」→ 点 (%d,%d)"
                       % (target["text"].replace("\n", " ")[:24], target["cx"], target["cy"]))
                 if not a.dry_run:
-                    click(target["cx"], target["cy"])
-                clicked.add((target["text"], target["cx"], target["cy"]))
+                    # ⚠️ 点完要**确认页面真的变了**，没变就重试。
+                    # 小程序刚打开的那一两秒，页面渲染完了但事件还没就绪，**点击会被丢掉**。
+                    # 实测农耕记就是被这个坑死的：点了活动卡但没跳转，而它已被记进 clicked，
+                    # 于是后面一路「无目标」→ 误判成跑偏 → 空转到轮次耗尽。
+                    h0 = page_hash(buf, W, H)
+                    for attempt in range(1, 4):
+                        click(target["cx"], target["cy"])
+                        time.sleep(2.5)
+                        if page_hash(grab(W, H), W, H) != h0:
+                            if attempt > 1:
+                                print("     → 第 %d 次点击才生效" % attempt)
+                            break
+                        print("     → 页面没变，重试（%d/3）" % attempt)
+                clicked.add(key)
                 scroll_rounds = 0        # 点到了东西 = 有进展，重置「疑似跑偏」计数
-                time.sleep(3)
+                time.sleep(1.5)
                 continue
 
         g = d["green"]

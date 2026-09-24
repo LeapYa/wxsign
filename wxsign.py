@@ -452,7 +452,9 @@ def register_member(brand, env):
     if not os.path.exists(os.path.join(HERE, "wxreg.py")):
         return False, "缺 wxreg.py（UI 注册脚本）"
     ensure_helpers()
-    envs = ["-e", "DISPLAY=:1", "-e", "SHOT_DIR=" + cpath(CTMP, "shots")]
+    # 截图**按品牌分目录**：共用一个目录的话，下一个品牌会把上一个的覆盖掉，
+    # 事后想回看「当时卡在哪一屏」就没了（踩过）。
+    envs = ["-e", "DISPLAY=:1", "-e", "SHOT_DIR=" + cpath(CTMP, "shots", brand["slug"])]
     if env.get("WX_REGISTER_PHONE_INDEX"):
         envs += ["-e", "WXSIGN_REGISTER_PHONE_INDEX=" + env["WX_REGISTER_PHONE_INDEX"]]
     if phone:

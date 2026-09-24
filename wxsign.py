@@ -128,6 +128,37 @@ def save_env(slug, env):
     os.chmod(p, 0o600)
 
 
+# 绑在**微信账号**上的字段 —— 换登录账号（小号验证完换大号）后必须清掉。
+# 为什么不能靠脚本自己更新：
+#   · wxrefresh.js 读 env 里的 WX_OPENID 当「目标上下文」去挑 CDP 连接（targetOpen），
+#     所以它**会主动去找旧账号**；写回身份时又带 `!env[k]` 守卫 —— 于是旧 openId 一直粘着。
+#   · 结果：换号后报「抓不到身份 / invalid code」，而日志看不出跟换号有关。
+# 与账号无关、可以保留的：WX_APPID（小程序 id）、WX_MPID（品牌侧 id，同品牌所有人都一样）、
+#   WX_GAMEID（活动 id，公开常量）、WX_REGISTER_*（配置项）。
+ACCOUNT_FIELDS = ("WX_OPENID", "WX_UNIONID", "WX_TOKEN", "WX_GCID",
+                  "WX_MEMBERID", "WX_CARDID", "WX_CARDNO", "WX_THIRDSHOPID")
+
+
+def reset_identity(slug, dry_run=False):
+    """清掉该品牌 env 里所有账号相关字段，保留品牌 / 活动常量。"""
+    env = load_env(slug)
+    if not env:
+        log("  [reset] %s：还没有配置文件，无需清理" % slug)
+        return 0
+    drop = [k for k in ACCOUNT_FIELDS if env.get(k)]
+    keep = {k: v for k, v in env.items() if k not in ACCOUNT_FIELDS}
+    log("  [reset] %s：清 %d 个 / 留 %d 个" % (slug, len(drop), len(keep)))
+    for k in drop:
+        log("      - %s" % k)
+    if keep:
+        log("      保留：%s" % "、".join(sorted(keep)))
+    if dry_run:
+        log("      （--dry-run，没有真的写）")
+        return len(drop)
+    save_env(slug, keep)
+    return len(drop)
+
+
 def jwt_exp(tok):
     import base64
     try:
@@ -797,7 +828,30 @@ def main():
         log("\n用法：wxsign.py --find <关键词>                     自动发现该品牌的 appId（不用手抄）")
         log("      wxsign.py <slug> [--probe|--discover|--register|--ensure]")
         log("      wxsign.py --all [--ensure]")
+        log("      wxsign.py <slug> --reset-identity     换了微信账号后清掉旧凭证")
         log("      <slug> 不带参数 = 直接签到（不是会员会自动注册，见 --register）")
+        return 0
+
+    # 换微信账号（小号验证完换大号）后，旧账号的 openId 等会一直粘在 env 里，
+    # 症状是「抓不到身份 / invalid code」且看不出跟换号有关 —— 用这条清掉。
+    if "--reset-identity" in argv:
+        cfg = load_brands()
+        by_slug = {b["slug"]: b for b in cfg["brands"]}
+        if "--all" in argv:
+            targets = [b["slug"] for b in cfg["brands"] if b.get("enabled")]
+        else:
+            targets = [s for s in argv if not s.startswith("--") and s in by_slug]
+        if not targets:
+            log("用法：wxsign.py <slug> --reset-identity   # 清该品牌的账号凭证")
+            log("      wxsign.py --all --reset-identity   # 所有启用的品牌")
+            log("      （加 --dry-run 只看会清什么，不写文件）")
+            return 2
+        log("换微信账号后要清掉这些字段：它们是绑在账号上的，且脚本不会自动覆盖。")
+        for s in targets:
+            reset_identity(s, dry_run="--dry-run" in argv)
+        log("\n清完 %d 个品牌。接着跑一次就会重新抓身份：" % len(targets))
+        log("  python3 wxsign.py --all --ensure")
+        log("  新账号在各品牌都不是会员 → 会自动走一遍注册（微信授权弹窗，不用手机号）。")
         return 0
 
     cfg = load_brands()

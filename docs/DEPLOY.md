@@ -486,3 +486,110 @@ docker exec $WX sh -c 'for p in $(ls /proc | grep -E "^[0-9]+$"); do \
 | `RESULT code=208/211` | token 失效 —— 重跑一次即可（脚本会自己刷） |
 | `RESULT code=401` | 该账号还不是这个品牌的会员 → 脚本会自动走微信授权弹窗注册；若仍失败，看 `[ui]` 日志与 `shots/<slug>/` 截图 |
 | `RESULT code=-1` | 网络层错误（已重试仍失败），看 msg |
+| 换了微信账号后「抓不到身份 / invalid code」，换回旧号又好了 | env 里还粘着旧账号的 `WX_OPENID` → `python3 wxsign.py --all --reset-identity`（见 [第 8.3 节](#83-换微信账号小号验证完--换大号)） |
+| 「新建实例」看着是干净的，但旧微信还在 | 删实例时没勾「彻底清除」，数据卷被保留了 → 见 [第 8.2 节](#82-装过云微想彻底卸干净) |
+
+---
+
+## 8. 后续运维：多开 / 卸干净 / 换微信账号
+
+首次部署完之后，这三件事迟早会遇到。
+
+### 8.1 再加一个微信实例（多开）
+
+云微本身就是多实例设计：面板「实例」页 →「**新建实例**」→ 选类型（微信 / Chromium）、命名 →
+面板自动 `docker run` 起一个新容器。每个实例是**独立的一整套**：
+
+```
+容器     woc-wx-<hash>          实测：woc-wx-2ada0225ca
+数据卷   woc-data-<hash>        实测：woc-data-2ada0225ca   ← 微信本体 + 登录态都在这里
+登录     要再扫一次码（实例之间互不影响）
+网络     woc-net                面板与实例之间的内网（多个实例共用）
+```
+
+⚠️ **本项目的脚本一次只操作一个实例** —— 它只读 `WOC_INSTANCE` 这一个变量。
+所以「同时跑两个微信账号」= 跑两份，各含一套环境变量与脚本目录：
+
+```bash
+# 第二份（比如大号）指向另一个实例
+WXSIGN_HOME=/ql/data/scripts/wxsign-b \
+WXSIGN_HOME_CONTAINER=/ql/data/scripts/wxsign-b \
+WOC_INSTANCE=woc-wx-<另一个 hash> \
+python3 /ql/data/scripts/wxsign-b/wxsign.py --all --ensure
+```
+
+两边的 `brands/` 目录是分开的，凭证不会串。
+
+### 8.2 装过云微、想彻底卸干净
+
+**最常见的「没卸干净」是删实例时没勾「彻底清除」** —— 云微默认**保留数据卷**
+（有意为之：删了实例还能重建回来），于是微信本体、登录态、几百 MB 都还留在盘上。
+
+先看还留着什么（命名规律是本机实测的）：
+
+```bash
+docker ps -a --format '{{.Names}}\t{{.Status}}' | grep -E 'woc-|wechat'
+docker volume ls --format '{{.Name}}' | grep woc
+docker network ls --format '{{.Name}}' | grep woc
+```
+
+再按顺序删：
+
+```bash
+docker rm -f woc-hook                 # 旁挂的 hook（如果有）
+docker rm -f woc-wx-<hash>            # 微信实例；hash 从上面第一条命令看
+docker rm -f woc-panel                # 面板放最后（它管着实例）
+
+docker volume rm woc-data-<hash>      # ⚠️ 微信本体 + 登录态都在这，删了要重装 + 重新扫码
+docker network rm woc-net             # 面板与实例之间的内网
+
+rm -rf ~/woc/data-panel               # 面板数据（账号、实例记录、日志）
+rm -rf ~/woc                          # 如果你当初就是在 ~/woc 里建的
+```
+
+> **只删容器不删卷**：下次「新建实例」看着是干净的，其实旧微信还在卷里 ——
+> 省下一次 200 MB 下载，但登录态也可能跟着回来。想真正从零开始，务必把卷删掉。
+> 反过来：**只是换微信版本 / 重装微信时别删卷**，登录态在 `/config/.xwechat`，删了就得多扫一次码。
+
+端口起不来时（重建面板）：`docker ps -a | grep 36080`，把占着 `36080` 的旧容器删掉。
+
+### 8.3 换微信账号（小号验证完 → 换大号）
+
+**只换微信登录是不够的。** 脚本侧还存着旧账号的一整套凭证，不清掉会一直失败 ——
+而且症状很难联想到换号：
+
+```
+换了新账号后，日志报「抓不到身份 / invalid code」；换回旧账号又好了
+```
+
+原因是 `wxrefresh.js` 会读 env 里的 `WX_OPENID` 当「目标上下文」去挑 CDP 连接，
+写回身份时又带「env 里已有就不覆盖」的守卫 → **旧 openId 一直粘着**。
+
+三步：
+
+```bash
+# 1) 让微信回登录页，用新账号扫码
+#    最省心：重启一次实例（微信会回到登录页，见第 6 节的登录说明），然后扫码
+#    —— 扫码要看容器画面（KasmVNC 网页）
+
+# 2) 清掉脚本侧的旧账号凭证（会打印清哪些；加 --dry-run 可先看，不写文件）
+python3 wxsign.py --all --reset-identity
+
+# 3) 跑一次：自动重抓身份，并在每个品牌自动注册（新账号在各家都还不是会员）
+python3 wxsign.py --all --ensure
+```
+
+`--reset-identity` 清这 8 个（有才清）：
+`WX_OPENID`、`WX_UNIONID`、`WX_TOKEN`、`WX_GCID`、`WX_MEMBERID`、`WX_CARDID`、`WX_CARDNO`、`WX_THIRDSHOPID`。
+
+保留与账号无关的：`WX_MPID`（品牌侧 id，同品牌所有人一样）、`WX_APPID`、`WX_GAMEID`（活动 id，公开常量）、`WX_REGISTER_*`（配置项）。
+
+换号后要知道的三件事：
+
+- **会重新注册一遍**：会员是绑 openId 的，新账号在每家都还不是会员 → 自动走微信授权弹窗注册；
+  卡号、积分从零开始。
+- **旧账号的会员记录不会消失**（那是服务商侧的），只是脚本不再用它。
+- **想两个号都长期在跑**：别在同一个实例里来回切 —— 按 [8.1](#81-再加一个微信实例多开)
+  新开一个实例，两个账号的设备指纹完全隔离，也不用反复清凭证。
+
+> 同一台设备频繁退出 / 换号本身就是个风控信号，尽量一次换定。

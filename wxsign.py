@@ -732,6 +732,27 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         r2, items = lot_list(env)
         log("  [probe·lot/list] code=%s content=%s"
             % (r2.get("code"), json.dumps(items, ensure_ascii=False)[:600]))
+
+        # 「这个号到底有没有东西可做」要看**两条**，不能只看 lot/list：
+        # ⚠️ 实测辣可可（sign 型）的 lot/list 也返 405 —— 它的签到活动**不走活动列表**。
+        #    只按 lot/list 判会把辣可可误当成「没活动」。
+        acts = items.get("list") if isinstance(items, dict) else None
+        gid = env.get("WX_GAMEID") or brand.get("gameid") or ""
+        if not gid and acts:
+            gid = str(acts[0].get("id") or "")
+        if gid:
+            sd = api_post(env, "/api/game/sign/detail", {"gameId": gid})
+            log("  [probe·sign/detail] gameId=%s code=%s msg=%s"
+                % (gid, sd.get("code"), sd.get("msg")))
+            if str(sd.get("code")) == CODE_OK:
+                log("  [probe] ✅ 这个号有**签到活动**（sign/detail 200）")
+            elif acts:
+                log("  [probe] 🟡 有活动但不支持签到：%s" % str(acts[0].get("name"))[:30])
+            else:
+                log("  [probe] ⚪ 服务端没有活动（该租户未配置）")
+        else:
+            log("  [probe] ⚪ 服务端没有活动，也没有可用的 gameId（lot/list=%s）"
+                % r2.get("code"))
         return True, "probe"
 
     ok, code, msg = do_sign(brand, env)

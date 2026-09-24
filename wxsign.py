@@ -477,8 +477,14 @@ def register_member(brand, env):
     return True, "UI 注册流程已跑"
 
 
-def pick_activity(items, want=("签到", "打卡", "sign")):
-    """从活动列表里挑签到类活动（type/名称命中关键词）。返回 (activity, 命中理由)。"""
+def pick_activity(items, want=("签到", "打卡", "参与", "领取", "抽奖", "sign")):
+    """从活动列表里挑出「签到」那个活动。返回 (activity, 命中理由)。
+
+    三级判据（越靠前越可信）—— 反馈：「别人也不一定叫『立即签到』」，所以不能只看文案：
+      ① 名字命中签到类**词根**（品牌文案有差异，只匹配词根）
+      ② 活动 **type** 命中打卡签到类型（来菜实测 type="2"，名字也叫「每日签到」）
+      ③ 列表里**只有一个**活动 → 直接用（很多租户就配了一个）
+    """
     if isinstance(items, dict):
         for k in ("list", "records", "rows", "content", "data"):
             if isinstance(items.get(k), list):
@@ -486,15 +492,20 @@ def pick_activity(items, want=("签到", "打卡", "sign")):
                 break
     if not isinstance(items, list):
         return None, "活动列表结构未识别"
-    for it in items:
-        if not isinstance(it, dict):
-            continue
+    acts = [it for it in items if isinstance(it, dict)]
+    for it in acts:
         blob = " ".join(str(it.get(k, "")) for k in
-                        ("type", "gameType", "name", "title", "activityName", "remark", "status"))
+                        ("name", "title", "activityName", "remark"))
         for w in want:
             if w in blob:
                 return it, "命中「%s」" % w
-    return None, "列表里没有签到类活动（共 %d 个）" % len(items)
+    for it in acts:
+        t = str(it.get("type") or it.get("gameType") or "")
+        if t == "2":
+            return it, "活动类型 type=2（打卡签到）"
+    if len(acts) == 1:
+        return acts[0], "列表只有一个活动，直接用它"
+    return None, "列表里挑不出签到活动（共 %d 个）" % len(acts)
 
 
 def discover_lot_gameid(env):

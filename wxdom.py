@@ -22,6 +22,7 @@
 用法（容器内）：python3 wxdom.py        # 打印当前页面可点元素清单
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -36,18 +37,85 @@ SCAN_JS = """(function(){try{
    if(!t||t.length>30) continue;
    var r=e.getBoundingClientRect();
    if(r.width<30||r.height<16) continue;
-   if(r.bottom<4||r.top>window.innerHeight-4) continue;
+   var cx=r.x+r.width/2, cy=r.y+r.height/2;
+   if(cx<0||cx>window.innerWidth||cy<6||cy>window.innerHeight-6) continue;   // 中心必须在视口内
    out.push({tag:e.tagName, cls:String(e.className||'').slice(0,40), text:t,
-             cx:Math.round(r.x+r.width/2), cy:Math.round(r.y+r.height/2),
+             cx:Math.round(cx), cy:Math.round(cy),
              w:Math.round(r.width), h:Math.round(r.height),
              area:Math.round(r.width*r.height)});
  }
  return JSON.stringify({vw:window.innerWidth, vh:window.innerHeight, items:out});
 }catch(e){return 'ERR:'+(e.message||e)}})()"""
 
-# 按文案找目标的优先顺序（越靠前越先点）。
-# 用文案而不是颜色 —— 这些文案是吾享同一套模板里的，各品牌基本一致。
-TARGETS = ("允许", "同意并继续", "同意", "授权", "立即签到", "签到", "参与", "领取", "确认")
+# 找目标用的**词根**（不是精确文案）—— 各品牌文案有差异，所以要宽。
+# 反馈：「别人也不一定叫『立即签到』」—— 对，所以这里只留词根，并且可配置覆盖。
+# ⚠️ 只收**双字以上**：单字（签/领/抽）会误命中「领取记录」「签到规则」这类相关但非动作的元素（实测踩过）。
+SIGN_WORDS = ("签到", "打卡", "参与", "领取", "抽奖", "去参与", "点击参与", "签一下")
+CONFIRM_WORDS = ("允许", "同意", "确认", "授权", "继续", "确定", "好的")
+# 排除词：含这些的**不点**。它们是「相关但非动作」的元素（记录/规则/导航/其它业务入口），
+# 点了就跑到别的页面去了。
+EXCLUDE_WORDS = ("记录", "规则", "说明", "明细", "商城", "更多", "上月", "下月", "上个月",
+                 "下个月", "排行榜", "历史", "帮助", "客服", "购买", "支付", "下单",
+                 "退款", "注销", "退出", "删除", "分享", "邀请", "查看")
+# 兼容旧名（wxreg 里还在用）
+TARGETS = SIGN_WORDS + CONFIRM_WORDS
+
+
+def _exclude():
+    env = os.environ.get("WXSIGN_REG_EXCLUDE", "").strip()
+    if env:
+        return tuple(w.strip() for w in env.split(",") if w.strip())
+    return EXCLUDE_WORDS
+
+
+def keywords(mode="sign"):
+    """取该模式下的词根。WXSIGN_REG_KEYWORDS 可覆盖（逗号分隔）——
+    给「文案完全不在词表里」的品牌留逃生口。"""
+    env = os.environ.get("WXSIGN_REG_KEYWORDS", "").strip()
+    if env:
+        return tuple(w.strip() for w in env.split(",") if w.strip())
+    return SIGN_WORDS if mode == "sign" else CONFIRM_WORDS
+
+
+def pick_action(d, mode="sign", clicked=None, allow_fallback=None):
+    """选「最可能是目标按钮」的元素。**两级策略**：
+
+    ① 词根命中（且不含排除词）→ 取**面积最小**的那个（最小 ≈ 最接近真实按钮，
+       而不是套着它的容器）
+    ② 一个都没命中 → **评分兜底**：挑「面积较大 + 位置靠下」的（主按钮的经验特征）
+
+    为什么要有 ②：不同品牌的按钮文案可能完全在词表之外（"点我"、"去参与"、图标按钮…）。
+    ⚠️ 但**默认关闭**（`WXSIGN_REG_FALLBACK=1` 才开）：实测宽松兜底会选到
+    「1积分」「已连续签到1天」这类**非按钮**元素，点下去就跑偏了；收紧成「扁+够大+下半屏」
+    之后仍会命中文字行。**误点的代价高于不点**，所以默认不启用，宁可由外层去滚动/试固定坐标。
+    """
+    if not d:
+        return None
+    clicked = clicked or (lambda it: False)
+    if allow_fallback is None:
+        allow_fallback = os.environ.get("WXSIGN_REG_FALLBACK", "0") == "1"
+    ex = _exclude()
+    pool = [it for it in d["items"]
+            if not clicked(it) and not any(w in it["text"] for w in ex)]
+    hits = [it for it in pool if any(w in it["text"] for w in keywords(mode))]
+    if hits:
+        hits.sort(key=lambda x: x["area"])
+        return hits[0]
+    if not allow_fallback:
+        return None
+    # 兜底只接受「**像主按钮**」的元素：扁（宽高比≥2.5）+ 够大 + 位于下半屏。
+    # 实测教训：宽松的「面积大优先」会选出「1积分」「已连续签到1天」这类**非按钮**元素，
+    # 点下去就跑偏了 —— 宁可这一个都选不出（返回 None，交给滚动/固定坐标兜底），也不要乱点。
+    vh = d.get("vh") or 1024
+    cand = [it for it in pool
+            if it["area"] >= 40000 and it["h"] > 0
+            and (it["w"] / float(it["h"])) >= 2.5
+            and it["cy"] > vh * 0.35
+            and len(it["text"]) <= 14]
+    if not cand:
+        return None
+    cand.sort(key=lambda x: -x["area"])
+    return cand[0]
 
 
 def evaluate(ws, expr, ctx=0, timeout=5.0):

@@ -527,13 +527,12 @@ def main():
             if now:
                 ctx = now
             dd = wxdom.scan(ws, ctx)
-            target = None
-            for kw in wxdom.TARGETS:
-                cand = [it for it in wxdom.find(dd, (kw,))
-                        if (it["text"], it["cx"], it["cy"]) not in clicked]
-                if cand:
-                    target = cand[0]
-                    break
+            # 两级策略（反馈：「别人也不一定叫『立即签到』」）：
+            #   ① 同义词根命中（面积最小者）  ② 都没命中 → 按「大 + 靠下 + 文案短」评分兜底
+            # 弹窗的确认类优先于页面的签到类（弹窗挡在最上层）。
+            is_clicked = lambda it: (it["text"], it["cx"], it["cy"]) in clicked      # noqa: E731
+            target = (wxdom.pick_action(dd, "confirm", is_clicked)
+                      or wxdom.pick_action(dd, "sign", is_clicked))
             if target:
                 print("[ui] DOM 文案「%s」→ 点 (%d,%d)"
                       % (target["text"].replace("\n", " ")[:24], target["cx"], target["cy"]))

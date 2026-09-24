@@ -9,6 +9,14 @@
 资源参考：微信实例 1.2 GiB（跑起小程序约 1.8 GiB）+ hook 0.47 GiB + 面板 0.12 GiB + 青龙 0.2 GiB，
 合计约 **2.5 GiB 内存、6 GB 磁盘**；建议 **2 核 4 GiB** 起。
 
+> **本文的占位符约定**
+>
+> - `$WX` = 微信实例容器名。云微起的实例都叫 `woc-wx-` 开头，用这条自动取：
+>   ```bash
+>   WX=$(docker ps --format '{{.Names}}' | grep '^woc-wx-' | head -1); echo $WX
+>   ```
+> - `<...>` = 需要你替换的值（如面板密码），出现处都会说明它从哪来。
+
 ---
 
 ## 1. 装 Docker
@@ -43,7 +51,7 @@ echo "面板密码: $PW"
 建 `.env`：
 
 ```dotenv
-WOC_PASSWORD=<上一步那串>
+WOC_PASSWORD=粘贴上一步 echo 出来的那串
 WOC_HTTP_PORT=36080
 WOC_SPOOF_OS=1
 # 默认软阈值 1500MiB 太低（跑起小程序实测到 1.8G），看门狗会「柔和重启」实例，
@@ -65,7 +73,7 @@ docker compose up -d
 >   -v ~/woc/data-panel:/data -v /var/run/docker.sock:/var/run/docker.sock \
 >   -e PORT=8080 -e WOC_DOCKER_NETWORK=woc-net \
 >   -e WOC_WECHAT_IMAGE=docker.io/gloridust/wechat-on-cloud:1.4.9 \
->   -e PANEL_ADMIN_USER=admin -e PANEL_ADMIN_PASSWORD=<同一个密码> \
+>   -e PANEL_ADMIN_USER=admin -e PANEL_ADMIN_PASSWORD=同上那串密码 \
 >   -e WOC_SPOOF_OS=1 -e WOC_INSTANCE_MEM_SOFT_MB=2800 -e WOC_INSTANCE_MEM_HARD_MB=4000 \
 >   -e TZ=Asia/Shanghai --restart unless-stopped gloridust/woc-panel:latest
 > ```
@@ -95,7 +103,7 @@ hook 靠 frida 找 WMPF 里的偏移，**WMPF 版本必须落在 WMPFDebugger �
 **要看的是 WMPF 版本，不是微信版本号**（多个微信版本可能共用同一个 `WeChatAppEx`）。
 
 ```bash
-docker exec <实例容器名> sh -c 'ls /opt/wechat 2>/dev/null; \
+docker exec $WX sh -c 'ls /opt/wechat 2>/dev/null; \
   find / -name "WeChatAppEx" -maxdepth 6 2>/dev/null | head -3'
 # 或者直接从 hook 启动日志看： [frida] script loaded, WMPF version: xxxxx
 ```
@@ -129,13 +137,13 @@ sha256 `b7d0f8d53e9f648bc2c77a6096a04100d008f2d9f0d3988a2a4859b5992aca0a`）。
 
 ```bash
 # ① 备份（可回滚）
-docker exec <实例> sh -c 'cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml.orig.bak'
+docker exec $WX sh -c 'cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml.orig.bak'
 # ② 改规则
-docker exec <实例> sh -c 'sed -i "s|<application class=\"\*\"><maximized>yes</maximized></application>|<application name=\"微信*\"><maximized>yes</maximized></application>|" /etc/xdg/openbox/rc.xml'
+docker exec $WX sh -c 'sed -i "s|<application class=\"\*\"><maximized>yes</maximized></application>|<application name=\"微信*\"><maximized>yes</maximized></application>|" /etc/xdg/openbox/rc.xml'
 # ③ 放到 HOME（= /config，挂载卷）优先位置，容器重建也不丢
-docker exec <实例> sh -c 'cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml'
+docker exec $WX sh -c 'cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml'
 # ④ 重载
-docker exec <实例> sh -c 'DISPLAY=:1 openbox --reconfigure'
+docker exec $WX sh -c 'DISPLAY=:1 openbox --reconfigure'
 ```
 
 实测结果：小程序窗口变成 **410x776 @ (435,124)** 的手机竖版，页面按 410 CSS px 布局；
@@ -147,7 +155,7 @@ docker exec <实例> sh -c 'DISPLAY=:1 openbox --reconfigure'
 **回滚**：
 
 ```bash
-docker exec <实例> sh -c 'cp /config/.config/openbox/rc.xml.orig.bak /etc/xdg/openbox/rc.xml && cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml && DISPLAY=:1 openbox --reconfigure'
+docker exec $WX sh -c 'cp /config/.config/openbox/rc.xml.orig.bak /etc/xdg/openbox/rc.xml && cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml && DISPLAY=:1 openbox --reconfigure'
 ```
 
 #### 这对脚本意味着什么（重要）
@@ -214,11 +222,12 @@ docker run -d --name qinglong \
 
 ```bash
 SCRIPTS=~/ql/data/scripts          # 与青龙数据卷同盘
-WX=<实例容器名>                     # 例 woc-wx-2ada0225ca
+REPO=~/wxsign                      # ← 改成你 clone 本仓库的实际路径
+WX=$(docker ps --format '{{.Names}}' | grep '^woc-wx-' | head -1)   # 自动取实例名
 VOL=woc-data-${WX#woc-wx-}          # 云微的数据卷名
 
-# 把本仓库的 wxsign/ 放进青龙脚本目录（保持 wxsign/ 这一层）
-mkdir -p $SCRIPTS && cp -r <本仓库>/wxsign $SCRIPTS/
+# 把仓库里的 wxsign/ 整体拷进青龙脚本目录（保持 wxsign/ 这一层）
+mkdir -p $SCRIPTS && cp -r $REPO/wxsign $SCRIPTS/
 
 docker run -d --name woc-hook \
   --pid=container:$WX --network=container:$WX \
@@ -275,20 +284,22 @@ docker exec woc-hook tail -5 /tmp/wmpf.log     # 期望看到 [frida] script loa
 
 ## 5. 配青龙
 
-### 环境变量
+在青龙后台点 **「环境变量」→ 新建**，逐个添加：
 
-```
-WOC_INSTANCE=woc-wx-xxxxxxxx                    # 微信实例容器名
-WOC_HOOK=woc-hook                               # hook 容器名
-WXSIGN_PYTHON=/usr/bin/python3
-WXSIGN_HOME_CONTAINER=/ql/data/scripts/wxsign   # 脚本在**容器里**的路径
-WXSIGN_REGISTER_PHONE=13800000000               # 可选：不是会员时自动注册用
-```
+| 变量名 | 填什么 |
+|---|---|
+| `WOC_INSTANCE` | 微信实例容器名。在**宿主机**跑 `docker ps --format '{{.Names}}'` 查，形如 `woc-wx-2ada0225ca` |
+| `WOC_HOOK` | hook 容器名，默认 `woc-hook` |
+| `WXSIGN_PYTHON` | `/usr/bin/python3`（青龙自带的） |
+| `WXSIGN_HOME_CONTAINER` | 脚本在**青龙容器里**的路径，即 `/ql/data/scripts/wxsign` |
+| `WXSIGN_REGISTER_PHONE` | 可选。配了走 API 直连注册；不配则走微信授权弹窗（不需要手机号） |
 
 > 本合集**不需要** `WXSIGN_MINIAPP_PY` —— 打开小程序用的 `wxopen.py` 就在仓库里，
 > 引擎每次跑会自动投递到微信容器（`ensure_helpers()`）。
 
 ### 定时任务
+
+青龙后台点 **「定时任务」→ 新建**，命令填下表的，日程填 Cron：
 
 | 名称 | 命令 | 定时 |
 |---|---|---|
@@ -328,7 +339,7 @@ Windows 版微信有「登录免确认」选项（可做到纯自动），**Linu
 
 | 现象 | 原因与处理 |
 |---|---|
-| 界面停在登录页 | 实例被重启过。投两个脚本再跑：`docker cp wxsign/wxopen.py wxsign/wxlogin.py <实例>:/tmp/ && docker exec -e DISPLAY=:1 <实例> python3 /tmp/wxlogin.py`。它按**微信绿按钮的像素质心**定位「登录」并点，然后**等你手机确认**（默认最多 300s，`--wait N` 可改），确认成功才把主窗口拉成 1280×1024 全屏。⚠️ **不是免确认**：人不在就超时（rc=3）；拖到过期会出二维码（rc=2，需扫码） |
+| 界面停在登录页 | 实例被重启过。投两个脚本再跑：`docker cp wxsign/wxopen.py wxsign/wxlogin.py $WX:/tmp/ && docker exec -e DISPLAY=:1 $WX python3 /tmp/wxlogin.py`。它按**微信绿按钮的像素质心**定位「登录」并点，然后**等你手机确认**（默认最多 300s，`--wait N` 可改），确认成功才把主窗口拉成 1280×1024 全屏。⚠️ **不是免确认**：人不在就超时（rc=3）；拖到过期会出二维码（rc=2，需扫码） |
 | 登录后主窗口缩成 280×380 停在 (372,194) | 登录流程没走完的症状（确认还没到）。这个状态下侧边栏像素扫描会全空，`open_panel` 报「按钮没找全」 |
 | 点击全落空 / 面板认不出来 | 主窗口没全屏（比例坐标失效），或**有残留的小程序窗口盖在上面**。`wxclean.py` 会清残留：先找微信绿药丸点左边的「拒绝」遣散隐私弹窗，再走三道防线关窗 |
 | 换不到 token，日志里 `invalid code` | 小程序窗口是**上一次留下的旧上下文**，里面的登录会话已失效。脚本会自动「关掉重开再试一次」 |
@@ -344,7 +355,7 @@ Windows 版微信有「登录免确认」选项（可做到纯自动），**Linu
 
 ```bash
 # 容器内执行
-docker exec <实例> sh -c 'for p in $(ls /proc | grep -E "^[0-9]+$"); do \
+docker exec $WX sh -c 'for p in $(ls /proc | grep -E "^[0-9]+$"); do \
   [ "$(cat /proc/$p/comm 2>/dev/null)" = "WeChatAppEx" ] && kill -9 $p; done'
 ```
 

@@ -91,6 +91,30 @@
       "note": "同款活动壳；活动列表加载较慢，首页当次为空"
     },
     {
+      "slug": "guliantian",
+      "name": "谷连天",
+      "appid": "wxe2d7c8cb0987ded6",
+      "keyword": "谷连天",
+      "miniapp": "谷连天+",
+      "carrier": "lot",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "游戏型（分包仅 _pages_home_，含 pages/sign + game/lot）；同品牌另有会员卡型 wx3bf335ac37718c20、微商城型 wxdd54752712979943"
+    },
+    {
+      "slug": "malakongjian",
+      "name": "麻辣空间",
+      "appid": "wx27b4fa038bc45638",
+      "keyword": "麻辣空间",
+      "miniapp": "麻辣空间趣玩",
+      "carrier": "lot",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "游戏型（分包仅 _pages_home_，含 pages/sign + game/lot）；同品牌另有会员卡型 wx8bf3fcfb69920f74 / wx79c1803a7c8bedb6"
+    },
+    {
       "slug": "xujiaca",
       "name": "许家菜",
       "appid": "wx4a754a0f6e06c359",

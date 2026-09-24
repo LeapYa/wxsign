@@ -96,10 +96,22 @@ def pick_action(d, mode="sign", clicked=None, allow_fallback=None):
         allow_fallback = os.environ.get("WXSIGN_REG_FALLBACK", "0") == "1"
     ex = _exclude()
     pool = [it for it in d["items"]
-            if not clicked(it) and not any(w in it["text"] for w in ex)]
+            if not clicked(it)
+            # 「已签到」「已连续签到1天」这类是**状态提示**而不是按钮 —— 以「已」开头基本可判。
+            and not it["text"].lstrip().startswith("已")
+            and not any(w in it["text"] for w in ex)]
     hits = [it for it in pool if any(w in it["text"] for w in keywords(mode))]
     if hits:
-        hits.sort(key=lambda x: x["area"])
+        # 命中多个时怎么挑？光用「面积最小」会偏向**说明文字**（如「已连续签到1天」也含「签到」）。
+        # 按钮的可靠形态特征是：**扁**（宽高比大）+ **水平居中** + 面积不太大（贴近叶子）。
+        # 于是排序键：先「是不是扁按钮」，再「离屏幕中线多近」，最后「面积小者优先」。
+        vw = d.get("vw") or 1280
+
+        def _score(it):
+            flat = (it["w"] / float(it["h"])) if it["h"] else 0
+            return (1 if flat >= 2.5 else 0, -abs(it["cx"] - vw / 2.0), -it["area"])
+
+        hits.sort(key=_score, reverse=True)
         return hits[0]
     if not allow_fallback:
         return None

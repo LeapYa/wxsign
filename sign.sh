@@ -8,9 +8,10 @@
 #
 # 做的事：docker/hook/微信 自检 → 掉登录就点登录 → 逐个品牌（开小程序 → 刷 token → 签到）
 #
-# ⚠️ 唯一做不到无人值守的一环：微信掉登录后，点完「登录」**必须在手机上确认**
-#    （Linux 版微信没有 Windows 的「登录免确认」选项）。久不确认会过期 → 只能扫码。
-#    所以真正要做的是**别让微信掉登录**（容器别重启）。见 docs/DEPLOY.md。
+# ⚠️ 登录是一次性配置：首次扫码登录一次，之后只要不重启就一直有效，运行期全自动。
+#    唯一要留意的是**别让微信掉登录** —— 一旦因重启掉登录，点完「登录」还需**在手机上确认**
+#    （Linux 版微信没有 Windows 的「登录免确认」选项），久不确认会过期 → 只能扫码。
+#    见 docs/DEPLOY.md 第 6 节。
 #
 # 需要的青龙环境变量：
 #   WOC_INSTANCE=<微信实例容器名>    WOC_HOOK=woc-hook
@@ -49,7 +50,7 @@ fi
 
 # 3. 微信掉登录就点一下。
 #    ⚠️ 点「登录」之后**必须有人在手机上确认**（Linux 版微信没有 Windows 那个「登录免确认」选项），
-#       所以这一步天生做不到无人值守；久不确认还会变成「必须扫码」。细节见 wxlogin.py 顶部。
+#       这是一次性配置，不影响日常无人值守；久不确认会变成「必须扫码」。细节见 wxlogin.py 顶部。
 docker cp "$HERE/wxopen.py"  "$INSTANCE":/tmp/ >/dev/null 2>&1 || true
 docker cp "$HERE/wxlogin.py" "$INSTANCE":/tmp/ >/dev/null 2>&1 || true
 if docker exec "$INSTANCE" sh -c 'DISPLAY=:1 python3 -c "

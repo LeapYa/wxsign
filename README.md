@@ -9,9 +9,9 @@
 > **上手就三步**：把 `wxsign/` 放进青龙脚本目录 → 配几个环境变量 → 加一条定时任务
 > `bash /ql/data/scripts/wxsign/sign.sh`。
 >
-> 唯一需要手工的是**首次抓一次身份**：每个品牌要在微信里把对应小程序打开一次，
-> 脚本才能从你账号里读出 `openId / mpId`（这是你自己的登录态，没法共用、也没法替你抓）。
-> 抓完就一劳永逸，之后每天自动跑。
+> **不需要手工抓任何东西。** 开小程序、刷 token、抓身份（`openId / mpId / memberId / 卡号`）、
+> 不是会员时注册、签到 —— 全是自动的，第一次跑和以后跑走同一条路。
+> 唯一的输入是注册要用的**手机号**（配一次，所有品牌共用）。
 
 ---
 
@@ -140,13 +140,16 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 ### 认证链路（这也是为什么必须有微信）
 
 ```
-① 微信里把目标小程序打开（wx.login 的 jsCode 与 appid 绑死，必须开对号）
+① 自动把目标小程序打开（面板搜索 → 点结果卡片，开错号会自动关掉重试）
 ② CDP 读到小程序逻辑层 → 调 wx.login() 拿 jsCode
 ③ POST wechat.wuuxiang.com/i5xforyou/auth/login {code, mpid} → 换到 token（短效 JWT，约 110 分钟）
+   同时把 mpId / openId / unionId / 会员卡号 一起读出来写进 brands/<slug>.env
 ④ 带 token 打 scrm.wuuxiang.com/crm7game-api/api/* 做签到
 ```
 
 token 每次现取现用，没有「抓一次长期用」这回事。
+换不到 token 时的标准动作是**关掉小程序重开**（旧窗口里的登录会话会失效，
+`wx.login` 的 code 拿去换会返 `invalid code`）—— 脚本会自己重试一次。
 
 ### 不是会员怎么办
 
@@ -167,33 +170,39 @@ POST /api/member/register   data={mobile, gameId, thirdShopId, byInviteCode}
 # 1) 在 brands.json 里加一条（slug / name / appid / keyword / miniapp / carrier）
 #    不知道 appid 就先在小程序面板搜到它的「活动号」，拆包看域名确认是不是吾享
 
-# 2) 人工把这个品牌的活动小程序在微信里打开一次（或让 sign.sh --ensure 自动开）
+# 2) 跑一次 —— 它会自己开小程序、抓身份（mpId/openId/memberId/卡号）、刷 token
+python3 wxsign.py <slug> --ensure
 
-# 3) 抓身份
-docker exec woc-hook sh -c 'cd /work/wxsign && ENVFILE=/work/wxsign/brands/<slug>.env \
-  WX_APPID=<appid> NODE_PATH=/opt/wmpf/node_modules node wxident.js 60'
-
-# 4) 探测 + 找活动 id
+# 3) 看活动：lot 型会自动从活动列表里认出签到类活动并写入 gameId；
+#    sign 型没有列举接口，需要进一次签到页看活动 id，填进 brands.json 的 gameid
 python3 wxsign.py <slug> --probe
-python3 wxsign.py <slug> --discover     # 从活动列表里抄 WX_GAMEID 填进 brands/<slug>.env
+python3 wxsign.py <slug> --discover
 
-# 5) 联调
+# 4) 联调
 python3 wxsign.py <slug>
 ```
+
+**除了第 1 步要填 appId、以及 sign 型要填 gameId，其余全自动。**
+（上面 9 个品牌的 appId 和辣可可的 gameId 都已经在 `brands.json` 里了。）
 
 ---
 
 ## 七、已知限制
 
-1. **首次要自己抓一次身份**，且**青龙与微信必须同机**（token 靠客户端产生，服务端自举不了）。
+1. **青龙与微信必须同机** —— token 靠微信客户端产生，服务端自举不了。
+   除此之外**零手工**：身份、token、会员信息、活动 id 都由脚本自己取。
 2. **`lot` 型的「签到」参数结构还没真机验证**。`/api/game/lot/check` 存在、包裹体已知，
    但它要的 `data` 字段还没在生产上跑通。现有实现属于尽力而为 ——
    建议先用 `--probe` / `--discover` 看清活动结构，再开定时任务。
-3. **同一时刻只能开一个小程序** → `--all` 是串行的，每个品牌约 1~2 分钟。
-4. **注册分支只单测过**（无手机号 / 格式错 / 落 UI 三种都按预期拦住），
+3. **`sign` 型的活动 id 只能进一次签到页拿**。`gameId` 不在任何接口或小程序包里
+   （`/api/game/sign/*` 和 `/api/game/lot/list` 都要求先给 id，没有列举接口），
+   所以得人工进一次签到页。不过它是**长期常量**（辣可可那个到 2028-01），
+   填进 `brands.json` 的 `gameid` 就永久有效 —— 已经填好了，所以现在也是零手工。
+4. **同一时刻只能开一个小程序** → `--all` 是串行的，每个品牌约 1~2 分钟。
+5. **注册分支只单测过**（无手机号 / 格式错 / 落 UI 三种都按预期拦住），
    没有真发过一次注册请求 —— 那会在你账号上真实建会员。填好手机号后跑一次
    `wxsign.py <slug> --register` 才算验证过。
-5. **风控**：在非官方环境运行微信本身违反其条款，建议用闲置小号，先跑一两周再定型。
+6. **风控**：在非官方环境运行微信本身违反其条款，建议用闲置小号，先跑一两周再定型。
    服务商侧也留了口子 —— 辣可可的签到规则里明确写「非正当手段获得的积分会被清零」。
 
 ---

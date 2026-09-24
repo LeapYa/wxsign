@@ -10,13 +10,14 @@
       "slug": "lakeke",
       "name": "辣可可",
       "appid": "wxf8a17a14c0521576",
+      "gameid": "1000273253",
       "keyword": "辣可可现炒黄牛肉",
       "miniapp": "辣可可现炒黄牛肉i",
       "carrier": "sign",
       "type": "sign",
       "enabled": true,
       "verified": true,
-      "note": "参照实现，已真机联调通过（RESULT=200/415）"
+      "note": "参照实现，已真机联调通过（RESULT=200/415）。gameid 放在这里而不是 env：它不是凭证、是公开的活动常量（档期到 2028-01），这样 clone 下来就有，新用户零手工。"
     },
     {
       "slug": "shudaxia",

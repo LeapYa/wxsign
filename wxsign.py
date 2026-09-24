@@ -140,7 +140,22 @@ def jwt_exp(tok):
 
 # ───────────────────────── HTTP ─────────────────────────
 
-def api_post(env, path, data):
+def api_post(env, path, data, retries=2):
+    """带重试的 POST。实测沙箱/容器出口偶发 `502 Bad Gateway`（Tunnel connection failed），
+    这类是网络层瞬时错误、重试就好，不该直接判业务失败。"""
+    r = None
+    for attempt in range(retries + 1):
+        r = _api_post_once(env, path, data)
+        if str(r.get("code")) != "-1":
+            return r
+        if attempt < retries:
+            log("  [net] %s 第 %d 次失败（%s），%.1fs 后重试"
+                % (path, attempt + 1, str(r.get("msg"))[:60], 1.5 * (attempt + 1)))
+            time.sleep(1.5 * (attempt + 1))
+    return r
+
+
+def _api_post_once(env, path, data):
     mp = env.get("WX_MPID", "")
     if not mp:
         return {"code": "-1", "msg": "缺少 WX_MPID（先跑 wxident.js 抓身份）"}
@@ -183,24 +198,37 @@ def sh(cmd, timeout=240):
         return 124, "超时"
 
 
+def clean_leftovers():
+    """关掉残留的小程序窗口（含清掉挡住关闭按钮的隐私弹窗）。
+
+    为什么必须做：① 残留窗口会盖住微信侧边栏，面板可能认不出来；
+    ② 更要紧的是 —— **旧窗口里的登录会话会失效**，此时 wx.login() 取到的 code
+    拿去 /auth/login 会返 `invalid code`。所以「换不到 token」时的标准动作就是
+    「关掉重开」。
+    """
+    if not INSTANCE:
+        return False
+    try:
+        c = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE,
+                            CPY, cpath(CTMP, "wxclean.py")],
+                           capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        log("  [clean] 跳过（%s）" % e)
+        return False
+    for line in ((c.stdout or "") + (c.stderr or "")).splitlines():
+        if line.startswith("[clean]"):
+            log("  " + line)
+    if c.returncode not in (0, 1):
+        log("  [clean] rc=%s（不影响后续，继续试）" % c.returncode)
+    return c.returncode == 0
+
+
 def ensure_miniapp(brand):
     """把该品牌的「载体小程序」打开（token 的 jsCode 与 appId 绑死，必须开对号）。"""
     if not INSTANCE:
         log("  [ensure] 未设 WOC_INSTANCE，跳过自动开小程序")
         return False
-    # 先清残留的小程序窗口：上一次没关掉的窗口会盖在微信上，导致侧边栏点不中、面板认不出
-    # （实测：残留窗口上有隐私弹窗/悬浮提示时，关闭按钮点不中）
-    try:
-        c = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE,
-                            CPY, cpath(CTMP, "wxclean.py")],
-                           capture_output=True, text=True, timeout=300)
-        for line in ((c.stdout or "") + (c.stderr or "")).splitlines():
-            if line.startswith("[clean]") or c.returncode not in (0, 1):
-                log("  " + line)
-        if c.returncode not in (0, 1):
-            log("  [clean] rc=%s（不影响后续，继续试）" % c.returncode)
-    except Exception as e:
-        log("  [clean] 跳过（%s）" % e)
+    clean_leftovers()
 
     # 用参数列表而非拼字符串：小程序名里有中文，拼命令行容易被引号吃掉
     args = ["docker", "exec", "-e", "DISPLAY=:1",
@@ -246,6 +274,31 @@ def refresh_token(brand, env, force=False):
         if line.strip():
             log("     " + line.strip()[:200])
     return rc == 0
+
+
+def harvest_ident(brand):
+    """抓比 token 刷新更全的身份 —— 尤其是 activity 的 gameId。
+
+    wxrefresh.js 只读 storage 里的 mpId/openId/unionId/gcId；而 wxident.js 还会读
+    `getCurrentPages()` 的页面 data，能拿到 baseInfo.gameId（签到活动的 id）。
+    辣可可这类 sign 型号的活动 id 不在 /api/game/lot/list 里（那条返回 405），所以只能这样抓。
+    自动化的前提是**小程序已经开着**（前一步 ensure_miniapp 刚开过）。
+    """
+    args = ["docker", "exec",
+            "-e", "ENVFILE=" + cpath(HOME_C, "brands", "%s.env" % brand["slug"]),
+            "-e", "WX_APPID=" + brand["appid"], HOOK, "sh", "-c",
+            "cd %s && NODE_PATH=/opt/wmpf/node_modules node wxident.js 30" % HOME_C]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=300)
+        out = (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        log("  [ident] 异常：%s" % e)
+        return False
+    log("  [ident] wxident.js rc=%s" % p.returncode)
+    for line in out.splitlines():
+        if line.strip():
+            log("     " + line.strip()[:200])
+    return p.returncode == 0
 
 
 # ───────────────────────── 业务动作 ─────────────────────────
@@ -347,7 +400,9 @@ def pick_activity(items, want=("签到", "打卡", "sign")):
 def do_sign(brand, env):
     """返回 (是否成功, 业务码, 说明)"""
     slug = brand["slug"]
-    game_id = env.get("WX_GAMEID", "")
+    # gameId 不是凭证、是公开的活动常量，所以优先放 brands.json（这样新用户 clone 下来就有）；
+    # brands/<slug>.env 里的 WX_GAMEID 优先，便于临时覆盖。
+    game_id = env.get("WX_GAMEID") or brand.get("gameid", "")
     third = env.get("WX_THIRDSHOPID", "")
 
     r, mem = member_info(env, game_id, third)
@@ -378,6 +433,23 @@ def do_sign(brand, env):
         save_env(slug, env)
         log("  [member] 会员 OK：积分=%s 卡号=%s" % (m.get("score", "-"), m.get("cardNo", "-")))
 
+    # 签到要用 memberId/cardId/cardNo。全新自举时它们只可能来自 /api/member/single，
+    # 所以这里补一次；还是拿不到就别硬发（否则服务端只会回参数错，日志还看不清原因）。
+    if not (env.get("WX_MEMBERID") and env.get("WX_CARDID")):
+        log("  [member] 缺会员三件套 → 再查一次 /api/member/single")
+        r2, mem2 = member_info(env, game_id, third)
+        m2 = mem2 if isinstance(mem2, dict) else {}
+        for k, envk in (("id", "WX_MEMBERID"), ("cardId", "WX_CARDID"),
+                        ("cardNo", "WX_CARDNO"), ("mcId", "WX_THIRDSHOPID")):
+            if m2.get(k):
+                env[envk] = str(m2[k])
+        if env.get("WX_MEMBERID"):
+            save_env(slug, env)
+        else:
+            return False, str(r2.get("code")), (
+                "拿不到会员信息（memberId 为空）→ /api/member/single 返回 code=%s msg=%s"
+                % (r2.get("code"), r2.get("msg")))
+
     # 该号包内有专用签到模块 → 走最稳的 sign 接口
     if brand.get("carrier") == "sign" and game_id:
         d = api_post(env, "/api/game/sign/detail", {"gameId": game_id})
@@ -401,6 +473,13 @@ def do_sign(brand, env):
         if sc == CODE_NOT_MEMBER:
             return False, sc, "还不是会员"
         return False, sc, "签到失败：%s" % s.get("msg")
+
+    if brand.get("carrier") == "sign":
+        return False, "-", ("「%s」是 sign 型号但缺活动 id：gameId 不在任何接口或小程序包里"
+                            "（/api/game/sign/* 与 /api/game/lot/list 都要先给 id，没有列举接口），"
+                            "只能进一次签到页拿。填到 brands.json 的 gameid 或 brands/%s.env 的 "
+                            "WX_GAMEID 即可 —— 它是长期常量，填一次永久有效。"
+                            % (brand["name"], brand["slug"]))
 
     # 只有活动壳（lot）的号：先列活动，把签到类活动的原始结构打出来供接入
     r, items = lot_list(env)
@@ -446,22 +525,44 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
     slug, name = brand["slug"], brand["name"]
     log("\n===== %s（%s） appid=%s =====" % (name, slug, brand["appid"]))
     env = load_env(slug)
-    if not env.get("WX_MPID"):
-        log("  [!] 还没有 %s —— 先把小程序开着，跑一次身份采集："
-            "\n      docker exec %s sh -c 'cd %s && ENVFILE=%s WX_APPID=%s "
-            "NODE_PATH=/opt/wmpf/node_modules node wxident.js 60'"
-            % (os.path.relpath(env_path(slug), HOME), HOOK, HOME_C,
-               os.path.join(HOME_C, "brands", "%s.env" % slug), brand["appid"]))
-        log("RESULT %s code=noident msg=缺身份配置" % slug)
-        return False, "noident"
 
-    if do_ensure:
-        ensure_miniapp(brand)
-    if not refresh_token(brand, env):
-        log("  [!] token 刷新失败——小程序没开或 appId 不对")
+    # 身份（mpId/openId/unionId/gcId）与 token **全部自动获取，不需要人工抓**：
+    #   开小程序（面板搜索→点卡片）→ CDP 读 storage + wx.login → /auth/login
+    #   → 顺带把身份写回 brands/<slug>.env。第一次跑和以后跑走的是同一条路。
+    need_ident = not (env.get("WX_MPID") and env.get("WX_OPENID"))
+    if need_ident:
+        log("  [init] 这个品牌还没有身份凭证 → 自动走一遍（开小程序 → 取值 → 刷 token）")
+    if do_ensure or need_ident:
+        if INSTANCE:
+            ensure_miniapp(brand)
+        elif need_ident:
+            log("  [!] 缺身份且未设 WOC_INSTANCE → 无法自动开小程序取值")
+
+    ok_token = refresh_token(brand, env, force=need_ident)
+    if not ok_token and INSTANCE:
+        # 换不到 token 最常见的原因是：小程序窗口还是上一次留下的**旧上下文**，
+        # 里面的登录会话已失效 → wx.login 的 code 拿去换 token 会返 invalid code。
+        # 标准动作是关掉重开，再试一次。
+        log("  [retry] 换不到 token → 关掉重开小程序再试（旧上下文里的 code 会失效）")
+        if ensure_miniapp(brand):
+            time.sleep(3)
+            ok_token = refresh_token(brand, env, force=True)
+    if not ok_token:
+        log("  [!] token 刷新失败——小程序没开成，或 appId 配错了（当前 %s）" % brand["appid"])
         log("RESULT %s code=notoken msg=token 不可用" % slug)
         return False, "notoken"
-    env = load_env(slug)          # 刷新后重新读
+    env = load_env(slug)          # 刷新后重新读（身份可能刚被写进来）
+
+    if not env.get("WX_MPID"):
+        log("  [!] 仍拿不到 mpId：小程序没开成，或 appId 配错了（当前 %s）" % brand["appid"])
+        log("RESULT %s code=noident msg=拿不到身份" % slug)
+        return False, "noident"
+
+    # sign 型号的 activity id 不在活动列表接口里（辣可可那条返回 405），得从页面 data 抓一次
+    if brand.get("carrier") == "sign" and not (env.get("WX_GAMEID") or brand.get("gameid")):
+        harvest_ident(brand)
+        env = load_env(slug)
+
 
     if discover:
         r, items = lot_list(env)

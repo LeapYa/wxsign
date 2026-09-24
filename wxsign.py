@@ -311,7 +311,7 @@ def ensure_helpers():
     if not INSTANCE:
         return False
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
-            ("wxfind.py", "wxcdp.py", "pkgprobe.py", "wxclean.py", "wxopen.py")]
+            ("wxfind.py", "wxcdp.py", "pkgprobe.py", "wxclean.py", "wxopen.py", "wxreg.py")]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖
@@ -415,10 +415,11 @@ def register_member(brand, env):
     mobile 是**明文手机号** —— 加密串只有在走微信弹窗授权时才需要。
     `/api/member/register` 在**每个吾享游戏型包里都有**（实测 6/6），所以这条能通用。
 
-    手机号来源（按优先级）：
-      1. brands/<slug>.env 的 WX_REGISTER_PHONE（单品牌专属号）
-      2. 进程环境变量 WXSIGN_REGISTER_PHONE（青龙里配一次，所有品牌共用）
-    方式 WX_REGISTER_MODE：api（默认，有号就直连注册）| ui（走微信授权弹窗）| auto
+    手机号是**可选的**，不是必须的 —— 这一点之前写错过：
+      · 默认（不配手机号）走 **UI 授权**：驱动微信界面点「签到/参与入口 → 隐私协议 →
+        授权 → 微信手机号授权弹窗 → 允许」，手机号由微信从你自己账号里给，全自动。
+      · 配了手机号（`WX_REGISTER_PHONE` / `WXSIGN_REGISTER_PHONE`）才走 API 直连（零 UI，更快）。
+      · 该账号绑了多个号码时，UI 路要用 `WX_REGISTER_PHONE_INDEX`（或手机号 + tesseract OCR）挑一行。
     同一个人可以在多个品牌各注册一次会员，互不影响。
     """
     mode = (env.get("WX_REGISTER_MODE") or os.environ.get("WXSIGN_REGISTER_MODE") or "auto").lower()
@@ -426,7 +427,7 @@ def register_member(brand, env):
     if mode == "auto":
         mode = "api" if phone else "ui"
     log("  [register] 还不是会员 → 方式=%s 手机号=%s"
-        % (mode, "已设" if phone else "(未设)"))
+        % (mode, "已设（走 API 直连）" if phone else "(未设，走微信授权弹窗)"))
 
     if mode == "api":
         if not re.fullmatch(r"1\d{10}", phone):
@@ -443,28 +444,36 @@ def register_member(brand, env):
             return True, "API 注册成功"
         return False, "API 注册失败：%s（可改 WX_REGISTER_MODE=ui 走微信弹窗）" % r.get("msg")
 
-    # UI 兜底：驱动微信的手机号授权弹窗。脚本在各项目里都不一样，所以用环境变量指过去。
-    ui_py = os.environ.get("WXSIGN_UI_REGISTER_PY", "")
-    if not ui_py or not os.path.exists(ui_py):
-        return False, ("UI 注册需要 WXSIGN_UI_REGISTER_PY 指向 ui_register.py"
-                       "（辣可可项目里那份，会点微信手机号授权弹窗）")
+    # UI 路径：驱动微信界面把授权走完（脚本内置为 wxreg.py，由 ensure_helpers 投放）。
+    # 全自动 —— 手机号由微信从你自己账号里给，不需要你提供。
     if not INSTANCE:
         return False, "UI 注册需要 WOC_INSTANCE（要操作微信界面）"
-    inner = ("cd %s && SHOT_DIR=%s REG_PHONE_INDEX=%s REG_PHONE=%s python3 %s"
-             % (CTMP, CTMP + "/shots",
-                env.get("WX_REGISTER_PHONE_INDEX", "0") or "0", phone,
-                cpath(CTMP, "ui_register.py")))
+    if not os.path.exists(os.path.join(HERE, "wxreg.py")):
+        return False, "缺 wxreg.py（UI 注册脚本）"
+    ensure_helpers()
+    envs = ["-e", "DISPLAY=:1", "-e", "SHOT_DIR=" + cpath(CTMP, "shots")]
+    if env.get("WX_REGISTER_PHONE_INDEX"):
+        envs += ["-e", "WXSIGN_REGISTER_PHONE_INDEX=" + env["WX_REGISTER_PHONE_INDEX"]]
+    if phone:
+        envs += ["-e", "WXSIGN_REGISTER_PHONE=" + phone]
+    if os.environ.get("WXSIGN_REG_CLICK"):
+        envs += ["-e", "WXSIGN_REG_CLICK=" + os.environ["WXSIGN_REG_CLICK"]]
+    if os.environ.get("WXSIGN_REG_SCROLL"):
+        envs += ["-e", "WXSIGN_REG_SCROLL=" + os.environ["WXSIGN_REG_SCROLL"]]
     try:
-        subprocess.run(["docker", "cp", ui_py, "%s:%s" % (INSTANCE, cpath(CTMP, "ui_register.py"))],
-                       capture_output=True, text=True, timeout=120)
-        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", "-e", "SHOT_DIR=" + CTMP + "/shots",
-                            INSTANCE, "sh", "-c", inner],
+        p = subprocess.run(["docker", "exec"] + envs + [INSTANCE, CPY, cpath(CTMP, "wxreg.py")],
                            capture_output=True, text=True, timeout=900)
-        for line in ((p.stdout or "") + (p.stderr or "")).splitlines()[-25:]:
-            log("     " + line[:200])
     except Exception as e:
         return False, "UI 注册异常：%s" % e
-    return True, "UI 注册流程已跑（结果看上面的日志/截图）"
+    for line in ((p.stdout or "") + (p.stderr or "")).splitlines()[-25:]:
+        log("     " + line[:200])
+    if p.returncode == 4:
+        return False, "UI 注册没跑：当前不在小程序页面（要先把目标小程序开在签到/活动页）"
+    if p.returncode != 0:
+        return False, ("UI 注册没走完（rc=%s）—— 看上面的 [ui] 日志与 %s/shots/reg_*.png。"
+                       "入口坐标可能需要按品牌调（WXSIGN_REG_CLICK=x,y，比例或像素）"
+                       % (p.returncode, CTMP))
+    return True, "UI 注册流程已跑"
 
 
 def pick_activity(items, want=("签到", "打卡", "sign")):

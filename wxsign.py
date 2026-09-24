@@ -404,6 +404,10 @@ def restart_hook(wait=60):
         subprocess.run(["docker", "exec", HOOK, "sh", "-c", kill],
                        capture_output=True, text=True, timeout=90)
         time.sleep(2)
+        # ⚠️ 先把旧日志删掉再启动：否则「日志里有 script loaded」可能是**上一轮**留下的，
+        #    就绪判断会在 3 秒内假成功（实测踩过），之后所有刷新都白跑。
+        subprocess.run(["docker", "exec", HOOK, "sh", "-c", "rm -f /tmp/wmpf.log"],
+                       capture_output=True, text=True, timeout=30)
         subprocess.run(["docker", "exec", "-d", HOOK, "sh", "-c",
                         "cd %s && node node_modules/ts-node/dist/bin.js src/index.ts "
                         "> /tmp/wmpf.log 2>&1" % WMPF_DIR],
@@ -451,9 +455,18 @@ def ensure_miniapp(brand, retry_hard=True):
     ok = rc in (0, 4)
 
     if not ok and retry_hard:
-        # 打不开面板的头号原因就是那批关不掉的推广小程序窗口。常规关窗治不了它们，
-        # 只能硬清运行时 → 顺带重启 hook → 再试一次。这样批量跑才不会「一崩到底」。
-        log("  [ensure] 打开失败（rc=%s）→ 硬清残留 + 重启 hook，再试一次" % rc)
+        # 打不开面板有两大原因，处置完全不同：
+        #   ① 侧边栏被**关不掉的推广窗口**堵死 → 只能硬清运行时；
+        #   ② 只是 hook / 面板状态不对 → 重启 hook 就够。
+        # 而硬清是**有代价的**：小程序面板本身也由 WeChatAppEx 渲染，杀了运行时面板就再也
+        # 开不起来（实测踩过：一次硬清 19 个进程，之后每个号都卡在「没能确认小程序面板」）。
+        # 所以先花十几秒重启 hook 试一次，**还不行为才动硬的**。
+        log("  [ensure] 打开失败（rc=%s）→ 先重启 hook（重新 attach）再试一次" % rc)
+        restart_hook()
+        rc, out = _wxopen(brand)
+        ok = rc in (0, 4)
+    if not ok and retry_hard:
+        log("  [ensure] 重启 hook 也没打开 → 硬清小程序运行时（⚠️ 会连坐面板，之后要靠 hook 重挂）")
         clean_leftovers(hard=True)
         rc, out = _wxopen(brand)
         ok = rc in (0, 4)
@@ -910,17 +923,18 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
             time.sleep(3)
             ok_token = refresh_token(brand, env, force=True)
     if not ok_token and INSTANCE:
-        # 第二级（必须有，否则会「一崩到底」）：硬清小程序运行时 + 重启 hook + 重开。
+        # 第二级：只**重启 hook**（重新 attach），然后重开小程序再刷一次。
         #
-        # 为什么这一级不可省：WMPFDebugger **只在启动时 attach 一次**，而且只挂在**某一个**
-        # WeChatAppEx 进程上；而微信会为小程序起多个运行时进程。残留窗口一多，新开的小程序
-        # 就可能落在**没被挂上**的那个进程里 —— 表现是 `[enum] 有 wx 的上下文=[3,6,8]` 里
-        # 压根没有目标小程序、每个 ctx 都「拿不到 mpId」，然后报「token 刷新失败」。
-        # 实测：一批 52 个号里 80% 死在这一步，而只要硬清一次 + 重启 hook 就立刻正常。
-        # （日志里那句「没能换到 token（确认目标小程序已打开、且 appId 配置正确）」是**误导**的，
-        #   小程序其实开着、appId 也没错，只是 hook 没挂上它。）
-        log("  [retry] 还是换不到 → 硬清小程序运行时 + 重启 hook，再开一次")
-        clean_leftovers(hard=True)              # 内部会在杀掉运行时后自动重启 hook
+        # ⚠️ 这里**故意不杀 WeChatAppEx**（`clean_leftovers(hard=True)`）—— 试过，会更糟：
+        #    小程序面板本身也是 WeChatAppEx 渲染的，19 个运行时一杀，面板就再也开不起来了
+        #    （实测 `[ensure] 打开失败（rc=3）→ 没能确认小程序面板`），把「读不到上下文」
+        #    升级成「连面板都没了」。硬清只在**确有关不掉的残留窗口**时才用（见 ensure_miniapp）。
+        #
+        # 为什么值得试这一级：WMPFDebugger 只在启动时 attach，且残留窗口一多，新开的小程序
+        # 可能落在没被挂上的运行时里 —— 日志表现是 `[enum] 有 wx 的上下文=[...]` 里
+        # 没有目标小程序、每个 ctx 都「拿不到 mpId」，而不是「小程序没开成」。
+        log("  [retry] 还是换不到 → 重启 hook（重新 attach）后再开一次")
+        restart_hook()
         if ensure_miniapp(brand):
             time.sleep(3)
             ok_token = refresh_token(brand, env, force=True)

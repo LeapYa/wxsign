@@ -966,6 +966,18 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         is_member = str(r.get("code")) == CODE_OK
         log("  [probe·member] code=%s → %s"
             % (r.get("code"), "已是会员" if is_member else "还不是会员（survey 还没法答）"))
+        # ⚠️ 是会员就**当场把会员三件套写回 env**再打 survey。
+        #    不写回的话：member/single 说「是会员」，但 env 里 memberId 还是空的，
+        #    sign/survey 就会拿空参数去问 → 又返 411 → 又被误判成「不是签到」
+        #    （实测踩过：过桥缘系的另两个号 new48/new49 就是这样被判成 🟡 的）。
+        #    member/single 与 sign/survey 用的是**两套参数**，这一层很容易漏。
+        if is_member and isinstance(mem, dict) and not env.get("WX_MEMBERID"):
+            for k, envk in (("id", "WX_MEMBERID"), ("cardId", "WX_CARDID"),
+                            ("cardNo", "WX_CARDNO"), ("mcId", "WX_THIRDSHOPID")):
+                if mem.get(k):
+                    env[envk] = str(mem[k])
+            save_env(slug, env)
+            log("  [probe·member] 已把会员三件套写回 env（memberId/cardId/cardNo）")
 
         sd = api_post(env, "/api/game/sign/detail", {"gameId": gid})
         det = content_of(sd) or {}

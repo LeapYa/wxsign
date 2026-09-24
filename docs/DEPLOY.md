@@ -111,6 +111,67 @@ sha256 `b7d0f8d53e9f648bc2c77a6096a04100d008f2d9f0d3988a2a4859b5992aca0a`）。
 
 ---
 
+### 2.6 让小程序以「手机竖版」运行（建议做）
+
+云微镜像的 openbox 有一条**通配**规则，把所有新窗口无条件最大化：
+
+```xml
+<!-- /etc/xdg/openbox/rc.xml 最后一行 -->
+<application class="*"><maximized>yes</maximized></application>
+```
+
+后果：小程序窗口被拉成整个虚拟屏（1280x1024）。页面于是按**桌面宽屏**布局渲染 ——
+「立即签到」那种按钮会被拉成 1000+px 宽的巨条，元素位置也和真机差很远。
+（这不是微信的问题，也不是「Linux 版就这样」，就是这一条配置。）
+
+改成**只最大化「微信」**（主窗口与小程序面板的标题都叫「微信」，小程序窗口标题是品牌名，
+正好能区分）：
+
+```bash
+# ① 备份（可回滚）
+docker exec <实例> sh -c 'cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml.orig.bak'
+# ② 改规则
+docker exec <实例> sh -c 'sed -i "s|<application class=\"\*\"><maximized>yes</maximized></application>|<application name=\"微信*\"><maximized>yes</maximized></application>|" /etc/xdg/openbox/rc.xml'
+# ③ 放到 HOME（= /config，挂载卷）优先位置，容器重建也不丢
+docker exec <实例> sh -c 'cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml'
+# ④ 重载
+docker exec <实例> sh -c 'DISPLAY=:1 openbox --reconfigure'
+```
+
+实测结果：小程序窗口变成 **410x776 @ (435,124)** 的手机竖版，页面按 410 CSS px 布局；
+主窗口与面板仍是 1280x1024（它们的标题命中「微信*」）。
+
+> ⚠️ `--reconfigure` **不会重排已经打开的窗口**。已有的小程序窗口要关掉重开才生效；
+> 如果面板窗口是在改规则**之前**创建的，它会保持原样，但下次重开就会按新规则最大化。
+
+**回滚**：
+
+```bash
+docker exec <实例> sh -c 'cp /config/.config/openbox/rc.xml.orig.bak /etc/xdg/openbox/rc.xml && cp /etc/xdg/openbox/rc.xml /config/.config/openbox/rc.xml && DISPLAY=:1 openbox --reconfigure'
+```
+
+#### 这对脚本意味着什么（重要）
+
+小程序窗口不再铺满屏幕、**位置也不在 (0,0)** → 所有点击与截图都必须加**窗口原点**：
+
+```
+屏幕坐标 = 窗口原点 + 页面坐标
+```
+
+换算这么简单，是因为实测（用 CDP 问页面自己）：
+
+```
+window.screenX/screenY = (435,124)   ← 与 xdotool 报的窗口原点完全一致
+innerHeight(779) > outerHeight(776)  ← 顶部那条「⌂ 首页 ●●● ─ ⊙」是**覆盖层**，不占视口
+devicePixelRatio = 1
+```
+
+所以**不需要**补偿标题栏高度。脚本已按此实现：`wxwin.py` 负责取窗口几何，
+`wxreg.py` 的 `click()/grab()/grab_png()` 全部走页面坐标并自动加偏移。
+
+> 不开这一节也能跑（窗口铺满时页面坐标恰好等于屏幕坐标），但那纯属巧合：
+> 一旦窗口位置变化就全错。开了之后是**正确**的写法。
+
 ## 3. 装青龙
 
 ```bash

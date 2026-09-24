@@ -40,6 +40,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wxwin                                     # noqa: E402
+
 DISPLAY = os.environ.get("DISPLAY", ":1")
 SHOT_DIR = os.environ.get("SHOT_DIR", "/tmp/shots")
 ROW_STEP = 0.045          # 号码行行距（占屏高比例）
@@ -61,16 +64,66 @@ def run(cmd):
 
 
 def display_size():
+    """整块虚拟屏的尺寸（主窗口 / 小程序面板用）。"""
     out = run("DISPLAY=%s xdotool getdisplaygeometry" % DISPLAY).strip().split()
     return int(out[0]), int(out[1])
 
 
-def grab(W, H):
+# ───────────────── 小程序窗口：页面坐标 → 屏幕坐标 ─────────────────
+# ⚠️ 坐标不再等于屏幕坐标，必须加窗口原点。
+#
+# 云微镜像的 openbox 原本有一条通配规则把所有窗口无条件最大化
+# （`<application class="*"><maximized>yes</maximized></application>`），
+# 小程序被拉成 1280x1024 —— 那时「页面坐标 == 屏幕坐标」纯属巧合。
+# 改成只最大化「微信」（主窗口 + 面板）之后，小程序窗口恢复成手机竖版
+# （实测 410x776 @ 435,124），位置也不再固定在 (0,0)。
+#
+# 换算为什么是简单的平移、不需要补标题栏高度：实测用 CDP 问页面自己，
+# window.screenX/screenY = (435,124) 与窗口原点**完全一致**，
+# 且 innerHeight(779) > outerHeight(776) —— 顶部那条「⌂ 首页 ●●● ─ ⊙」
+# 是**覆盖层**，不占视口。所以：屏幕 = 窗口原点 + 页面坐标（DPR=1）。
+_WIN = [0, 0, 0, 0]
+
+
+def win_rect():
+    """当前小程序窗口 (x,y,w,h)；没有则 None。"""
+    r = wxwin.rect()
+    if r:
+        _WIN[:] = r
+    return r
+
+
+def origin():
+    """页面 (0,0) 对应的屏幕坐标。没有小程序窗口时退化为 (0,0)。"""
+    r = win_rect()
+    return (r[0], r[1]) if r else (0, 0)
+
+
+def win_size():
+    """页面坐标系下的尺寸（就是小程序窗口尺寸）。没有窗口时退化为屏幕。"""
+    r = win_rect()
+    return (r[2], r[3]) if r else display_size()
+
+
+def grab(W=0, H=0, win=True):
+    """抓一帧。win=True 抓**小程序窗口区域**（页面坐标空间），False 抓整屏。"""
+    if win:
+        r = win_rect()
+        if not r:
+            raise RuntimeError("没有小程序窗口（先把目标小程序打开）")
+        ox, oy, w, h = r
+        if not W or not H:
+            W, H = w, h
+        src = "%s+%d,%d" % (DISPLAY, ox, oy)
+    else:
+        if not W or not H:
+            W, H = display_size()
+        src = DISPLAY
     cmd = ("DISPLAY=%s ffmpeg -loglevel error -f x11grab -video_size %dx%d -i %s "
-           "-frames:v 1 -f rawvideo -pix_fmt rgb24 -" % (DISPLAY, W, H, DISPLAY))
+           "-frames:v 1 -f rawvideo -pix_fmt rgb24 -" % (DISPLAY, W, H, src))
     d = subprocess.run(cmd, shell=True, capture_output=True).stdout
     if len(d) < W * H * 3:
-        raise RuntimeError("截屏失败（%d 字节）" % len(d))
+        raise RuntimeError("截屏失败（%d 字节，期望 %d）" % (len(d), W * H * 3))
     return d
 
 
@@ -85,11 +138,27 @@ def grab_file(path):
     return d, W, H
 
 
-def grab_png(W, H, name):
+def grab_png(W=0, H=0, name="shot.png", win=True):
+    """存一张 PNG。win=True 抓小程序窗口区域（页面坐标空间）。"""
     os.makedirs(SHOT_DIR, exist_ok=True)
     p = os.path.join(SHOT_DIR, name)
+    if win:
+        r = win_rect()
+        if r:
+            ox, oy, w, h = r
+            src = "%s+%d,%d" % (DISPLAY, ox, oy)
+            if not W or not H:
+                W, H = w, h
+        else:
+            src = DISPLAY
+            if not W or not H:
+                W, H = display_size()
+    else:
+        src = DISPLAY
+        if not W or not H:
+            W, H = display_size()
     run("DISPLAY=%s ffmpeg -loglevel error -y -f x11grab -video_size %dx%d -i %s -frames:v 1 %s"
-        % (DISPLAY, W, H, DISPLAY, p))
+        % (DISPLAY, W, H, src, p))
     return p
 
 
@@ -226,13 +295,45 @@ def text_bands(buf, W, H, y0, y1, x0, x1):
     return out
 
 
-def click(x, y):
-    run("DISPLAY=%s xdotool mousemove %d %d; sleep 0.4; DISPLAY=%s xdotool click 1" % (DISPLAY, x, y, DISPLAY))
+def click(x, y, raw=False):
+    """点击。x,y 是**小程序页面坐标**（自动加窗口原点）；raw=True 时按屏幕坐标点。"""
+    if not raw:
+        ox, oy = origin()
+        x, y = ox + x, oy + y
+    run("DISPLAY=%s xdotool mousemove %d %d; sleep 0.4; DISPLAY=%s xdotool click 1"
+        % (DISPLAY, x, y, DISPLAY))
 
 
 def scroll_down(times, W, H):
-    run(("DISPLAY=%s xdotool mousemove %d %d; " % (DISPLAY, W // 2, H // 2))
+    """在页面中部滚轮（坐标同样是页面坐标，自动加窗口原点）。"""
+    ox, oy = origin()
+    run(("DISPLAY=%s xdotool mousemove %d %d; " % (DISPLAY, ox + W // 2, oy + H // 2))
         + "".join("DISPLAY=%s xdotool click 5; sleep 0.25; " % DISPLAY for _ in range(times)))
+
+
+# ── 标题栏左上角的「回去」按钮 ──
+# 页面栈 >1 层时它是「< 返回」，只剩 1 层时是「⌂ 回首页」—— 两者位置相同，
+# 都点它即可。实测（410x776 窗口）按钮中心在窗口内 (24,40)；
+# 按比例写更稳：0.058W / 0.052H。
+# ⚠️ 它是**微信画的覆盖层**，不在小程序 DOM 里，所以只能按坐标点。
+def nav_point():
+    r = win_rect()
+    if not r:
+        return None
+    _, _, w, h = r
+    return int(w * 0.058), int(h * 0.052)
+
+
+def go_back():
+    """点标题栏左上角退回上一层（或回首页）。返回是否发了点击。"""
+    p = nav_point()
+    if not p:
+        print("[nav] 没有小程序窗口，无法返回")
+        return False
+    print("[nav] 点标题栏左上角「返回 / 回首页」%s（页面坐标）" % (p,))
+    click(p[0], p[1])
+    time.sleep(2.5)
+    return True
 
 
 def ocr_ok():
@@ -371,13 +472,21 @@ def detect(buf, W, H):
     card = white_card(buf, W, H)
     green = blob(buf, W, H, is_green, 0, W, 0, H)
     orange = blob(buf, W, H, is_orange, int(W * 0.10), int(W * 0.90), int(H * 0.30), int(H * 0.95), min_hits=8)
-    # 「绿按钮」必须同时满足：够宽（≥0.15W，排除绿色小头像/图标）+ 够扁（≤0.08H，排除纵向聚合）
-    # 只设上界会把微信聊天列表里的绿色头像当成按钮（实测误判过）
     gw = (green[2] - green[0]) if green else 0
     gh = (green[3] - green[1]) if green else 0
+    # 手机号弹窗的特征：**一张白色卡片 + 卡内接近通栏的绿按钮**（那个「允许」）。
+    # ⚠️ 判据必须用「占**卡片**宽」而不是「占**屏幕**宽」：
+    #    早先写的是「绿按钮占屏幕 15%~25%」，那是按 1280 全屏标定的；
+    #    窗口变成 410 宽的手机竖版后整个失效 —— 实测把来菜首页里绿色的
+    #    「进行中」文字（宽 62px ≈ 0.15W）当成了弹窗按钮，导致流程直接跑挂。
+    card_w = (card[2] - card[0]) if card else 0
+    if card_w:
+        phone_popup = bool(green and gw >= card_w * 0.55 and gh <= H * 0.12)
+    else:
+        # 没识别出白卡时的兜底：弹窗按钮在窄窗口下几乎是通栏的
+        phone_popup = bool(green and gw >= W * 0.45 and gh <= H * 0.12)
     out = {"card": card, "green": green, "orange": orange,
-           "phone_popup": bool(green and W * 0.15 <= gw < W * 0.25 and gh <= H * 0.08),
-           "check": None, "rows": []}
+           "phone_popup": phone_popup, "check": None, "rows": []}
     if out["phone_popup"]:
         # ✓ 锚点：绿按钮上方的绿色像素（排除按钮本身）
         out["check"] = blob(buf, W, H, is_green, 0, W, 0, green[1] - 6, step=2, min_hits=2)
@@ -429,16 +538,16 @@ def main():
         analyze(a.analyze)
         return
 
-    W, H = display_size()
-    print("[ui] 屏幕 %dx%d INDEX=%s PHONE=%s OCR=%s"
-          % (W, H, a.index or "(未设)", a.phone or "(未设)",
-             "有" if ocr_ok() else "无"))
-
-    if in_wechat_main(grab(W, H), W, H):
-        print("[ui] ✗ 当前是**微信主窗口**，不在小程序页面 ——"
-              "注册必须站在目标小程序的签到/活动页上（那种页面没有左侧图标列）")
-        grab_png(W, H, "reg_wrong_page.png")
+    if not win_rect():
+        print("[ui] ✗ 没有小程序窗口 —— 注册必须站在目标小程序的签到/活动页上。"
+              "先让引擎开小程序（--ensure），或手工在微信里打开一次。")
+        grab_png(0, 0, "reg_wrong_page.png", win=False)
         sys.exit(4)
+
+    W, H = win_size()           # 页面坐标空间（= 小程序窗口尺寸，实测 410x776）
+    print("[ui] 小程序窗口 %dx%d @ %d,%d | 页面(0,0) → 屏幕 %s | INDEX=%s PHONE=%s OCR=%s"
+          % (W, H, win_rect()[0], win_rect()[1], origin(),
+             a.index or "(未设)", a.phone or "(未设)", "有" if ocr_ok() else "无"))
 
     scroll = int(envv("WXSIGN_REG_SCROLL", default="0") or 0)
     if scroll:
@@ -464,6 +573,8 @@ def main():
         print("[ui] wxdom 不可用（%s）→ 退回像素识别" % e)
     clicked = set()
     clicked_px = set()       # 像素捏到的按钮位置，点过就不再点（否则会在同一处反复空点、占着轮次不滚动）
+    scroll_rounds = 0        # 连续「没点到任何东西、只能滚」的轮数（用来发现「跑偏了」）
+    nav_tries = 0            # 已经「退回上一层重来」了几次（设上限，避免来回绕圈）
 
     for step in range(1, 17):
         buf = grab(W, H)
@@ -540,6 +651,7 @@ def main():
                 if not a.dry_run:
                     click(target["cx"], target["cy"])
                 clicked.add((target["text"], target["cx"], target["cy"]))
+                scroll_rounds = 0        # 点到了东西 = 有进展，重置「疑似跑偏」计数
                 time.sleep(3)
                 continue
 
@@ -590,9 +702,30 @@ def main():
                 if not changed:
                     print("     ⚠️ 点 3 次页面都没变 —— 坐标可能不对，可调 WXSIGN_REG_CLICK")
         else:
-            print("[ui] 第%d步：无按钮 → 滚动找「立即签到」" % step)
-            if not a.dry_run:
-                scroll_down(3, W, H)
+            # 候选用完 → 滚动把按钮露出来。
+            # 滚了几轮仍然"这一页上没有任何可点的目标"，就怀疑是**误点跑到别的页面**了 ——
+            # 点标题栏左上角退回去重来。那个按钮：页面栈 >1 层时是「< 返回」，
+            # 只剩 1 层时是「⌂ 回首页」，**位置相同**，所以不管跑多远，点它总能往回走。
+            if scroll_rounds < 3:
+                scroll_rounds += 1
+                print("[ui] 第%d步：无按钮 → 滚动找目标（第 %d/3 次）" % (step, scroll_rounds))
+                if not a.dry_run:
+                    scroll_down(3, W, H)
+            else:
+                if nav_tries >= 2:
+                    print("[nav] 已经退回过 2 次、这页仍然没有可点目标 → 停手"
+                          "（该账号在这个品牌可能就是没有要办的事）")
+                    break
+                nav_tries += 1
+                print("[nav] 入口点完了、也滚了 3 轮，这页始终没有可点目标 → "
+                      "疑似点偏到别的页面，退回上一层重来（第 %d 次）" % nav_tries)
+                scroll_rounds = 0
+                # ⚠️ 只清「像素点过」的记录，**不清 clicked** ——
+                #    否则退回首页后会把同一个「打卡签到」再点一遍、又进签到页、又退回来，
+                #    来回绕圈直到轮次耗尽（实测踩过）。
+                clicked_px.clear()
+                if not a.dry_run and not go_back():
+                    break
         time.sleep(3.5)
 
     print("[ui] 轮次用尽 —— 若没注册成功，看 %s/reg_*.png 调 WXSIGN_REG_CLICK" % SHOT_DIR)

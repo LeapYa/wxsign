@@ -311,8 +311,8 @@ def ensure_helpers():
     if not INSTANCE:
         return False
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
-            ("wxfind.py", "wxcdp.py", "wxdom.py", "pkgprobe.py", "wxclean.py",
-             "wxopen.py", "wxreg.py")]
+            ("wxfind.py", "wxcdp.py", "wxdom.py", "wxwin.py", "pkgprobe.py",
+             "wxclean.py", "wxopen.py", "wxreg.py")]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖

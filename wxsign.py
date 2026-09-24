@@ -733,26 +733,43 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         log("  [probe·lot/list] code=%s content=%s"
             % (r2.get("code"), json.dumps(items, ensure_ascii=False)[:600]))
 
-        # 「这个号到底有没有东西可做」要看**两条**，不能只看 lot/list：
-        # ⚠️ 实测辣可可（sign 型）的 lot/list 也返 405 —— 它的签到活动**不走活动列表**。
-        #    只按 lot/list 判会把辣可可误当成「没活动」。
+        # 「这个号能不能签到」要看**能不能拿到签到记录**，判据演进过三轮：
+        #   ✗ 包内有 pages/sign / game/sign 字面量 → 只证明**壳**有能力，证不了租户开了活动
+        #   ✗ /api/game/lot/list 200               → 辣可可（sign 型）这里也返 405，会漏掉它
+        #   ✗ /api/game/sign/detail 200            → **只说明这个 gameId 有效**！
+        #        实测蜀大侠（周三会员日抽奖）、农耕记（周四秒杀）的 sign/detail 也是 200，
+        #        但它们的 isCumulativeSign = null、sign/survey 返 406 —— **不是签到活动**。
+        #   ✓ /api/member/sign/survey 200          → 能拿到 signNum / lastSignDate 才是真能签
         acts = items.get("list") if isinstance(items, dict) else None
         gid = env.get("WX_GAMEID") or brand.get("gameid") or ""
         if not gid and acts:
             gid = str(acts[0].get("id") or "")
-        if gid:
-            sd = api_post(env, "/api/game/sign/detail", {"gameId": gid})
-            log("  [probe·sign/detail] gameId=%s code=%s msg=%s"
-                % (gid, sd.get("code"), sd.get("msg")))
-            if str(sd.get("code")) == CODE_OK:
-                log("  [probe] ✅ 这个号有**签到活动**（sign/detail 200）")
-            elif acts:
-                log("  [probe] 🟡 有活动但不支持签到：%s" % str(acts[0].get("name"))[:30])
-            else:
-                log("  [probe] ⚪ 服务端没有活动（该租户未配置）")
+        if not gid:
+            log("  [probe] ⚪ 服务端没有活动，也没有可用的 gameId（lot/list=%s）" % r2.get("code"))
+            return True, "probe"
+
+        sd = api_post(env, "/api/game/sign/detail", {"gameId": gid})
+        det = content_of(sd) or {}
+        name = str(det.get("name"))[:30] if isinstance(det, dict) else ""
+        log("  [probe·sign/detail] gameId=%s code=%s name=%s isCumulativeSign=%s"
+            % (gid, sd.get("code"), name,
+               det.get("isCumulativeSign") if isinstance(det, dict) else "-"))
+
+        sv = api_post(env, "/api/member/sign/survey", {
+            "gameId": gid, "memberId": env.get("WX_MEMBERID", ""),
+            "cardId": env.get("WX_CARDID", ""), "cardNo": env.get("WX_CARDNO", "")})
+        svi = content_of(sv) or {}
+        log("  [probe·sign/survey] code=%s content=%s"
+            % (sv.get("code"), json.dumps(svi, ensure_ascii=False)[:200]))
+
+        if str(sv.get("code")) == CODE_OK:
+            log("  [probe] ✅ 能签到：%s（signNum=%s）"
+                % (name, svi.get("signNum") if isinstance(svi, dict) else "-"))
+        elif str(sd.get("code")) == CODE_OK:
+            log("  [probe] 🟡 有活动但**不是签到**（sign/survey 非 200）：%s —— "
+                "这类号只能参与抽奖/秒杀，签不了" % name)
         else:
-            log("  [probe] ⚪ 服务端没有活动，也没有可用的 gameId（lot/list=%s）"
-                % r2.get("code"))
+            log("  [probe] ⚪ 服务端没有活动（该租户未配置）")
         return True, "probe"
 
     ok, code, msg = do_sign(brand, env)

@@ -1,146 +1,207 @@
-# 吾享（wuuxiang）签到 · 活动合集
+# 微信小程序签到合集
 
-> 面向**青龙面板**的吾享系微信小程序签到集合。
-> 吾享 = 天财商龙旗下餐饮 SaaS（`wechat.wuuxiang.com` / `scrm.wuuxiang.com`），
-> 辣可可、农耕记、蜀大侠、来菜、九村烤脑花、酒煮江湖、肉串汪等餐饮品牌都是它的租户。
+微信小程序的每日签到脚本合集，青龙面板 / cron 都能跑。
 
-## 一、为什么是「一个引擎 + N 份配置」而不是 N 套脚本
+目前覆盖 **吾享（wuuxiang）** 系 —— 天财商龙旗下的餐饮 SaaS。
+辣可可、农耕记、蜀大侠、来菜、九村烤脑花、酒煮江湖、肉串汪、谷连天、麻辣空间
+用的都是它，所以**一套脚本就能全签**。
 
-实测确认（拆包 + 真机联调）：
+> **上手就三步**：把 `wxsign/` 放进青龙脚本目录 → 配几个环境变量 → 加一条定时任务
+> `bash /ql/data/scripts/wxsign/sign.sh`。
+>
+> 唯一需要手工的是**首次抓一次身份**：每个品牌要在微信里把对应小程序打开一次，
+> 脚本才能从你账号里读出 `openId / mpId`（这是你自己的登录态，没法共用、也没法替你抓）。
+> 抓完就一劳永逸，之后每天自动跑。
 
-1. **吾享全家共用同一套后端**，所有业务接口都是
-   `POST https://scrm.wuuxiang.com/crm7game-api/api/<path>`，
-   包裹体统一为 `{"mpId":…, "openId":…, "unionId":…, "data":{…}}`，
-   鉴权头 `Authorization: <token>` + `crm7-mpId: <mpId>`（可选 `csl-GC-Shardingkey`）。
-   换品牌只换**参数**，不换协议。
-2. **唯一的品牌差异是四个值**：`appId`（哪个小程序）、`mpId`（哪个租户）、
-   `gameId`（哪个活动）、以及账号在该租户下的会员身份。
-3. 所以合集 = `wxsign.py`（引擎，通用）+ `brands/<slug>.env`（每品牌一份凭证）。
+---
 
-### 已鉴别出的「载体小程序」类型
+## 一、能签到的小程序（9 个）
 
-| carrier | 包内特征 | 承载 |
+| 品牌 | 小程序 | appId | 首页活动 | 状态 |
+|---|---|---|---|---|
+| 辣可可 | 辣可可现炒黄牛肉i | `wxf8a17a14c0521576` | 可可会员签到（每天 1 积分） | ✅ **已真机跑通** |
+| 来菜 | 来菜 | `wx944ea5f5f7c3dc1f` | 【26】每日签到，半价吃招牌菜 | 已接入，待抓身份 |
+| 九村烤脑花 | 九村烤脑花YX | `wx24f657cf389aa2ad` | 26年会员签到 | 已接入，待抓身份 |
+| 酒煮江湖 | 积膳餐饮游戏 | `wx5fb9d9352a88e693` | 酒煮江湖日常积签到活动 | 已接入，待抓身份 |
+| 蜀大侠 | 蜀大侠活动号 | `wx23e20185d7551afc` | 周三会员日赢大奖（大转盘） | 已接入，待抓身份 |
+| 农耕记 | 农耕记转盘 | `wx3e0d5efb7c8e0e2d` | 积分秒杀菜品券（大转盘） | 已接入，待抓身份 |
+| 肉串汪 | 肉串汪活动入口 | `wxba723ab49cb3e098` | 同款活动壳 | 已接入，待抓身份 |
+| 谷连天 | 谷连天+ | `wxe2d7c8cb0987ded6` | 同款活动壳 | 已接入，待抓身份 |
+| 麻辣空间 | 麻辣空间趣玩 | `wx27b4fa038bc45638` | 同款活动壳 | 已接入，待抓身份 |
+
+> 签到给的一般是**会员积分**，攒着到小程序【商城】兑换。
+> 以辣可可为例：每天 +1 积分，连续 10 / 20 / 30 天分别加赠 10 / 15 / 20 积分，积分有效期 365 天。
+
+另外还有一批**别的服务商**的小程序也有签到（呷哺呷哺、五条友、竹园村、望京小腰、李先生、
+刘一手、大渔铁板烧、大龙燚等），但那不是吾享体系、用的是另一套接口，本合集目前不覆盖。
+
+---
+
+## 二、跑起来
+
+### 前提
+
+青龙与微信容器必须在**同一台宿主机**上 —— 青龙要调宿主 docker 去操作微信容器
+（token 靠微信客户端产生，服务端没法自己生成）。
+
+微信容器用[云微 WechatOnCloud](https://github.com/Gloridust/WechatOnCloud) 起，
+再按辣可可项目（`lakeke-sign`）的 `DEPLOY-QINGLONG.md` 挂好 `woc-hook`
+（WMPFDebugger 旁挂容器，用来抓 jsCode）。这部分比较长，一次配好就不用再动。
+
+### 青龙环境变量
+
+```
+WOC_INSTANCE=woc-wx-xxxxxxxx      # 微信实例容器名
+WOC_HOOK=woc-hook                 # 旁挂 hook 容器名
+WXSIGN_PYTHON=/usr/bin/python3
+WXSIGN_HOME_CONTAINER=/ql/data/scripts/wxsign    # 脚本在容器里的路径
+WXSIGN_MINIAPP_PY=/ql/data/scripts/lakeke-sign/reopen_miniapp.py   # 复用辣可可那份开小程序脚本
+LAKEKE_HOOK_DIR=/ql/data/scripts/lakeke-sign                       # 复用它的 hook_up.sh / wxlogin.py
+WXSIGN_REGISTER_PHONE=13800000000   # 可选：不是会员时自动注册用
+```
+
+### 青龙定时任务
+
+| 名称 | 命令 | 定时 |
 |---|---|---|
-| `sign` | 含 `/api/game/sign/{detail,monthDetail,signIn}` | 专用签到模块（辣可可现炒黄牛肉i 属此类，**已真机联调**） |
-| `lot` | 只含 `/api/game/lot/{list,detail,check,prize/*}` | 活动壳：**大转盘/抽奖 + 签到是其中一种活动类型** |
+| 小程序签到合集 | `bash /ql/data/scripts/wxsign/sign.sh` | `10 8 * * *` |
+| 保活（可选） | `bash /ql/data/scripts/wxsign/sign.sh --ensure-only` | `0 */2 * * *` |
 
-> 关键发现：`lot` 型号**没有** `/api/game/sign/*` 这 5 个接口，签到是作为「活动」跑的。
-> 通用入口是 `/api/game/lot/list`（拿活动列表，即首页那些卡片）与 `/api/game/lot/check`（参与）。
+跑完会**关掉小程序省内存**，下次签到自己重开。
 
-## 二、目录
+### 依赖
+
+**不需要装任何东西。** Python 侧只用标准库；JS 侧跑在 `woc-hook` 里用它自带的 node。
+
+---
+
+## 三、常用命令
+
+```bash
+python3 wxsign.py --list              # 看品牌表
+python3 wxsign.py <slug> --probe      # 只探测（会员状态 + 活动列表），不签到
+python3 wxsign.py <slug> --discover   # 打活动原始 JSON（接入新品牌时用来找 gameId）
+python3 wxsign.py <slug> --register   # 只注册会员
+python3 wxsign.py <slug>              # 该品牌签到（不是会员会自动注册再签）
+python3 wxsign.py <slug> --ensure     # 先自动开小程序 + 刷 token，再签到
+python3 wxsign.py --all --ensure      # 所有启用的品牌
+```
+
+每个品牌收尾都会打印一行，方便在青龙日志里 grep：
+
+```
+RESULT lakeke code=415 msg=今日已签到
+```
+
+---
+
+## 四、目录
 
 ```
 wxsign/
 ├── wxsign.py            引擎：探测 / 注册 / 签到 / 批量（青龙直接调它）
 ├── sign.sh              青龙总入口：自检 → 掉登录就点登录 → 逐品牌签到
 ├── wxclean.py           清残留小程序窗口（弹窗挡住关闭按钮时先遣散再关）
-├── wxident.js           身份采集（hook 容器内跑，按 appId+mpId 挑上下文）
+├── wxident.js           身份采集（hook 容器内跑，按 appId + mpId 挑上下文）
 ├── wxrefresh.js         token 刷新（hook 容器内跑，wx.login 换短效 JWT）
-├── brands.json          品牌表（静态：品牌名/小程序名/appId/carrier）
+├── brands.json          品牌表（静态：品牌名 / 小程序名 / appId / 载体类型）
 ├── brands/              每品牌凭证（自动生成，含 token，**别提交**）
 │   └── _template.env
 └── README.md
 ```
 
-## 三、青龙上跑起来（前提：青龙与微信容器同一台宿主机）
+---
 
-青龙必须能操作宿主 docker —— 即挂 `-v /var/run/docker.sock:/var/run/docker.sock`
-与 `-v $(which docker):/usr/bin/docker`，脚本目录挂到 `~/ql/data/scripts`。
+## 五、原理
 
-```bash
-# 1) 把本目录放到脚本目录
-cp -r wxsign /root/ql/data/scripts/
+### 为什么一套脚本能签所有吾享品牌
 
-# 2) hook 容器要把脚本目录挂进 /work（牌子是 wxsign.py 里默认的 HOME=/work 之外，
-#    所以用 WXSIGN_HOME 指到容器内路径；青龙里配环境变量即可）
-docker run -d --name woc-hook --pid=container:$WX --network=container:$WX \
-  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-  -v /root/ql/data/scripts:/work -v woc-data-xxxx:/config:ro \
-  woc-hook:1 sleep infinity
-```
-
-青龙「环境变量」页配置：
+吾享全家共用同一套后端、同一套包裹体：
 
 ```
-WOC_INSTANCE=woc-wx-2ada0225ca
-WOC_HOOK=woc-hook
-WXSIGN_PYTHON=/usr/bin/python3
-WXSIGN_MINIAPP_PY=/root/ql/data/scripts/lakeke-sign/reopen_miniapp.py
-LAKEKE_HOOK_DIR=/root/ql/data/scripts/lakeke-sign
+POST https://scrm.wuuxiang.com/crm7game-api/api/<path>
+body   {"mpId":…, "openId":…, "unionId":…, "data":{…}}
+header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gcId>]
 ```
 
-青龙「定时任务」：
+换品牌只换**参数**（appId / mpId / gameId），不换协议。
+所以做法是**一个引擎 + 每品牌一份 `brands/<slug>.env`**：
+加品牌只加配置文件，不动代码，也没有 N 份要各自维护的脚本。
 
-| 名称 | 命令 | 定时 |
+### 两类「载体」小程序
+
+| 类型 | 包内特征 | 承载 |
 |---|---|---|
-| 吾享签到合集 | `bash /ql/data/scripts/wxsign/sign.sh` | `10 8 * * *` |
-| 吾享保活（可选） | `bash /ql/data/scripts/wxsign/sign.sh --ensure-only` | `0 */2 * * *` |
+| `sign` | 有 `/api/game/sign/{detail,monthDetail,signIn}` | 专用签到模块（只有辣可可现炒黄牛肉i 属此类） |
+| `lot` | 只有 `/api/game/lot/{list,detail,check,prize/*}` | 活动壳：**大转盘 / 抽奖 + 签到是其中一种活动类型** |
 
-**依赖**：只用 Python 标准库；JS 侧跑在 woc-hook 里用它自己的 node（`NODE_PATH=/opt/wmpf/node_modules`）。
+`lot` 型的签到走「活动」：`lot/list` 拿活动列表（就是首页那些卡片），`lot/check` 参与。
 
-## 四、接入一个新品牌（5 步）
+### 认证链路（这也是为什么必须有微信）
+
+```
+① 微信里把目标小程序打开（wx.login 的 jsCode 与 appid 绑死，必须开对号）
+② CDP 读到小程序逻辑层 → 调 wx.login() 拿 jsCode
+③ POST wechat.wuuxiang.com/i5xforyou/auth/login {code, mpid} → 换到 token（短效 JWT，约 110 分钟）
+④ 带 token 打 scrm.wuuxiang.com/crm7game-api/api/* 做签到
+```
+
+token 每次现取现用，没有「抓一次长期用」这回事。
+
+### 不是会员怎么办
+
+签到接口要 `memberId / cardId / cardNo`，只有会员才有。
+不是会员时脚本会自动走注册（照抄小程序页面源码 `registerVip` 的入参）：
+
+```
+POST /api/member/register   data={mobile, gameId, thirdShopId, byInviteCode}
+```
+
+`mobile` 是明文手机号。同一个人可以在多个品牌各注册一次会员，互不影响。
+
+---
+
+## 六、接入一个新品牌
 
 ```bash
-cd wxsign
-
 # 1) 在 brands.json 里加一条（slug / name / appid / keyword / miniapp / carrier）
-#    不知道 appid 就先在小程序面板搜到它的“活动号”，用 survey 工具链拿 appId
+#    不知道 appid 就先在小程序面板搜到它的「活动号」，拆包看域名确认是不是吾享
 
 # 2) 人工把这个品牌的活动小程序在微信里打开一次（或让 sign.sh --ensure 自动开）
 
-# 3) 抓身份（appId 填第 1 步的）
+# 3) 抓身份
 docker exec woc-hook sh -c 'cd /work/wxsign && ENVFILE=/work/wxsign/brands/<slug>.env \
   WX_APPID=<appid> NODE_PATH=/opt/wmpf/node_modules node wxident.js 60'
 
-# 4) 探测：确认账号是不是该品牌会员、活动列表长什么样
+# 4) 探测 + 找活动 id
 python3 wxsign.py <slug> --probe
-python3 wxsign.py <slug> --discover      # 打活动原始 JSON，用来填 WX_GAMEID
+python3 wxsign.py <slug> --discover     # 从活动列表里抄 WX_GAMEID 填进 brands/<slug>.env
 
-# 4.5) 不是会员？自动注册（要先配好手机号）
-export WXSIGN_REGISTER_PHONE=13800000000   # 或用 brands/<slug>.env 的 WX_REGISTER_PHONE
-python3 wxsign.py <slug> --register
-
-# 5) 联调签到
+# 5) 联调
 python3 wxsign.py <slug>
 ```
 
-`--probe` / `--discover` 的输出就是接入文档：活动列表里挑出签到类的 `gameId`，
-写进 `brands/<slug>.env` 的 `WX_GAMEID` 即可。
+---
 
-## 五、已鉴别的候选品牌（来自本轮批量鉴别）
+## 七、已知限制
 
-| 品牌 | 载体小程序 | appId | carrier | 首页可见活动 |
-|---|---|---|---|---|
-| 辣可可 | 辣可可现炒黄牛肉i | `wxf8a17a14c0521576` | sign | 每日积分签到（**已联调**） |
-| 蜀大侠 | 蜀大侠活动号 | `wx23e20185d7551afc` | lot | 周三会员日赢大奖 · 幸运抽奖（大转盘） |
-| 九村烤脑花 | 九村烤脑花YX | `wx24f657cf389aa2ad` | lot | 26年会员签到 · 打卡签到 |
-| 农耕记 | 农耕记转盘 | `wx3e0d5efb7c8e0e2d` | lot | 积分秒杀菜品券 · 幸运抽奖 |
-| 来菜 | 来菜 | `wx944ea5f5f7c3dc1f` | lot | 【26】每日签到，半价吃招牌菜 |
-| 酒煮江湖 | 积膳餐饮游戏 | `wx5fb9d9352a88e693` | lot | 酒煮江湖日常积签到活动 |
-| 肉串汪 | 肉串汪活动入口 | `wxba723ab49cb3e098` | lot | 活动列表（加载较慢） |
-| 许家菜 / 巡湘记 / 失眠常德 | 各自的会员卡型号 | 见 `brands.json` | lot | 未见签到，`enabled:false` 备用 |
+1. **首次要自己抓一次身份**，且**青龙与微信必须同机**（token 靠客户端产生，服务端自举不了）。
+2. **`lot` 型的「签到」参数结构还没真机验证**。`/api/game/lot/check` 存在、包裹体已知，
+   但它要的 `data` 字段还没在生产上跑通。现有实现属于尽力而为 ——
+   建议先用 `--probe` / `--discover` 看清活动结构，再开定时任务。
+3. **同一时刻只能开一个小程序** → `--all` 是串行的，每个品牌约 1~2 分钟。
+4. **注册分支只单测过**（无手机号 / 格式错 / 落 UI 三种都按预期拦住），
+   没有真发过一次注册请求 —— 那会在你账号上真实建会员。填好手机号后跑一次
+   `wxsign.py <slug> --register` 才算验证过。
+5. **风控**：在非官方环境运行微信本身违反其条款，建议用闲置小号，先跑一两周再定型。
+   服务商侧也留了口子 —— 辣可可的签到规则里明确写「非正当手段获得的积分会被清零」。
 
-## 六、已知限制 / 待联调（**重要，别当已完成**）
+---
 
-1. ~~账号必须先是该品牌的会员~~ → **已自动化**。签到接口要 `memberId/cardId/cardNo`，只有会员才有；
-   不是会员时脚本会自己走注册（`POST /api/member/register`，明文手机号，该接口在每个吾享游戏型包里都有）。
-   手机号配 `WX_REGISTER_PHONE`（单品牌）或青龙环境变量 `WXSIGN_REGISTER_PHONE`（所有品牌共用）。
-   同一个人可以在多个品牌各注册一次会员，互不影响。
-   > ⚠️ 注册分支的接线已单测过（无号/格式错/落 UI 三种都按预期拦住），但**没有真的打过一次注册请求**——
-   > 那会在你账号上真实建会员，需要你自己填手机号后跑 `wxsign.py <slug> --register` 验证。
-2. **`lot` 型的「签到」动作参数结构尚未真机联调**。`/api/game/lot/check` 已知存在、
-   包裹体已知，但它要的 `data` 字段（是否要 `gameId` + `activityId` + 更多）还没在真机上验证过。
-   现有实现是**尽力而为**，请先用 `--probe` / `--discover` 看清活动结构再开定时任务。
-3. **token 是短效 JWT（实测 ~110 分钟）**，每次签到前都要在**那个 appId 的小程序开着**的
-   前提下 `wx.login()` 换新。所以**青龙必须与微信容器同机**，无法纯服务端自举。
-4. 同一时刻只能开一个小程序 → `--all` 是**串行**的，每个品牌约 1~2 分钟，7 个品牌约 10 分钟。
-5. 风控：在非官方环境运行微信本身违反其条款，**用闲置小号**，别用主力号；先跑一两周再定型。
+## 八、相关
 
-## 七、与辣可可那个项目的关系
-
-本目录是从 `lakeke-sign`（辣可可自动签到）泛化出来的：
-- 引擎逻辑（包裹体、响应码约定、token 刷新链路）沿用并已在其上验证；
-- `wxident.js` / `wxrefresh.js` 是 `cdp_lakeke_ident.js` / `auth_refresh_node.js` 的**去品牌化**版本
-  （appId / mpId 改从环境变量来，env 前缀 `LAKEKE_` → `WX_`）；
-- 「打开指定小程序」仍复用 `reopen_miniapp.py`（它已支持 `LAKEKE_MINIAPP` / `LAKEKE_KEYWORD` 环境变量）；
-- hook 补丁、微信容器运维见 `wechat-linux-container-ops` skill 与辣可可项目的 `DEPLOY-QINGLONG.md`。
+- 本仓库是从 **辣可可自动签到**（`lakeke-sign`）泛化出来的：
+  `wxident.js` / `wxrefresh.js` 是那边 `cdp_lakeke_ident.js` / `auth_refresh_node.js` 的去品牌化版本，
+  「打开指定小程序」复用那边的 `reopen_miniapp.py`。
+- 微信容器 + hook 的运维细节（WMPF 版本、场景号白名单、登录掉了怎么救）
+  见辣可可项目的 `DEPLOY-QINGLONG.md`。

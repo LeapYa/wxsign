@@ -346,32 +346,98 @@ def sh(cmd, timeout=240):
         return 124, "超时"
 
 
-def clean_leftovers():
+def clean_leftovers(hard=False):
     """关掉残留的小程序窗口（含清掉挡住关闭按钮的隐私弹窗）。
 
-    为什么必须做：① 残留窗口会盖住微信侧边栏，面板可能认不出来；
+    为什么必须做：① 残留窗口会盖住微信侧边栏，`open_panel` 就再也认不出面板；
     ② 更要紧的是 —— **旧窗口里的登录会话会失效**，此时 wx.login() 取到的 code
     拿去 /auth/login 会返 `invalid code`。所以「换不到 token」时的标准动作就是
     「关掉重开」。
+
+    hard=True → 加 `--restart-runtime`，直接杀小程序运行时进程（WeChatAppEx）：
+    实测有一类窗口**常规手段根本关不掉** —— 它们是微信小程序面板里的**推广位/推荐卡片**
+    （标题像「华夏家博」「永伟美发店」「媚姐养生会所」「潮乐棋牌会馆」），
+    点关闭按钮毫无反应。攒到五六个就把侧边栏彻底堵死，之后整批品牌全部打不开面板。
+    ⚠️ 硬清之后**必须重启 hook**（WMPFDebugger 只在启动时 attach 一次），这里会自动做。
     """
     if not INSTANCE:
         return False
+    args = ["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY, cpath(CTMP, "wxclean.py")]
+    if hard:
+        args.append("--restart-runtime")
     try:
-        c = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE,
-                            CPY, cpath(CTMP, "wxclean.py")],
-                           capture_output=True, text=True, timeout=300)
+        c = subprocess.run(args, capture_output=True, text=True, timeout=600)
     except Exception as e:
         log("  [clean] 跳过（%s）" % e)
         return False
-    for line in ((c.stdout or "") + (c.stderr or "")).splitlines():
-        if line.startswith("[clean]"):
-            log("  " + line)
+    out = (c.stdout or "") + (c.stderr or "")
+    killed = False
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("[clean]") or (hard and s.startswith("[reopen]")):
+            log("  " + s)
+        if "WeChatAppEx" in s and "已杀" in s:
+            killed = True
+    if killed:
+        restart_hook()
     if c.returncode not in (0, 1):
         log("  [clean] rc=%s（不影响后续，继续试）" % c.returncode)
     return c.returncode == 0
 
 
-def ensure_miniapp(brand):
+WMPF_DIR = os.environ.get("WXSIGN_WMPF_DIR", "/opt/wmpf")
+
+
+def restart_hook(wait=60):
+    """重启 hook 容器里的 WMPFDebugger，等它重新 attach 上来。
+
+    为什么非得重启：它**只在启动时 attach 一次**。硬清杀掉 WeChatAppEx 之后，
+    新拉起的小程序实例不会被挂上 —— 症状是 CDP 一个 context 都拿不到（ctx=0）、
+    hook 日志里也不再有 `miniapp client connected`，后面每个品牌都会 notoken。
+    """
+    if not HOOK:
+        return False
+    log("  [hook] 重启 WMPFDebugger（硬清过小程序运行时，必须重新 attach 一次）")
+    kill = ("for p in $(ls /proc | grep -E '^[0-9]+$'); do "
+            "[ \"$(cat /proc/$p/comm 2>/dev/null)\" = node ] && kill $p 2>/dev/null; done")
+    try:
+        subprocess.run(["docker", "exec", HOOK, "sh", "-c", kill],
+                       capture_output=True, text=True, timeout=90)
+        time.sleep(2)
+        subprocess.run(["docker", "exec", "-d", HOOK, "sh", "-c",
+                        "cd %s && node node_modules/ts-node/dist/bin.js src/index.ts "
+                        "> /tmp/wmpf.log 2>&1" % WMPF_DIR],
+                       capture_output=True, text=True, timeout=90)
+    except Exception as e:
+        log("  [hook] 重启异常：%s" % e)
+        return False
+    waited = 0
+    while waited < wait:
+        time.sleep(3)
+        waited += 3
+        p = subprocess.run(["docker", "exec", HOOK, "grep", "-q", "script loaded", "/tmp/wmpf.log"],
+                           capture_output=True, text=True)
+        if p.returncode == 0:
+            log("  [hook] 就绪（等了 %ds）" % waited)
+            return True
+    log("  [hook] ⚠️ 等了 %ds 没看到 'script loaded' → 跑 wmpf/check_wmpf.sh 查 WMPF 偏移配置" % wait)
+    return False
+
+
+def _wxopen(brand):
+    """开一次小程序，返回 (rc, output)。"""
+    args = ["docker", "exec", "-e", "DISPLAY=:1",
+            "-e", "WXSIGN_MINIAPP=" + brand["miniapp"],
+            "-e", "WXSIGN_KEYWORD=" + brand["keyword"],
+            INSTANCE, CPY, cpath(CTMP, "wxopen.py"), "--loose"]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=400)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return 1, str(e)
+
+
+def ensure_miniapp(brand, retry_hard=True):
     """把该品牌的「载体小程序」打开（token 的 jsCode 与 appId 绑死，必须开对号）。"""
     if not INSTANCE:
         log("  [ensure] 未设 WOC_INSTANCE，跳过自动开小程序")
@@ -379,17 +445,19 @@ def ensure_miniapp(brand):
     clean_leftovers()
 
     # 用参数列表而非拼字符串：小程序名里有中文，拼命令行容易被引号吃掉
-    args = ["docker", "exec", "-e", "DISPLAY=:1",
-            "-e", "WXSIGN_MINIAPP=" + brand["miniapp"],
-            "-e", "WXSIGN_KEYWORD=" + brand["keyword"],
-            INSTANCE, CPY, cpath(CTMP, "wxopen.py"), "--loose"]
-    try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=300)
-        rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
-    except Exception as e:
-        rc, out = 1, str(e)
-    # reopen_miniapp 的 --loose 语义：0=已打开；4=点过候选但没法用窗口标题确认（交给 appId 复核）
+    rc, out = _wxopen(brand)
+    # wxopen 的 --loose 语义：0=已打开；4=点过候选但没法用窗口标题确认（交给 appId 复核）；
+    # 3=连面板都没打开（几乎总是「侧边栏被残留窗口堵死」）
     ok = rc in (0, 4)
+
+    if not ok and retry_hard:
+        # 打不开面板的头号原因就是那批关不掉的推广小程序窗口。常规关窗治不了它们，
+        # 只能硬清运行时 → 顺带重启 hook → 再试一次。这样批量跑才不会「一崩到底」。
+        log("  [ensure] 打开失败（rc=%s）→ 硬清残留 + 重启 hook，再试一次" % rc)
+        clean_leftovers(hard=True)
+        rc, out = _wxopen(brand)
+        ok = rc in (0, 4)
+
     log("  [ensure] %s → rc=%s %s" % (brand["miniapp"], rc, "(已就绪)" if ok else "(可能没开成)"))
     for line in out.splitlines():
         # 出错了就把所有输出都打出来 —— 只过滤 [reopen] 会把真正的报错吞掉（踩过）
@@ -865,15 +933,8 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         log(json.dumps(items, ensure_ascii=False, indent=1)[:3000])
         return True, "discover"
 
-    if register_only:
-        ok, msg = register_member(brand, env)
-        log("  [register] %s" % msg)
-        if ok:
-            r, mem = member_info(env, env.get("WX_GAMEID", ""), env.get("WX_THIRDSHOPID", ""))
-            log("  [register] 复查 /api/member/single → code=%s content=%s"
-                % (r.get("code"), json.dumps(mem, ensure_ascii=False)[:300]))
-        return ok, "register"
-
+    # ⚠️ 顺序要紧：`--probe` 必须在 `--register` 之前判。两个一起给时语义是
+    #    「探测，并且需要注册就给这个号注册后再终判」（见下面 probe 分支里的 register_only）。
     if probe:
         r, mem = member_info(env, env.get("WX_GAMEID", ""), env.get("WX_THIRDSHOPID", ""))
         log("  [probe·member] code=%s content=%s"
@@ -882,13 +943,18 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         log("  [probe·lot/list] code=%s content=%s"
             % (r2.get("code"), json.dumps(items, ensure_ascii=False)[:600]))
 
-        # 「这个号能不能签到」要看**能不能拿到签到记录**，判据演进过三轮：
+        # 「这个号能不能签到」的判据演进过四轮（每轮都是踩出来的）：
         #   ✗ 包内有 pages/sign / game/sign 字面量 → 只证明**壳**有能力，证不了租户开了活动
         #   ✗ /api/game/lot/list 200               → 辣可可（sign 型）这里也返 405，会漏掉它
         #   ✗ /api/game/sign/detail 200            → **只说明这个 gameId 有效**！
-        #        实测蜀大侠（周三会员日抽奖）、农耕记（周四秒杀）的 sign/detail 也是 200，
-        #        但它们的 isCumulativeSign = null、sign/survey 返 406 —— **不是签到活动**。
-        #   ✓ /api/member/sign/survey 200          → 能拿到 signNum / lastSignDate 才是真能签
+        #        实测蜀大侠（周三会员日抽奖）、农耕记（周四秒杀）的 sign/detail 也是 200。
+        #   ✗ /api/member/sign/survey 200          → **只对「已经是该品牌会员」的号成立**。
+        #        实测过桥缘游戏中心：活动就叫「过桥缘签到送积分」、type=2、sign/detail 200，
+        #        但还没注册会员 → survey 返 411，被判成「不是签到」——**假阴性**，
+        #        真跑一遍自动注册后立刻签到成功（415 今日已签到）。
+        #   ✓ sign/detail 的 **isCumulativeSign 非 null** → 不依赖会员资格，且能区分：
+        #        过桥缘=0（是签到，非累积型）；蜀大侠/农耕记=null（抽奖/秒杀，不是签到）。
+        #   所以判据是：先看 isCumulativeSign 定性，能用 survey 定量时才用 survey。
         acts = items.get("list") if isinstance(items, dict) else None
         gid = env.get("WX_GAMEID") or brand.get("gameid") or ""
         if not gid and acts:
@@ -897,12 +963,18 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
             log("  [probe] ⚪ 服务端没有活动，也没有可用的 gameId（lot/list=%s）" % r2.get("code"))
             return True, "probe"
 
+        is_member = str(r.get("code")) == CODE_OK
+        log("  [probe·member] code=%s → %s"
+            % (r.get("code"), "已是会员" if is_member else "还不是会员（survey 还没法答）"))
+
         sd = api_post(env, "/api/game/sign/detail", {"gameId": gid})
         det = content_of(sd) or {}
         name = str(det.get("name"))[:30] if isinstance(det, dict) else ""
+        cum = det.get("isCumulativeSign") if isinstance(det, dict) else None
         log("  [probe·sign/detail] gameId=%s code=%s name=%s isCumulativeSign=%s"
-            % (gid, sd.get("code"), name,
-               det.get("isCumulativeSign") if isinstance(det, dict) else "-"))
+            % (gid, sd.get("code"), name, cum))
+
+        is_sign_act = str(sd.get("code")) == CODE_OK and cum is not None
 
         sv = api_post(env, "/api/member/sign/survey", {
             "gameId": gid, "memberId": env.get("WX_MEMBERID", ""),
@@ -914,12 +986,55 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         if str(sv.get("code")) == CODE_OK:
             log("  [probe] ✅ 能签到：%s（signNum=%s）"
                 % (name, svi.get("signNum") if isinstance(svi, dict) else "-"))
+            return True, "probe"
+
+        if is_sign_act and register_only:
+            # `--probe --register`：不是会员时先注册，再复查一次，给终判（会真实建会员！）
+            ok, msg = register_member(brand, env)
+            log("  [probe·register] %s" % msg)
+            if ok:
+                time.sleep(2)
+                r3, mem3 = member_info(env, gid, env.get("WX_THIRDSHOPID", ""))
+                m3 = mem3 if isinstance(mem3, dict) else {}
+                for k, envk in (("id", "WX_MEMBERID"), ("cardId", "WX_CARDID"),
+                                ("cardNo", "WX_CARDNO"), ("mcId", "WX_THIRDSHOPID")):
+                    if m3.get(k):
+                        env[envk] = str(m3[k])
+                save_env(slug, env)
+                sv2 = api_post(env, "/api/member/sign/survey", {
+                    "gameId": gid, "memberId": env.get("WX_MEMBERID", ""),
+                    "cardId": env.get("WX_CARDID", ""), "cardNo": env.get("WX_CARDNO", "")})
+                log("  [probe·sign/survey] 注册后复查 code=%s content=%s"
+                    % (sv2.get("code"), json.dumps(content_of(sv2) or {}, ensure_ascii=False)[:200]))
+                if str(sv2.get("code")) == CODE_OK:
+                    log("  [probe] ✅ 能签到（注册后确认）：%s" % name)
+                else:
+                    log("  [probe] 🟡 有签到活动，但注册后 survey 仍返 %s —— "
+                        "多半该租户没配会员卡 / 签到档期未到" % sv2.get("code"))
+            return True, "probe"
+
+        if is_sign_act and not is_member:
+            log("  [probe] 🔵 **是签到活动**（%s，isCumulativeSign=%s）—— 只是这个号还不是会员，"
+                "survey 答不了（%s）。加 --register 可自动注册后给终判。"
+                % (name, cum, sv.get("code")))
+        elif is_sign_act:
+            log("  [probe] 🟡 有签到活动（%s），但 survey 返 %s —— 多半没配会员卡" % (name, sv.get("code")))
         elif str(sd.get("code")) == CODE_OK:
-            log("  [probe] 🟡 有活动但**不是签到**（sign/survey 非 200）：%s —— "
+            log("  [probe] 🟡 有活动但**不是签到**（isCumulativeSign 为 null）：%s —— "
                 "这类号只能参与抽奖/秒杀，签不了" % name)
         else:
             log("  [probe] ⚪ 服务端没有活动（该租户未配置）")
         return True, "probe"
+
+    if register_only:
+        # 只注册（`--probe --register` 已被上面的 probe 分支接管，不会走到这）
+        ok, msg = register_member(brand, env)
+        log("  [register] %s" % msg)
+        if ok:
+            r, mem = member_info(env, env.get("WX_GAMEID", ""), env.get("WX_THIRDSHOPID", ""))
+            log("  [register] 复查 /api/member/single → code=%s content=%s"
+                % (r.get("code"), json.dumps(mem, ensure_ascii=False)[:300]))
+        return ok, "register"
 
     ok, code, msg = do_sign(brand, env)
     log("RESULT %s code=%s msg=%s" % (slug, code, msg))

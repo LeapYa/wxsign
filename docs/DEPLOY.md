@@ -499,6 +499,8 @@ docker exec $WX sh -c 'for p in $(ls /proc | grep -E "^[0-9]+$"); do \
 | hook 日志没有 `miniapp client connected` | 场景号没进白名单 → `bash wmpf/hook_patch.sh $WX`（见 [第 4.1 节](#41-必须打的两个补丁)） |
 | CDP 一个 context 都读不到（`ctx=0`） | hook 只在启动时 attach 一次：重启过 hook、或杀过 `WeChatAppEx` 之后没重开小程序 → `bash wmpf/restart_hook.sh`，**再把小程序重开一次** |
 | 一直「小程序没开成」 | 微信没登录，或 `brands.json` 里 appId / miniapp 名写错 |
+| 日志里「点侧边栏『小程序』按钮 y=…」点了两次都「没能确认小程序面板」，整批都这样 | **多半是微信弹着模态框**（最常见是「退出登录？确定/取消」）—— 模态框会吞掉之后所有点击，症状伪装成「面板打不开」。脚本现在每轮都会自动遣散（`clear_modals`），若仍复现就截个图看：`docker exec -e DISPLAY=:1 $WX ffmpeg -f x11grab -video_size 1280x1024 -i :1 -frames:v 1 /tmp/s.png` |
+| 侧边栏堆着「华夏家博 / 永伟美发店 / 媚姐养生会所」这类窗口，关不掉 | 那是微信小程序面板里的**推广位**，常规关窗（点关闭按钮）对它无效，攒到五六个就把侧边栏堵死 → 硬清：`docker exec -e DISPLAY=:1 $WX python3 /tmp/wxclean.py --restart-runtime`，**然后必须** `bash wmpf/restart_hook.sh`（引擎现在也会自己这么做） |
 | `RESULT code=208/211` | token 失效 —— 重跑一次即可（脚本会自己刷） |
 | `RESULT code=401` | 该账号还不是这个品牌的会员 → 脚本会自动走微信授权弹窗注册；若仍失败，看 `[ui]` 日志与 `shots/<slug>/` 截图 |
 | `RESULT code=-1` | 网络层错误（已重试仍失败），看 msg |

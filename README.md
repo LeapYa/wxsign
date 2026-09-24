@@ -67,6 +67,8 @@
 python3 wxsign.py --list              # 看品牌表（含启用 / 已联调状态）+ 本次生效范围
 python3 wxsign.py --find <关键词>      # 自动搜出该品牌名下的小程序并读出 appId（不用手抄）
 python3 wxsign.py <slug> --probe      # 探测：直接告诉你这个号能不能签，不签到
+python3 wxsign.py <slug> --probe --register
+                                      # 探测 + 不是会员就注册，再复查一次 → 终判（会真实建会员）
 python3 wxsign.py <slug> --discover   # 打活动原始 JSON（接入新品牌时用来找 gameId）
 python3 wxsign.py <slug> --register   # 只注册会员
 python3 wxsign.py <slug>              # 该品牌签到（不是会员会自动注册再签）
@@ -174,9 +176,23 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 所以代码不依赖静态分类：直接打 `sign/detail`，认（200）就走这套接口。
 `lot/*` 那套是**抽奖**（大转盘），不是签到，别拿它当签到调。
 
-> 一个容易踩的推断：`sign/detail` 返 `200` **只说明这个 gameId 有效**，
-> 不代表它是签到活动（抽奖 / 秒杀的 gameId 也返 200）。要确认「真能签到」，
-> 得看 `/api/member/sign/survey` 有没有返出 `signNum`。
+> **判断「这个号能不能签」不能只看一个接口**（判据修了四轮，每轮都是踩出来的）：
+>
+> | 看什么 | 为什么不够 |
+> |---|---|
+> | 包里有 `pages/sign` 字面量 | 只证明**壳**有能力，证不了这个租户开了活动 |
+> | `lot/list` 返 `200` | 辣可可这类 sign 型号在这里返 `405`，会漏掉它 |
+> | `sign/detail` 返 `200` | **只说明这个 gameId 有效** —— 抽奖/秒杀的 gameId 也返 200 |
+> | `sign/survey` 返 `200` | **只对「已经是该品牌会员」的号成立**，非会员答不了 |
+>
+> 可靠的定性判据是 **`sign/detail` 里的 `isCumulativeSign` 非 null**：它不依赖会员资格，
+> 而且能把两类活动分开 —— 过桥缘签到送积分 = `0`（是签到），蜀大侠周三抽奖 / 农耕记秒杀 = `null`（不是签到）。
+> 所以 `--probe` 先用它定性，能用 `sign/survey` 定量时才用 survey 给「确认能签」。
+>
+> 上表最后一行是踩过的坑：过桥缘游戏中心的签到活动**名字就叫「过桥缘签到送积分」**、
+> `sign/detail` 返 200，但因为当时还不是会员，`sign/survey` 返 `411`，被误判成「不是签到」。
+> 真跑一遍自动注册后立刻签到成功。所以 `--probe --register` 才是终判：
+> 需要时给这个号注册会员，再复查一次 survey。
 
 ### 认证链路（这也是为什么必须有微信）
 
@@ -306,10 +322,11 @@ python3 wxsign.py --find <品牌关键词>
 # 2) 跑一次 —— 它会自己开小程序、抓身份（mpId/openId/memberId/卡号）、刷 token
 python3 wxsign.py <slug> --ensure
 
-# 3) 探测：--probe 直接给结论（能签到 / 有活动但不是签到 / 服务端没有活动）；
-#    --discover 打活动原始 JSON，用来填 gameId
+# 3) 探测：--probe 直接给结论（✅ 能签到 / 🔵 是签到活动但还没注册 /
+#    🟡 有活动但不是签到 / ⚪ 服务端没配活动）；加了 --register 就是终判
 python3 wxsign.py <slug> --probe
-python3 wxsign.py <slug> --discover
+python3 wxsign.py <slug> --probe --register
+python3 wxsign.py <slug> --discover      # 打活动原始 JSON，用来填 gameId
 
 # 4) 联调
 python3 wxsign.py <slug>
@@ -338,6 +355,12 @@ python3 wxsign.py <slug>
    不替你下结论。
 6. **风控**：在非官方环境运行微信本身违反其条款，建议用闲置小号，先跑一两周再定型。
    服务商侧也留了口子 —— 辣可可的签到规则里明确写「非正当手段获得的积分会被清零」。
+7. **界面自动化有两类「环境病」，引擎会自愈，但知道一下更好**：
+   - **模态框吞点击**：微信弹「退出登录？」这类确认框时，之后所有点击都落不到实处，
+     症状伪装成「小程序面板打不开」。每轮会先扫一遍并点掉它（点**取消**那一侧，绝不碰绿色按钮）。
+   - **关不掉的推广窗口**：小程序面板里的推广位（标题像「华夏家博」「永伟美发店」）点关闭按钮无反应，
+     攒到五六个就把侧边栏堵死。打不开面板时引擎会硬清运行时并自动重启 hook 再重试一次。
+   两者都只在**批量跑**时才明显 —— 这也是 `--all` 要串行、每个品牌约 1~2 分钟的原因。
 
 ---
 

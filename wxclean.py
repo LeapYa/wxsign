@@ -11,6 +11,9 @@
   · 微信主窗口（WM_CLASS 含 wechat）一律不碰
   · 关窗走微信自己的关闭按钮（三道防线），**绝不 xdotool windowclose**
 
+还会**无条件**先扫一遍模态弹窗（`clear_modals`）—— 模态框会吞掉之后所有点击，
+症状伪装成「小程序面板打不开」，很难联想到，所以每轮都查一次。
+
 用法（容器内）：DISPLAY=:1 python3 wxclean.py [--restart-runtime]
   --restart-runtime  常规手段都关不掉时，**杀掉小程序运行时进程（WeChatAppEx）**。
                      ⚠️ 这会清掉所有小程序窗口，而且 hook 需要跟着重启（WMPFDebugger 是
@@ -39,34 +42,159 @@ def leftover(wid, title):
     return True
 
 
-def dismiss_popups(wid, W, H):
-    """先遣散挡在窗口上的弹窗/悬浮提示，否则关闭按钮点不中（实测踩过）。
+def _px(buf, W, x, y):
+    i = (y * W + x) * 3
+    return buf[i], buf[i + 1], buf[i + 2]
 
-    做法：找窗口内容区里那颗**微信绿**药丸按钮（隐私弹窗的「同意」），点它左边那颗
-    （「拒绝」）—— 我们不授权、只关窗。找不到绿按钮就只发一次 Esc。
+
+def green_button(buf, W, H):
+    """找「微信绿」**药丸按钮**的包围盒 → (x0, y0, x1, y1)；找不到返回 None。
+
+    ⚠️ 加了形状判据（宽 60~240、高 18~70）：只按颜色找的话，**聊天窗口里自己的绿色
+       气泡**（#95EC69）也会中招，于是「遣散弹窗」变成在聊天记录上乱点。
+    ⚠️ 也刻意不取「绿色像素的质心」：质心会被附近别的小块绿色带偏，再按固定比例
+       往左推一颗，布局一变就点到空白（旧实现就是这么错的）。
+    """
+    minx, maxx, miny, maxy, n = W, -1, H, -1, 0
+    for y in range(int(H * 0.25), int(H * 0.70), 2):
+        for x in range(int(W * 0.15), int(W * 0.85), 2):
+            r, g, b = _px(buf, W, x, y)
+            if g > 150 and g - r > 60 and g - b > 40:
+                n += 1
+                minx, maxx = min(minx, x), max(maxx, x)
+                miny, maxy = min(miny, y), max(maxy, y)
+    if n < 250:
+        return None
+    w, h = maxx - minx + 1, maxy - miny + 1
+    if not (60 <= w <= 240 and 18 <= h <= 70):
+        return None
+    return minx, miny, maxx, maxy
+
+
+def row_runs(buf, W, y, tol=6, min_len=6, merge_gap=30):
+    """把一行像素切成「同色段」，并把被文字切断的段合回去。
+    → [(x0, x1, (r,g,b)), ...]（按钮里的字会把它切两半，必须合，否则认不出按钮）"""
+    runs = []
+    for x in range(W):
+        c = _px(buf, W, x, y)
+        if runs and max(abs(c[k] - runs[-1][2][k]) for k in range(3)) <= tol:
+            runs[-1][1] = x
+        else:
+            runs.append([x, x, c])
+    merged = []
+    for r in runs:
+        if (merged and r[0] - merged[-1][1] <= merge_gap
+                and max(abs(r[2][k] - merged[-1][2][k]) for k in range(3)) <= tol):
+            merged[-1][1] = r[1]
+        else:
+            merged.append(r)
+    return [r for r in merged if r[1] - r[0] + 1 >= min_len]
+
+
+def _sibling_on_row(buf, W, box, y):
+    """在指定那一行上找绿按钮的兄弟按钮 → (x0, x1) 或 None。判据见 sibling_button。"""
+    x0, _, x1, _ = box
+    cands = []
+    for a, b, c in row_runs(buf, W, y):
+        if a <= x1 and b >= x0:                            # 与绿按钮重叠 → 就是它自己
+            continue
+        if not (34 <= b - a + 1 <= 260):                   # 药丸按钮的合理宽度
+            continue
+        if max(c) - min(c) > 5 or not 205 <= sum(c) // 3 <= 245:
+            continue
+        if (b < x0 and x0 - b > 60) or (a > x1 and a - x1 > 60):
+            continue                                       # 太远，不是它的兄弟
+        cands.append((a, b))
+    left = [c for c in cands if c[1] < x0]
+    right = [c for c in cands if c[0] > x1]
+    return (left[-1] if left else None) or (right[0] if right else None)
+
+
+def sibling_button(buf, W, box):
+    """绿按钮**同一行**上的兄弟按钮中心 → (x, y) 或 None。
+
+    为什么不能固定「往左找一颗」（旧实现的 bug，代价是整轮白跑）：
+      隐私弹窗   拒绝(左,灰) / 同意(右,绿)   → 往左 = 拒绝 ✓
+      退出登录   确定(左,绿) / 取消(右,灰)   → 往左 = 点在空白上，框关不掉；
+                 而它是**模态**的，之后所有点击都被它吞掉。症状伪装成
+                 「小程序面板打不开 / 侧边栏点不动」，完全联想不到是这个框在挡
+                 （实测因此把整批品牌跑成 notoken）。
+    改成：左右都扫，点**不是绿色的那颗** —— 两种布局都成立，而且永远碰不到绿色（危险）那颗。
+
+    三条约束都是从实测像素反推的（不然满屏都是「灰块」）：
+      · **扫按钮上/下缘那两行**，不扫正中：按钮标签文字会把灰底切成两半，
+        两半各自可能就窄于阈值了；贴着边缘扫读到的是一整条实心药丸
+        （实测 y0+4：`644..755` 一整段；而在正中那行会被切成 `644..686` + `713..755`）。
+      · **紧邻**：兄弟按钮的边必须在绿按钮 60px 以内，否则左侧栏（x0~60）、
+        右侧阴影（x787~823）这些平灰块全都会被当成按钮。
+      · **严格平灰**：逐通道极差 ≤ 5，排除聊天列表那种带蓝调、略不平的底色。
+    """
+    x0, y0, x1, y1 = box
+    lines = []
+    for y in (y0 + 4, y1 - 4, (y0 + y1) // 2):
+        if y not in lines and y0 <= y <= y1:
+            lines.append(y)
+    for y in lines:
+        got = _sibling_on_row(buf, W, box, y)
+        if got:
+            return (got[0] + got[1]) // 2, y
+    return None
+
+
+def dismiss_popups(wid, W, H):
+    """遣散挡在窗口上的**模态弹窗**（否则关窗按钮点不中、后续点击全被吞）。
+
+    做法：在内容区找微信绿药丸按钮，点它同一行上的**兄弟按钮** ——
+    隐私弹窗那颗是「拒绝」、退出登录那颗是「取消」，都是「不授权 / 不执行」的安全选项。
     """
     R.raise_window(wid)
     time.sleep(0.6)
     buf = R.grab(W, H)
-    xs, ys = [], []
-    # 内容区中央带状范围里找微信绿 #07C160（避开标题栏与底栏）
-    for y in range(int(H * 0.30), int(H * 0.62), 2):
-        base = y * W * 3
-        for x in range(int(W * 0.15), int(W * 0.85), 2):
-            i = base + x * 3
-            r, g, b = buf[i], buf[i + 1], buf[i + 2]
-            if g > 150 and g - r > 60 and g - b > 40:
-                xs.append(x)
-                ys.append(y)
-    if len(xs) >= 300:                       # 够大才算按钮，不是图标
-        gx, gy = sum(xs) // len(xs), sum(ys) // len(ys)
-        click_x = gx - int(W * 0.109)        # 「拒绝」在「同意」左边约 0.109W
-        print("[clean] 检测到弹窗绿色按钮 (%d,%d) → 点它左边的「拒绝」(%d,%d)" % (gx, gy, click_x, gy))
-        R.click(click_x, gy, 1.5)
+    box = green_button(buf, W, H)
+    if not box:
+        print("[clean] 没检测到弹窗，发一次 Esc 清掉悬浮提示")
+        R.key("Escape", 1.0)
+        return False
+    gx, gy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+    sib = sibling_button(buf, W, box)
+    if sib:
+        print("[clean] 检测到弹窗绿色按钮 (%d,%d) → 点兄弟按钮（拒绝/取消）(%d,%d)"
+              % (gx, gy, sib[0], sib[1]))
+        R.click(sib[0], sib[1], 1.5)
         return True
-    print("[clean] 没检测到弹窗，发一次 Esc 清掉悬浮提示")
-    R.key("Escape", 1.0)
-    return False
+    click_x = gx - int(W * 0.109)          # 兜底：按老经验左移一颗，但绝不点绿色
+    print("[clean] 没认出兄弟按钮 → 退到绿按钮左移一颗 (%d,%d)" % (click_x, gy))
+    R.click(click_x, gy, 1.5)
+    return True
+
+
+def clear_modals(W, H):
+    """**不管有没有残留窗口**，先扫一遍模态弹窗并遣散。
+
+    为什么必须无条件做：模态框会吞掉之后所有点击，症状是「面板打不开 / 侧边栏点不动」，
+    极难联想到弹窗。而旧实现是「没有残留窗口就直接 return」—— 那个分支恰恰**永远不检查弹窗**，
+    于是「侧边栏干净 + 一个退出登录框」这个组合直接把整批品牌跑废（实测踩了一整轮）。
+
+    ⚠️ 只对**微信自己的窗口**做（主窗口 / 小程序面板，标题都是「微信」）：
+    小程序页面里到处是绿色按钮，拿这套逻辑去点就是灾难。
+    """
+    wid = R.top_window(W, H)
+    if not wid:
+        return False
+    title = ""
+    for w, t in R.windows():
+        if str(w) == str(wid):
+            title = t.strip()
+            break
+    if title != "微信":
+        return False
+    hits = 0
+    for _ in range(3):
+        if not dismiss_popups(wid, W, H):
+            break
+        hits += 1
+        time.sleep(0.8)
+    return hits > 0
 
 
 def main():
@@ -75,6 +203,9 @@ def main():
         R.run("DISPLAY=%s xrandr -s %dx%d" % (R.DISPLAY, R.WANT_W, R.WANT_H))
         time.sleep(2)
         W, H = R.size()
+
+    if clear_modals(W, H):
+        print("[clean] 上面遣散了模态弹窗（它会吞掉之后所有点击）")
 
     targets = [(w, t) for w, t in R.windows() if leftover(w, t)]
     if not targets:

@@ -301,6 +301,98 @@ def harvest_ident(brand):
     return p.returncode == 0
 
 
+def ensure_helpers():
+    """把仓库里的辅助脚本投放到微信实例容器（CTMP）。
+
+    每次跑都同步一次，这样改了代码/换了版本立刻生效，不用手工 docker cp。
+    需要：wxfind.py（发现 appId）、wxcdp.py（读 appId）、pkgprobe.py（判包）、
+    wxclean.py（清残留窗口）、reopen_miniapp.py（开小程序；来自 WXSIGN_MINIAPP_PY）。
+    """
+    if not INSTANCE:
+        return False
+    srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
+            ("wxfind.py", "wxcdp.py", "pkgprobe.py", "wxclean.py")]
+    mini = os.environ.get("WXSIGN_MINIAPP_PY", "") or os.path.join(HERE, "reopen_miniapp.py")
+    if os.path.exists(mini):
+        srcs.append((mini, cpath(CTMP, "reopen_miniapp.py")))
+    else:
+        log("  [helpers] 找不到 reopen_miniapp.py（设 WXSIGN_MINIAPP_PY 指过去）")
+    ok = True
+    for s, d in srcs:
+        if not os.path.exists(s):
+            log("  [helpers] 缺 %s" % s)
+            ok = False
+            continue
+        try:
+            p = subprocess.run(["docker", "cp", s, "%s:%s" % (INSTANCE, d)],
+                               capture_output=True, text=True, timeout=120)
+            if p.returncode != 0:
+                log("  [helpers] 投放 %s 失败：%s" % (s, (p.stderr or "").strip()[:120]))
+                ok = False
+        except Exception as e:
+            log("  [helpers] 投放 %s 异常：%s" % (s, e))
+            ok = False
+    return ok
+
+
+def discover_appid(kw, max_cards=6):
+    """按品牌关键词自动发现 appId（开面板 → 搜索 → 逐张卡片点开 → 读 appId → 判包）。"""
+    log("\n===== 发现 appId：搜索「%s」=====" % kw)
+    if not INSTANCE:
+        log("[!] 需要 WOC_INSTANCE（要操作微信界面）")
+        return None
+    ensure_helpers()
+    args = ["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+            cpath(CTMP, "wxfind.py"), kw, str(max_cards)]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=1800)
+    except Exception as e:
+        log("[!] 执行异常：%s" % e)
+        return None
+    out = (p.stdout or "") + (p.stderr or "")
+    data = None
+    # 容器的全部输出都要透出来 —— 只挑 [find] 前缀会把真正的报错（[reopen] 那批）吞掉，踩过两次
+    for line in out.splitlines():
+        if line.startswith("FIND_JSON="):
+            try:
+                data = json.loads(line[len("FIND_JSON="):])
+            except json.JSONDecodeError:
+                pass
+        elif line.strip():
+            log(line)
+    if not data:
+        log("[!] 没拿到结果（rc=%s）" % p.returncode)
+        return None
+
+    rows = data.get("found", [])
+    log("\n发现 %d 个号：" % len(rows))
+    log("  %-4s %-24s %-14s %-8s %-10s %s" % ("#", "小程序名", "appId", "供应商", "载体", "签到能力"))
+    for i, f in enumerate(rows, 1):
+        sup = "吾享" if f.get("wuuxiang") else "其他"
+        sign = ("有签到接口" if f.get("sign_api") else
+                "有签到页" if f.get("sign_page") else
+                "仅活动壳" if f.get("lot_api") else "无")
+        log("  %-4s %-24s %-14s %-8s %-10s %s"
+            % (i, f.get("name", "?"), f.get("appid", "?"), sup, f.get("carrier", "?"), sign))
+
+    # 直接给出可以粘贴进 brands.json 的条目
+    best = rows[0] if rows else None
+    if best:
+        log("\n最像签到载体的那个（按名字规律 + 包能力排序）（复制进 brands.json 的 brands 数组）：")
+        log(json.dumps({
+            "slug": kw.replace(" ", ""),
+            "name": kw,
+            "appid": best.get("appid", ""),
+            "keyword": kw,
+            "miniapp": best.get("name", ""),
+            "carrier": "sign" if best.get("sign_api") else "lot",
+            "type": "sign",
+            "enabled": True,
+            "verified": False,
+        }, ensure_ascii=False, indent=2))
+    return data
+
+
 # ───────────────────────── 业务动作 ─────────────────────────
 
 def member_info(env, game_id="", third_shop=""):
@@ -532,6 +624,8 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
     need_ident = not (env.get("WX_MPID") and env.get("WX_OPENID"))
     if need_ident:
         log("  [init] 这个品牌还没有身份凭证 → 自动走一遍（开小程序 → 取值 → 刷 token）")
+    if INSTANCE and (do_ensure or need_ident):
+        ensure_helpers()
     if do_ensure or need_ident:
         if INSTANCE:
             ensure_miniapp(brand)
@@ -595,6 +689,12 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
 
 def main():
     argv = sys.argv[1:]
+    if "--find" in argv:
+        i = argv.index("--find")
+        if i + 1 >= len(argv):
+            log("用法：wxsign.py --find <品牌关键词>   —— 自动搜出该品牌名下的小程序并读出 appId")
+            return 2
+        return 0 if discover_appid(argv[i + 1]) else 1
     if not argv or "--list" in argv:
         cfg = load_brands()
         log("%-16s %-10s %-22s %-22s %s" % ("slug", "品牌", "载体小程序", "appid", "状态"))
@@ -603,7 +703,9 @@ def main():
                 % (b["slug"], b["name"], b["miniapp"], b["appid"],
                    "启用" if b.get("enabled") else "停用",
                    "（已联调）" if b.get("verified") else ""))
-        log("\n用法：wxsign.py <slug> [--probe|--discover|--register|--ensure]  |  wxsign.py --all [--ensure]")
+        log("\n用法：wxsign.py --find <关键词>                     自动发现该品牌的 appId（不用手抄）")
+        log("      wxsign.py <slug> [--probe|--discover|--register|--ensure]")
+        log("      wxsign.py --all [--ensure]")
         log("      <slug> 不带参数 = 直接签到（不是会员会自动注册，见 --register）")
         return 0
 

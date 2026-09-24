@@ -79,12 +79,26 @@ WXSIGN_REGISTER_PHONE=13800000000   # 可选：不是会员时自动注册用
 
 ```bash
 python3 wxsign.py --list              # 看品牌表
+python3 wxsign.py --find <关键词>      # 自动搜出该品牌名下的小程序并读出 appId（不用手抄）
 python3 wxsign.py <slug> --probe      # 只探测（会员状态 + 活动列表），不签到
 python3 wxsign.py <slug> --discover   # 打活动原始 JSON（接入新品牌时用来找 gameId）
 python3 wxsign.py <slug> --register   # 只注册会员
 python3 wxsign.py <slug>              # 该品牌签到（不是会员会自动注册再签）
 python3 wxsign.py <slug> --ensure     # 先自动开小程序 + 刷 token，再签到
 python3 wxsign.py --all --ensure      # 所有启用的品牌
+```
+
+`--find` 干的就是你会手工做的事：打开小程序面板 → 搜索关键词 → 逐张结果卡片点开 →
+从逻辑层读出 appId（比窗口标题硬）→ 再检查每个号的小程序包，得出**是不是吾享、
+属于哪类载体、有没有签到能力**，最后直接给一段可以粘进 `brands.json` 的配置。
+
+```
+发现 4 个号：
+  #    小程序名            appId                供应商   载体    签到能力
+  1    许家CUISINE        wx4a754a0f6e06c359   吾享     other  无
+  2    许家菜甄选           wx05d403af04751c58   吾享     other  无
+  3    徐春娇下饭菜          wx36ad9b2c702c291b   其他     非吾享    有签到页
+  4    中牟迅才招聘网         wx93882413f14840d4   其他     非吾享    无
 ```
 
 每个品牌收尾都会打印一行，方便在青龙日志里 grep：
@@ -99,16 +113,22 @@ RESULT lakeke code=415 msg=今日已签到
 
 ```
 wxsign/
-├── wxsign.py            引擎：探测 / 注册 / 签到 / 批量（青龙直接调它）
+├── wxsign.py            引擎：发现 appId / 探测 / 注册 / 签到 / 批量（青龙直接调它）
 ├── sign.sh              青龙总入口：自检 → 掉登录就点登录 → 逐品牌签到
-├── wxclean.py           清残留小程序窗口（弹窗挡住关闭按钮时先遣散再关）
-├── wxident.js           身份采集（hook 容器内跑，按 appId + mpId 挑上下文）
-├── wxrefresh.js         token 刷新（hook 容器内跑，wx.login 换短效 JWT）
-├── brands.json          品牌表（静态：品牌名 / 小程序名 / appId / 载体类型）
+├── wxfind.py            （容器内跑）按关键词搜小程序并读出 appId
+├── wxident.js           （hook 容器内跑）身份采集，按 appId + mpId 挑上下文
+├── wxrefresh.js         （hook 容器内跑）token 刷新，wx.login 换短效 JWT
+├── wxcdp.py             （容器内跑）纯标准库 WebSocket + CDP，读小程序 appId
+├── pkgprobe.py          （容器内跑）拆小程序包判供应商 / 签到能力
+├── wxclean.py           （容器内跑）清残留小程序窗口（弹窗挡住关闭按钮时先遣散再关）
+├── brands.json          品牌表（品牌名 / 小程序名 / appId / gameId / 载体类型）
 ├── brands/              每品牌凭证（自动生成，含 token，**别提交**）
 │   └── _template.env
 └── README.md
 ```
+
+> 上面 5 个「容器内跑」的脚本不用你手动投递 —— 引擎每次跑都会自动
+> `docker cp` 到微信实例容器里（`ensure_helpers()`），改了代码立刻生效。
 
 ---
 
@@ -167,8 +187,9 @@ POST /api/member/register   data={mobile, gameId, thirdShopId, byInviteCode}
 ## 六、接入一个新品牌
 
 ```bash
-# 1) 在 brands.json 里加一条（slug / name / appid / keyword / miniapp / carrier）
-#    不知道 appid 就先在小程序面板搜到它的「活动号」，拆包看域名确认是不是吾享
+# 1) 一条命令把 appId 找出来（它自己开面板搜、点开卡片、读 appId、判包）
+python3 wxsign.py --find <品牌关键词>
+#    把它打印的 JSON 粘进 brands.json 的 brands 数组（slug 自己改成英文）
 
 # 2) 跑一次 —— 它会自己开小程序、抓身份（mpId/openId/memberId/卡号）、刷 token
 python3 wxsign.py <slug> --ensure
@@ -182,8 +203,8 @@ python3 wxsign.py <slug> --discover
 python3 wxsign.py <slug>
 ```
 
-**除了第 1 步要填 appId、以及 sign 型要填 gameId，其余全自动。**
-（上面 9 个品牌的 appId 和辣可可的 gameId 都已经在 `brands.json` 里了。）
+**除了给 `brands.json` 加一条（appId 由 `--find` 自动读出、gameId 见第 3 步），其余全自动。**
+（上面 9 个品牌的 appId 和辣可可的 gameId 都已经在 `brands.json` 里了，所以现在也是零手工。）
 
 ---
 

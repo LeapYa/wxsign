@@ -8,6 +8,10 @@
 #
 # 做的事：docker/hook/微信 自检 → 掉登录就点登录 → 逐个品牌（开小程序 → 刷 token → 签到）
 #
+# ⚠️ 唯一做不到无人值守的一环：微信掉登录后，点完「登录」**必须在手机上确认**
+#    （Linux 版微信没有 Windows 的「登录免确认」选项）。久不确认会过期 → 只能扫码。
+#    所以真正要做的是**别让微信掉登录**（容器别重启）。见 docs/DEPLOY.md。
+#
 # 需要的青龙环境变量：
 #   WOC_INSTANCE=<微信实例容器名>    WOC_HOOK=woc-hook
 #   WXSIGN_PYTHON=/usr/bin/python3
@@ -43,15 +47,30 @@ else
   log "⚠️ hook 容器不存在 → 刷 token 会失败。按 docs/DEPLOY.md 第 4 节建一次（一次性）"
 fi
 
-# 3. 微信掉登录就点一下（按微信绿按钮的像素定位，不写死坐标）
-docker cp "$HERE/wxlogin.py" "$INSTANCE":/tmp/wxlogin.py >/dev/null 2>&1 || true
+# 3. 微信掉登录就点一下。
+#    ⚠️ 点「登录」之后**必须有人在手机上确认**（Linux 版微信没有 Windows 那个「登录免确认」选项），
+#       所以这一步天生做不到无人值守；久不确认还会变成「必须扫码」。细节见 wxlogin.py 顶部。
+docker cp "$HERE/wxopen.py"  "$INSTANCE":/tmp/ >/dev/null 2>&1 || true
+docker cp "$HERE/wxlogin.py" "$INSTANCE":/tmp/ >/dev/null 2>&1 || true
 if docker exec "$INSTANCE" sh -c 'DISPLAY=:1 python3 -c "
 import subprocess,sys
 d=subprocess.run(\"DISPLAY=:1 ffmpeg -loglevel error -f x11grab -video_size 1280x1024 -i :1 -frames:v 1 -f rawvideo -pix_fmt rgb24 -\",shell=True,capture_output=True).stdout
 g=sum(1 for i in range(0,len(d),6) if d[i+1]>150 and d[i+1]-d[i]>60 and d[i+1]-d[i+2]>40)
 sys.exit(0 if g>300 else 1)"' 2>/dev/null; then
-  log "检测到微信停在登录页 → 点登录并拉全屏"
-  docker exec -e DISPLAY=:1 "$INSTANCE" "$PY" /tmp/wxlogin.py || log "⚠️ 自动登录失败，看容器截图"
+  log "检测到微信停在登录页 → 点登录（**需要你在手机上确认**），最多等 ${WXSIGN_LOGIN_WAIT:-300}s"
+  docker exec -e DISPLAY=:1 "$INSTANCE" "$PY" /tmp/wxlogin.py
+  LOGIN_RC=$?
+  case "$LOGIN_RC" in
+    0) log "✅ 微信已登录" ;;
+    1) log "本来就是登录状态" ;;
+    2) log "❌ 出现二维码：登录状态多半已过期，现在**只能扫码**。"
+       log "   打开 KasmVNC 网页 → 进实例 → 手机扫码登录，然后重跑本任务。"
+       exit 2 ;;
+    3) log "❌ 登录没完成：点了按钮但没人确认（或界面异常）。"
+       log "   请在手机上点确认后重跑；**久不确认会过期，变成必须扫码**。"
+       exit 3 ;;
+    *) log "⚠️ 登录状态未知（rc=$LOGIN_RC），继续尝试签到" ;;
+  esac
 fi
 
 [ "${1:-}" = "--ensure-only" ] && { log "仅保活，退出"; exit 0; }

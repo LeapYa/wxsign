@@ -531,10 +531,9 @@ def do_sign(brand, env):
     game_id = env.get("WX_GAMEID") or brand.get("gameid", "")
     third = env.get("WX_THIRDSHOPID", "")
 
-    # lot 型的 gameId 能直接从活动列表认出来（sign 型不行，得进签到页抄一次）。
-    # ⚠️ 必须放在「查会员 / 注册」**之前** —— 注册接口要 gameId；
-    #    否则非会员的品牌会拿着空 gameId 去注册（实测来菜就是这个情况）。
-    if not game_id and brand.get("carrier") == "lot":
+    # 没有 gameId 就先自己找：从活动列表里认出签到活动（对哪种类型都有用，所以不判 carrier）。
+    # ⚠️ 必须放在「查会员 / 注册」**之前** —— 注册接口要 gameId。
+    if not game_id:
         gid, why = discover_lot_gameid(env)
         if gid:
             game_id = gid
@@ -589,13 +588,23 @@ def do_sign(brand, env):
                 "拿不到会员信息（memberId 为空）→ /api/member/single 返回 code=%s msg=%s"
                 % (r2.get("code"), r2.get("msg")))
 
-    # 该号包内有专用签到模块 → 走最稳的 sign 接口
-    if brand.get("carrier") == "sign" and game_id:
-        d = api_post(env, "/api/game/sign/detail", {"gameId": game_id})
-        dc = str(d.get("code"))
-        log("  [sign/detail] code=%s msg=%s" % (dc, d.get("msg")))
-        if dc in (CODE_AUTH_BAD, CODE_AUTH_EXP):
-            return False, dc, "token 失效"
+    # ⚠️ 签到统一走 sign 接口，**不再依赖 brands.json 的 carrier 字段**。
+    # 纠正（2026-09-24 实测）：之前按「包内是否含 game/sign/signIn 字面串」判 carrier，
+    # 把来菜判成了 lot —— 但它运行时走的就是 /api/game/sign/*（用逻辑层 hook wx.request
+    # 抓到的真实请求：/api/game/sign/detail、/api/member/sign/survey、/api/game/sign/signIn）。
+    # 所以改成**运行时判断**：先打 sign/detail，认（200）就走签；不认再退到 lot。
+    if not game_id:
+        return False, "-", ("缺活动 id（gameId）：sign 与 lot 接口都要先给 id，没有列举接口。"
+                            "lot 型可从活动列表自动认出，sign 型得进一次签到页抄。"
+                            "填到 brands.json 的 gameid 或 brands/%s.env 的 WX_GAMEID"
+                            "（长期常量，填一次永久有效）" % brand["slug"])
+
+    d = api_post(env, "/api/game/sign/detail", {"gameId": game_id})
+    dc = str(d.get("code"))
+    log("  [sign/detail] code=%s msg=%s" % (dc, d.get("msg")))
+    if dc in (CODE_AUTH_BAD, CODE_AUTH_EXP):
+        return False, dc, "token 失效（%s）→ 重跑 wxrefresh.js" % d.get("msg")
+    if dc == CODE_OK:
         s = api_post(env, "/api/game/sign/signIn", {
             "gameId": game_id, "memberId": env.get("WX_MEMBERID", ""),
             "cardId": env.get("WX_CARDID", ""), "cardNo": env.get("WX_CARDNO", ""),
@@ -613,14 +622,8 @@ def do_sign(brand, env):
             return False, sc, "还不是会员"
         return False, sc, "签到失败：%s" % s.get("msg")
 
-    if brand.get("carrier") == "sign":
-        return False, "-", ("「%s」是 sign 型号但缺活动 id：gameId 不在任何接口或小程序包里"
-                            "（/api/game/sign/* 与 /api/game/lot/list 都要先给 id，没有列举接口），"
-                            "只能进一次签到页拿。填到 brands.json 的 gameid 或 brands/%s.env 的 "
-                            "WX_GAMEID 即可 —— 它是长期常量，填一次永久有效。"
-                            % (brand["name"], brand["slug"]))
-
-    # 只有活动壳（lot）的号：先列活动，把签到类活动的原始结构打出来供接入
+    # sign 接口不认这个号 → 退回「活动壳」路径（lot 是抽奖/活动的通用壳，签到只是其中一种）
+    log("  [sign/detail] 这个号不支持 sign 接口（code=%s）→ 退回 lot 路径" % dc)
     r, items = lot_list(env)
     log("  [lot/list] code=%s" % r.get("code"))
     act, why = pick_activity(items)

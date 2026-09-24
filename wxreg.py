@@ -463,8 +463,9 @@ def main():
     except Exception as e:
         print("[ui] wxdom 不可用（%s）→ 退回像素识别" % e)
     clicked = set()
+    clicked_px = set()       # 像素捏到的按钮位置，点过就不再点（否则会在同一处反复空点、占着轮次不滚动）
 
-    for step in range(1, 11):
+    for step in range(1, 17):
         buf = grab(W, H)
         d = detect(buf, W, H)
 
@@ -543,20 +544,24 @@ def main():
                 continue
 
         g = d["green"]
-        if is_button(g, buf, W, is_green):             # 隐私协议「同意并继续」
-            print("[ui] 点「同意并继续」(%d,%d)" % ((g[0] + g[2]) // 2, (g[1] + g[3]) // 2))
+        px = ((g[0] + g[2]) // 2, (g[1] + g[3]) // 2) if is_button(g, buf, W, is_green) else None
+        if px and px not in clicked_px:                 # 隐私协议「同意并继续」
+            clicked_px.add(px)
+            print("[ui] 点「同意并继续」(%d,%d)" % px)
             if not a.dry_run:
-                click((g[0] + g[2]) // 2, (g[1] + g[3]) // 2)
+                click(px[0], px[1])
                 time.sleep(3)
             continue
 
         o = d["orange"]
-        if is_button(o, buf, W, is_orange, min_density=0.5):
+        px = (((o[0] + o[2]) // 2, (o[1] + o[3]) // 2)
+              if is_button(o, buf, W, is_orange, min_density=0.5) else None)
+        if px and px not in clicked_px:
             # 弹窗里的「授权」/ 页面上的「立即签到」「参与」—— 都是同一类大按钮
-            print("[ui] 点橙色大按钮「授权 / 立即签到」(%d,%d)"
-                  % ((o[0] + o[2]) // 2, (o[1] + o[3]) // 2))
+            clicked_px.add(px)
+            print("[ui] 点橙色大按钮「授权 / 立即签到」(%d,%d)" % px)
             if not a.dry_run:
-                click((o[0] + o[2]) // 2, (o[1] + o[3]) // 2)
+                click(px[0], px[1])
                 time.sleep(4)
             continue
 

@@ -56,7 +56,9 @@ CONFIRM_WORDS = ("允许", "同意", "确认", "授权", "继续", "确定", "�
 # 点了就跑到别的页面去了。
 EXCLUDE_WORDS = ("记录", "规则", "说明", "明细", "商城", "更多", "上月", "下月", "上个月",
                  "下个月", "排行榜", "历史", "帮助", "客服", "购买", "支付", "下单",
-                 "退款", "注销", "退出", "删除", "分享", "邀请", "查看")
+                 "退款", "注销", "退出", "删除", "分享", "邀请", "查看",
+                 # 「再累计签到15天得好券」这类**进度说明**也含「签到」，实测被误点过
+                 "得好券", "奖励", "累计")
 # 兼容旧名（wxreg 里还在用）
 TARGETS = SIGN_WORDS + CONFIRM_WORDS
 
@@ -97,6 +99,8 @@ def pick_action(d, mode="sign", clicked=None, allow_fallback=None):
     ex = _exclude()
     pool = [it for it in d["items"]
             if not clicked(it)
+            # 顶部 55px 是小程序的**标题栏/导航条**，那里的文字点了没意义（实测会浪费轮次）
+            and it["cy"] > 55
             # 「已签到」「已连续签到1天」这类是**状态提示**而不是按钮 —— 以「已」开头基本可判。
             and not it["text"].lstrip().startswith("已")
             and not any(w in it["text"] for w in ex)]

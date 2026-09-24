@@ -197,7 +197,23 @@ def clear_modals(W, H):
     return hits > 0
 
 
+def count_leftovers():
+    """只数不关，输出 `[clean] LEFT=<n>`（给调用方决定要不要上硬手段）。
+
+    为什么要单独一个模式：硬清运行时**有代价**（会把小程序面板一起弄没，
+    面板本身也是 WeChatAppEx 渲染的），所以调用方得先知道「到底有没有残留」，
+    别拿它当万能自愈 —— 实测踩过：没有残留也硬清，结果面板彻底打不开，整批跑废。
+    """
+    n = len([1 for w, t in R.windows() if leftover(w, t)])
+    print("[clean] LEFT=%d" % n)
+    return n
+
+
 def main():
+    if "--count" in sys.argv:
+        count_leftovers()
+        return 0
+
     W, H = R.size()
     if (W, H) != (R.WANT_W, R.WANT_H):
         R.run("DISPLAY=%s xrandr -s %dx%d" % (R.DISPLAY, R.WANT_W, R.WANT_H))

@@ -428,6 +428,24 @@ def restart_hook(wait=60):
     return False
 
 
+def leftover_count():
+    """现在有几个「关不掉/没关」的小程序窗口？（只数不关，很快）
+    用来决定要不要上硬手段 —— 见 ensure_miniapp 里的说明。"""
+    if not INSTANCE:
+        return 0
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxclean.py"), "--count"],
+                           capture_output=True, text=True, timeout=120)
+    except Exception:
+        return 0
+    for line in ((p.stdout or "") + (p.stderr or "")).splitlines():
+        m = re.search(r"\[clean\] LEFT=(\d+)", line.strip())
+        if m:
+            return int(m.group(1))
+    return 0
+
+
 def _wxopen(brand):
     """开一次小程序，返回 (rc, output)。"""
     args = ["docker", "exec", "-e", "DISPLAY=:1",
@@ -466,7 +484,16 @@ def ensure_miniapp(brand, retry_hard=True):
         rc, out = _wxopen(brand)
         ok = rc in (0, 4)
     if not ok and retry_hard:
-        log("  [ensure] 重启 hook 也没打开 → 硬清小程序运行时（⚠️ 会连坐面板，之后要靠 hook 重挂）")
+        # 硬清**只在真的有残留窗口时才做**。没有残留还硬清 = 白白把面板弄没
+        # （实测踩过一次，之后整批号都卡在「没能确认小程序面板」）。
+        # 没有残留 → 面板多半是「微信自己以为面板还开着」那种状态，脚本治不了，
+        # 只能**重启微信**，所以这里直接放弃、别再折腾。
+        left = leftover_count()
+        if left <= 0:
+            log("  [ensure] 重启 hook 后仍打不开，且**没有残留窗口** → 不是残留堵的，"
+                "脚本治不了（多半要重启微信才能让面板复位）。放弃这个号，不再硬清。")
+            return False
+        log("  [ensure] 重启 hook 也没打开，但确有 %d 个残留 → 硬清运行时（⚠️ 会连坐面板）" % left)
         clean_leftovers(hard=True)
         rc, out = _wxopen(brand)
         ok = rc in (0, 4)

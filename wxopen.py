@@ -246,7 +246,18 @@ def raise_window(wid):
         run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
         run("DISPLAY=%s xdotool windowraise %s" % (DISPLAY, wid))
         time.sleep(0.6)
-        if str(top_window(WANT_W, WANT_H)) == str(wid):
+        top = top_window(WANT_W, WANT_H)
+        if top is None:
+            # ⚠️ **认不出顶上是谁 ≠ 没抬起来**。
+            #    `top_window()` 依赖「那个窗口在我们按标题筛的列表里」，而
+            #    **硬清运行时之后微信重建的窗口是无名的**（面板/运行时的窗口都叫不出名字），
+            #    `win_under()` 于是返回 None。若把它当失败，会连锁成
+            #    「主窗口抬不起来 → 不点侧边栏 → 面板永远打不开」的**假死**
+            #    （实测踩到：硬清一次之后 open_panel 直接放弃）。
+            #    所以这里**乐观放行** —— 真被别的窗口挡着时，后面 `click_expect`
+            #    那道理所当然的安全阀仍会拦下来（它按点问「鼠标底下是不是目标」）。
+            return True
+        if str(top) == str(wid):
             return True
     print("[reopen] ⚠️ 抬不起窗口 %s（顶上始终是 %s）"
           % (wid, top_window(WANT_W, WANT_H)))
@@ -310,11 +321,21 @@ def top_window(W=None, H=None):
 
 
 def click_expect(wid, x, y, wait=0.7, what=""):
-    """点之前先确认「鼠标底下就是 wid」，不是就不点。"""
+    """点之前先确认「鼠标底下就是 wid」，不是就不点。
+
+    ⚠️ `win_under()` 返回 None 时**放行**（不是拒绝）—— 它返回 None 有两种情况：
+      ① 鼠标底下是个**无名的**顶层窗口（硬清运行时之后微信重建的窗口就是这样，
+         面板/运行时都叫不出名字），这时它必然「认不出」；
+      ② 窗口管理器结构异常。
+    这两种情况下 `wid` 很可能**确实是**最上层（我们刚 raise 过），
+    把 None 当失败会让所有点击被拒 → 表现为「面板打不开 / 卡片定位坏了」的**假死**
+    （实测：硬清一次之后整个流程卡死，日志一片 `⛔ … 不是预期目标`）。
+    安全阀仍然有效：只要**认出了**是别的窗口，就照样拒绝。
+    """
     under = win_under(x, y)
-    if str(under) != str(wid):
+    if under is not None and str(under) != str(wid):
         print("[reopen] ⛔ (%d,%d) 底下是窗口 %s，不是预期目标 %s → 不点%s"
-              % (x, y, under or "（认不出）", wid, (" " + what) if what else ""))
+              % (x, y, under, wid, (" " + what) if what else ""))
         return False
     click(x, y, wait)
     return True

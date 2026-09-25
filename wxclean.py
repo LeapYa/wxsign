@@ -22,6 +22,7 @@
 退出码：0 = 全部清掉（或本来就没有）；1 = 有没关掉的
 """
 import os
+import re
 import sys
 import time
 
@@ -148,6 +149,33 @@ def sibling_button(buf, W, box):
     return None
 
 
+def _activate_popup():
+    """把「小尺寸匿名顶层窗口」（= 微信原生对话框）激活到最前。
+
+    为什么**必需**（2026-09-25 实测）：`退出登录？` 框是**独立的匿名顶层窗口**，
+    直接对它的坐标发 `xdotool click` **不生效** —— wxclean 连点三次框都不关
+    （日志显示"点兄弟按钮（拒绝/取消）"，但框纹丝不动）。
+    而「先 `xdotool windowactivate --sync <框>` 再点同一个坐标」**一次就成**。
+    实测 Esc、Tab+Return 也都无效 —— 只有「先激活、再点击」有效。
+
+    判据：无名字 + 尺寸在 100~500 × 80~400 之间的顶层窗口 = 微信原生对话框
+    （主窗口/面板都是 1280x1024；辅助窗口是 1x1/10x10/200x200，都被尺寸过滤掉）。
+    """
+    try:
+        out = R.run("DISPLAY=%s xwininfo -root -children" % R.DISPLAY)
+    except Exception:
+        return False
+    for line in out.splitlines():
+        m = re.match(r"\s+(0x[0-9a-fA-F]+) \(has no name\):\s+\(\)\s+(\d+)x(\d+)\+", line)
+        if not m:
+            continue
+        w, h = int(m.group(2)), int(m.group(3))
+        if 100 <= w <= 500 and 80 <= h <= 400:
+            R.run("DISPLAY=%s xdotool windowactivate --sync %s" % (R.DISPLAY, m.group(1)))
+            return True
+    return False
+
+
 def dismiss_popups(wid, W, H):
     """遣散挡在窗口上的**模态弹窗**（否则关窗按钮点不中、后续点击全被吞）。
 
@@ -167,10 +195,15 @@ def dismiss_popups(wid, W, H):
     if sib:
         print("[clean] 检测到弹窗绿色按钮 (%d,%d) → 点兄弟按钮（拒绝/取消）(%d,%d)"
               % (gx, gy, sib[0], sib[1]))
+        # ⚠️ 先激活弹窗**再**点 —— 原生对话框不接受「未激活状态下的合成点击」（见 _activate_popup）
+        if _activate_popup():
+            time.sleep(0.5)
         R.click(sib[0], sib[1], 1.5)
         return True
     click_x = gx - int(W * 0.109)          # 兜底：按老经验左移一颗，但绝不点绿色
     print("[clean] 没认出兄弟按钮 → 退到绿按钮左移一颗 (%d,%d)" % (click_x, gy))
+    if _activate_popup():
+        time.sleep(0.5)
     R.click(click_x, gy, 1.5)
     return True
 

@@ -145,7 +145,15 @@ def pick_action(d, mode="sign", clicked=None, allow_fallback=None):
 
         def _score(it):
             flat = (it["w"] / float(it["h"])) if it["h"] else 0
-            return (1 if flat >= 2.5 else 0, -abs(it["cx"] - vw / 2.0), -it["area"])
+            # ⚠️ 第二项「文案越短越像按钮」是踩出来的：
+            #    LONG_OK 那个例外（「注册/授权」允许长文案）本来是为蜀大侠的长入口加的，
+            #    结果绿茵阁西餐厅那层弹层的**整句说明**
+            #    「Hi，神秘食客 更好的会员服务，注册登录后即可体验」（25 字，含「注册」）
+            #    也通过了长度过滤，而且又扁又宽、评分高过真正的「立即登录」按钮 →
+            #    整整几轮都在点那行说明文字，弹层永远不消失，注册自然没发生。
+            #    按钮文案通常很短（2~6 字），说明文字才长 —— 用长度当第二判据最稳。
+            return (1 if flat >= 2.5 else 0, -len(it["text"]),
+                    -abs(it["cx"] - vw / 2.0), -it["area"])
 
         hits.sort(key=_score, reverse=True)
         return hits[0]

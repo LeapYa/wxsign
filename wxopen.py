@@ -545,6 +545,35 @@ def has_miniapp_tab(wid, W, H):
     return blue >= 5
 
 
+def reload_panel(W, H):
+    """把面板的 webview 重载一次（Ctrl+R），成功返回面板窗口 id。
+
+    为什么需要这一步（实测踩过一整轮）：小程序面板是个 **Chromium 页面**，
+    它会掉成「没有连接到网络 / 重新加载」的错误页 —— 此时窗口还在、标签条里的
+    「小程序」紫色图标也在，但页面是空的、**一个小程序运行时都没有**
+    （CDP 侧的表现是 `[enum] 有 wx 的上下文=[]`）。
+    而这时候点侧边栏只会把它**切换关闭**，于是外部看到的就是
+    「面板打不开 rc=3」→ 之前一路升级到「硬清运行时 / 重启微信」，全都没必要。
+
+    ⚠️ 判据要落在**行为**上：`has_miniapp_tab()` 只证明标签条有那个图标，
+       证明不了页面是活的。所以这里以「重载后能拿到面板窗口」为准，
+       真正的可用性由后续 `[enum]` 有没有上下文来判。
+    """
+    cands = [wid for wid, t in windows()
+             if (t or "").strip() == "微信" and str(wid) != str(find_main_window())]
+    if not cands:
+        print("[reopen] 没有标题为「微信」的副窗口可重载")
+        return None
+    for wid in cands:
+        raise_window(wid)
+        key("ctrl+r", 5.0)
+        if has_miniapp_tab(wid, W, H):
+            print("[reopen] 面板重载成功（Ctrl+R）→ 窗口 %s" % wid)
+            return wid
+    print("[reopen] Ctrl+R 重载后仍未确认面板")
+    return None
+
+
 def open_panel(W, H):
     """打开（或置顶）小程序面板：点侧边栏顶部那组里的**最后一个**按钮（=「小程序」）。
 
@@ -582,6 +611,11 @@ def open_panel(W, H):
                 return wid
             print("[reopen] 顶上这个「微信」窗口的标签条里没有「小程序」（图标不对）")
             break
+    # 点侧边栏判不出来 —— 先把**面板 webview 自己**救一次（Ctrl+R），最便宜且常有奇效。
+    print("[reopen] 侧边栏判不出来 → 试 Ctrl+R 重载面板 webview")
+    wid = reload_panel(W, H)
+    if wid:
+        return wid
     print("[reopen] 没能确认小程序面板 → 不继续（不乱点）")
     return None
 

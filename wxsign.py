@@ -45,6 +45,7 @@
 退出码：0 = 全部成功（含「今日已签到」）；1 = 有失败。
 每个品牌收尾打印一行便于 grep：  RESULT <slug> code=<业务码> msg=<说明>
 """
+import http.client
 import json
 import os
 import re
@@ -88,6 +89,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 _SSL = ssl.create_default_context()
 _SSL.check_hostname = False
 _SSL.verify_mode = ssl.CERT_NONE
+
+# CRM 接口的**复用连接**（见 _api_post_once 的说明：不复用会临时端口耗尽）
+# ⚠️ http.client 要的是「host + 完整路径」两段，别把 CRM_BASE 的路径前缀丢了
+#    （丢了会静默变成 HTTP 404，看着像接口不存在）。
+_CRM_HOST = CRM_BASE.split("//", 1)[1].split("/", 1)[0]
+_CRM_PREFIX = "/" + CRM_BASE.split("//", 1)[1].split("/", 1)[1].strip("/")
+_CONN = [None]
 
 # 已验证的响应码约定（辣可可真机实测）
 CODE_OK, CODE_ALREADY, CODE_AUTH_BAD, CODE_AUTH_EXP = "200", "415", "208", "211"
@@ -288,42 +296,74 @@ def jwt_exp(tok):
 
 # ───────────────────────── HTTP ─────────────────────────
 
-def api_post(env, path, data, retries=2):
-    """带重试的 POST。实测沙箱/容器出口偶发 `502 Bad Gateway`（Tunnel connection failed），
-    这类是网络层瞬时错误、重试就好，不该直接判业务失败。"""
+def api_post(env, path, data, retries=3):
+    """带重试的 POST。实测沙箱/容器出口偶发 `502 Bad Gateway`（Tunnel connection failed）
+    和 `WinError 10048`（临时端口耗尽），这类是网络层瞬时错误、重试就好，
+    不该直接判业务失败 —— 更不该被当成「这个号没有活动」（踩过，见 --probe）。"""
     r = None
     for attempt in range(retries + 1):
         r = _api_post_once(env, path, data)
-        if str(r.get("code")) != "-1":
+        if not is_transport_fail(r):
             return r
         if attempt < retries:
+            wait = 2.0 * (attempt + 1)
             log("  [net] %s 第 %d 次失败（%s），%.1fs 后重试"
-                % (path, attempt + 1, str(r.get("msg"))[:60], 1.5 * (attempt + 1)))
-            time.sleep(1.5 * (attempt + 1))
+                % (path, attempt + 1, str(r.get("msg"))[:60], wait))
+            time.sleep(wait)
     return r
 
 
 def _api_post_once(env, path, data):
+    """单次 POST。**复用同一条 HTTPS 连接**，并在传输错误时小睡重连。
+
+    为什么必须复用：批量跑时这里的调用非常密集，而 urllib.urlopen 每次都新开 socket、
+    响应对象一析构就关 —— 高频调用下 Windows 会报
+    `WinError 10048 通常每个套接字地址只允许使用一次`（临时端口耗尽 / TIME_WAIT 堆积），
+    于是业务请求全返 code=-1，**看起来像「这个号没有活动」，其实是本机网络问题**。
+    实测踩过：审计里一个号因此得出假结论（详见 --probe 的传输失败分支）。
+    """
     mp = env.get("WX_MPID", "")
     if not mp:
-        return {"code": "-1", "msg": "缺少 WX_MPID（先跑 wxident.js 抓身份）"}
+        return {"code": "-1", "msg": "缺少 WX_MPID（先跑 wxident.js 抓身份）", "_transport": 1}
     body = {"mpId": mp, "openId": env.get("WX_OPENID", ""),
             "unionId": env.get("WX_UNIONID", ""), "data": data}
+    payload = json.dumps(body).encode()
     headers = {"Content-Type": "application/json",
                "Authorization": env.get("WX_TOKEN", ""),
-               "crm7-mpId": mp, "User-Agent": UA}
+               "crm7-mpId": mp, "User-Agent": UA,
+               "Content-Length": str(len(payload)), "Connection": "keep-alive"}
     if env.get("WX_GCID"):
         headers["csl-GC-Shardingkey"] = env["WX_GCID"]
-    req = urllib.request.Request(CRM_BASE + path, data=json.dumps(body).encode(),
-                                 headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode(errors="replace") if e.fp else ""
-        return {"code": str(e.code), "msg": "HTTP %s: %s" % (e.code, raw[:200])}
-    except Exception as e:
-        return {"code": "-1", "msg": str(e)}
+
+    last = None
+    for attempt in range(3):
+        conn = _CONN[0]
+        try:
+            if conn is None:
+                conn = http.client.HTTPSConnection(_CRM_HOST, timeout=20, context=_SSL)
+                _CONN[0] = conn
+            conn.request("POST", _CRM_PREFIX + path, body=payload, headers=headers)
+            r = conn.getresponse()
+            raw = r.read().decode(errors="replace")
+            if r.status != 200:
+                # 服务端明确回了个 HTTP 码 —— 这是「有应答」，不是传输失败
+                return {"code": str(r.status), "msg": "HTTP %s: %s" % (r.status, raw[:200])}
+            return json.loads(raw)
+        except Exception as e:
+            last = e
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _CONN[0] = None
+            if attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+    return {"code": "-1", "msg": str(last), "_transport": 1}
+
+
+def is_transport_fail(resp):
+    """这个响应是「本机/链路的传输失败」吗（不是业务结论）。"""
+    return bool(resp and str(resp.get("code")) == "-1")
 
 
 def content_of(resp):
@@ -1053,7 +1093,17 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         gid = env.get("WX_GAMEID") or brand.get("gameid") or ""
         if not gid and acts:
             gid = str(acts[0].get("id") or "")
+        # ⚠️ 传输失败 ≠ 业务结论。
+        #    实测：批量跑时本机临时端口耗尽（WinError 10048）+ 出口隧道 502，
+        #    所有调用都返 code=-1，于是走到最后那个 else，被写成「服务端没有活动（该租户未配置）」
+        #    ——**这是个假结论**，会把「没查到」伪装成「查过了、没有」。
+        #    凡是本号出现过传输失败，就一律标成不可判定，交给重跑。
+        net_bad = is_transport_fail(r) or is_transport_fail(r2)
         if not gid:
+            if is_transport_fail(r2):
+                log("  [probe] ⚠️ 传输失败（%s）—— **未判定**，请重跑这个号"
+                    % str(r2.get("msg"))[:70])
+                return False, "netfail"
             log("  [probe] ⚪ 服务端没有活动，也没有可用的 gameId（lot/list=%s）" % r2.get("code"))
             return True, "probe"
 
@@ -1093,6 +1143,7 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
             log("  [probe] ✅ 能签到：%s（signNum=%s）"
                 % (name, svi.get("signNum") if isinstance(svi, dict) else "-"))
             return True, "probe"
+        net_bad = net_bad or is_transport_fail(sd) or is_transport_fail(sv)
 
         if is_sign_act and register_only:
             # `--probe --register`：不是会员时先注册，再复查一次，给终判（会真实建会员！）
@@ -1128,6 +1179,10 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         elif str(sd.get("code")) == CODE_OK:
             log("  [probe] 🟡 有活动但**不是签到**（isCumulativeSign 为 null）：%s —— "
                 "这类号只能参与抽奖/秒杀，签不了" % name)
+        elif net_bad:
+            log("  [probe] ⚠️ 传输失败 —— **未判定**（接口返 code=-1，属本机/链路问题，"
+                "不是「没有活动」）。请重跑这个号。")
+            return False, "netfail"
         else:
             log("  [probe] ⚪ 服务端没有活动（该租户未配置）")
         return True, "probe"

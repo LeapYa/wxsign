@@ -54,6 +54,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -645,7 +646,8 @@ def ensure_helpers():
         return False
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
             ("wxfind.py", "wxcdp.py", "wxdom.py", "wxwin.py", "pkgprobe.py",
-             "wxclean.py", "wxopen.py", "wxreg.py", "wxagree.py", "wxnet.py")]
+             "wxclean.py", "wxopen.py", "wxreg.py", "wxagree.py", "wxnet.py",
+             "wxyd.py")]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖
@@ -858,8 +860,133 @@ def discover_lot_gameid(env):
     return "", "活动项里没有 id 字段"
 
 
+# ───────────────────── 易东（eingdong）后端 ─────────────────────
+# 仓库里的第二个后端。吾享那套（crm7game-api + mpId/openId + 签名）在这里完全不适用：
+# 易东是「明文 PHP 路由 + cookie sessionKey」，结构上比吾享还简单。实测记录见 survey/YD_API.md。
+#   取身份（小程序逻辑层，wxyd.py）→ POST /api/login 换 sessionKey
+#   → cookie: sessionKey=<sk> → POST /signin/get_info 查状态 → /signin/check_in_1 签到
+YD_BASE = "https://zhyx.eingdong.com/api/index.php"
+_YD_HOST = YD_BASE.split("//", 1)[1].split("/", 1)[0]
+_YD_PREFIX = "/" + YD_BASE.split("//", 1)[1].split("/", 1)[1].strip("/")
+_YD_CONN = [None]
+
+
+def _yd_post_once(path, data, cookie=""):
+    """单次 POST。也复用连接 —— 理由与 _api_post_once 完全相同（临时端口耗尽）。"""
+    body = urllib.parse.urlencode(data).encode()
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if cookie:
+        headers["cookie"] = cookie
+    try:
+        conn = _YD_CONN[0]
+        if conn is None:
+            conn = http.client.HTTPSConnection(_YD_HOST, timeout=20, context=_SSL)
+            _YD_CONN[0] = conn
+        conn.request("POST", _YD_PREFIX + path, body=body, headers=headers)
+        r = conn.getresponse()
+        raw = r.read().decode(errors="replace")
+        if r.status != 200:
+            return {"status": str(r.status), "msg": "HTTP %s: %s" % (r.status, raw[:200])}
+        return json.loads(raw)
+    except Exception as e:
+        _YD_CONN[0] = None
+        return {"_transport": 1, "msg": "传输失败：%s" % e}
+
+
+def yd_post(path, data, cookie="", retries=3):
+    """带重试的 POST。判据用 `_transport`（易东的业务字段是 status/msg，不是 code）。"""
+    r = None
+    for attempt in range(retries + 1):
+        r = _yd_post_once(path, data, cookie)
+        if not r.get("_transport"):
+            return r
+        if attempt < retries:
+            wait = 2.0 * (attempt + 1)
+            log("  [net] %s 第 %d 次失败（%s），%.1fs 后重试"
+                % (path, attempt + 1, str(r.get("msg"))[:60], wait))
+            time.sleep(wait)
+    return r
+
+
+def yd_ident(brand, wait=15):
+    """在小程序逻辑层取 (code, storeid)；失败返回 (None, None)。
+
+    前提：目标小程序**正开着**（前一步 ensure_miniapp 刚开过）且 hook 通。
+    code 只用一次、约 5 分钟内有效，所以拿到就立刻用，不要缓存。
+    """
+    if not INSTANCE:
+        log("  [yd] 未设 WOC_INSTANCE → 取不到 code")
+        return None, None
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxyd.py"), brand.get("appid", ""), str(wait)],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        log("  [yd] 执行异常：%s" % e)
+        return None, None
+    out = (p.stdout or "") + (p.stderr or "")
+    got = None
+    for line in out.splitlines():
+        if line.startswith("YD_JSON="):
+            try:
+                got = json.loads(line[len("YD_JSON="):])
+            except ValueError:
+                pass
+        elif line.strip():
+            log("     " + line.strip()[:180])
+    if not got:
+        log("  [yd] 没拿到身份（wxyd.py rc=%s）" % p.returncode)
+        return None, None
+    return got.get("code"), str(got.get("storeid") or "")
+
+
+def do_sign_yd(brand, env):
+    """易东后端签到。返回 (是否成功, 业务码, 说明)。"""
+    storeid = env.get("YD_STOREID", "")
+    code, got_store = yd_ident(brand)
+    if not code:
+        return False, "NOCODE", "拿不到 wx.login 的 code（小程序开着吗？hook 通吗？）"
+    if got_store:
+        storeid = got_store
+    if not storeid:
+        return False, "NOSTORE", "拿不到门店 storeid（小程序 ext 配置里没有？）"
+
+    r = yd_post("/api/login", {"code": code, "storeid": storeid,
+                               "ext_storeid": storeid,
+                               "v": env.get("YD_VERSION", "1"), "parent_id": "0"})
+    if str(r.get("status")) != "1":
+        return False, "LOGIN", "换 sessionKey 失败：%s" % str(r.get("msg"))[:160]
+    sk = r.get("sessionId", "")
+    if not sk:
+        return False, "LOGIN", "登录应答里没有 sessionId"
+    log("  [yd] 已登录：门店「%s」 openId=%s"
+        % (r.get("store_name", storeid), r.get("openId", "")))
+    if env.get("YD_SESSIONKEY") != sk:          # 落盘只是省一次 login，不是必需
+        env["YD_SESSIONKEY"] = sk
+        env["YD_STOREID"] = storeid
+        save_env(brand["slug"], env)
+
+    cookie = "sessionKey=" + sk
+    info = yd_post("/signin/get_info", {"storeid": storeid}, cookie=cookie)
+    if str(info.get("status")) != "1":
+        return False, "INFO", "查签到状态失败：%s" % str(info.get("msg"))[:160]
+    d = info.get("info") or {}
+    if str(d.get("signed_today", "0")) == "1":
+        return True, "415", "今天已经签到过了（连续 %s 天）" % d.get("keep_days", "?")
+
+    r = yd_post("/signin/check_in_1", {"storeid": storeid}, cookie=cookie)
+    if str(r.get("status")) == "1":
+        rw = r.get("reward") or {}
+        return True, "200", "签到成功：+%s，连续 %s 天" % (rw.get("reward_amount"), rw.get("keep_days"))
+    return False, str(r.get("status")), str(r.get("msg"))[:160]
+
+
 def do_sign(brand, env):
     """返回 (是否成功, 业务码, 说明)"""
+    # 后端分派：brands.json 的 engine 缺省 = 吾享（老条目不用动）
+    if (brand.get("engine") or "wuuxiang") == "eingdong":
+        return do_sign_yd(brand, env)
     slug = brand["slug"]
     # gameId 不是凭证、是公开的活动常量，所以优先放 brands.json（这样新用户 clone 下来就有）；
     # brands/<slug>.env 里的 WX_GAMEID 优先，便于临时覆盖。
@@ -1016,6 +1143,14 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
             ensure_miniapp(brand)
         elif need_ident:
             log("  [!] 缺身份且未设 WOC_INSTANCE → 无法自动开小程序取值")
+
+    # 后端分派：易东系不走吾享那套（mpId / token / 签名），直接进它自己的流程。
+    # ⚠️ 必须放在 refresh_token **之前** —— 否则会被「token 刷新失败 → notoken」拦死
+    #    （2026-09-25 实测踩过：报 RESULT code=notoken，根本到不了 do_sign_yd）。
+    if (brand.get("engine") or "wuuxiang") == "eingdong":
+        yd_ok, yd_code, yd_msg = do_sign_yd(brand, env)
+        log("RESULT %s code=%s msg=%s" % (slug, yd_code, yd_msg))
+        return yd_ok, yd_code
 
     ok_token = refresh_token(brand, env, force=need_ident)
     if not ok_token and INSTANCE:

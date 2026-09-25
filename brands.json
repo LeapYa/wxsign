@@ -1,5 +1,6 @@
 {
-  "_comment": "吾享（wuuxiang / 天财商龙 CRM7）系小程序签到·活动合集 —— 品牌表。静态信息在此，凭证在 brands/<slug>.env。",
+  "_comment": "小程序签到·活动合集 —— 品牌表。静态信息在此，凭证在 brands/<slug>.env。",
+  "_engines": "两个后端：缺省 = 吾享（wuuxiang / 天财商龙 CRM7，见 crm_base）｜eingdong = 易东（zhyx.eingdong.com，链路见 survey/YD_API.md）。条目用 engine 字段选，不写就是 wuuxiang。",
   "engine_version": 1,
   "crm_base": "https://scrm.wuuxiang.com/crm7game-api",
   "login_url": "https://wechat.wuuxiang.com/i5xforyou/auth/login",
@@ -186,6 +187,18 @@
       "enabled": false,
       "verified": false,
       "note": "会员卡型；未见签到"
+    },
+    {
+      "slug": "liuyishou",
+      "name": "刘一手",
+      "appid": "wx757e678caa41a2a6",
+      "keyword": "刘一手",
+      "miniapp": "刘一手火锅店",
+      "engine": "eingdong",
+      "type": "sign",
+      "enabled": true,
+      "verified": true,
+      "note": "**第二个后端：易东（eingdong）**的首个条目。链路：小程序逻辑层取 wx.login 的 code 与 ext 里的 storeid（wxyd.py）→ POST /api/login 换 sessionKey → 之后请求带 cookie sessionKey=… → /signin/get_info 查状态 → /signin/check_in_1 签到。接口与逐条实测记录见 survey/YD_API.md。⚠️ 这个 appId 是**巴塞罗那店**（登录返回的 store_name = 巴塞罗那刘一手火锅店），国内门店用不上；同后端另有「巧娘子」wxa8f4bf2bc3913d64，但那个号还没实测过，先不入库。"
     }
   ]
 }

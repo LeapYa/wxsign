@@ -907,8 +907,15 @@ def find_search_box(W, H):
     return None
 
 
-def do_search(W, H, box):
-    """主窗口搜索框 → 输入 → 点下拉里的「搜索网络结果」→ 落到搜一搜结果页。
+def do_search(W, H, box, goto_net=False):
+    """主窗口搜索框 → 输入 →（可选）点「搜索网络结果」落到搜一搜结果页。
+
+    **默认停在下拉**（goto_net=False）：实测小程序条目就在「输入后的下拉」里
+    （「最近使用过的小程序」那一段），根本不用跳页面 —— 手工点开刘一手就是这么点的；
+    而老实现一路点到「搜一搜网络结果页」，那一页**没有小程序列表**，`find_rows` 自然是 0 行
+    （2026-09-25 实测：`结果页找到 0 行`，白跑两轮）。
+    goto_net=True 保留老行为，只作为「下拉里确实没有小程序条目」时的退路。
+
     ⚠️ 打字是发给**当前有键盘焦点的窗口**的，所以输入前必须确认主窗口在最前
        （否则字会落到别的窗口，甚至在聊天输入框里回车就直接发出去）；
        框没确认之前也一个字都不输入。"""
@@ -926,6 +933,8 @@ def do_search(W, H, box):
     time.sleep(2.0)
     buf = grab(W, H)
     png(W, H, "reopen_search_dropdown.png")
+    if not goto_net:
+        return True                     # 就停在下拉，交给调用方去点小程序条目
     ny = find_netsearch_row(buf, W, H)
     if not ny:
         # 定位不到就**什么都不按**退出（老代码这里按 Down+回车，
@@ -976,6 +985,50 @@ def find_netsearch_row(buf, W, H):
     return None
 
 
+def find_dropdown_miniapps(buf, W, H):
+    """找搜索下拉里**小程序条目**的 y 中心列表（按 y 升序）。
+
+    判据与 find_netsearch_row 同源、方向相反：两类行的图标都落在同一条竖列里，
+    但**小程序行的 logo 横向跨度约 22px**（x≈76..98，实测），
+    而「搜索网络结果」的 ✳ 只有约 9px —— 颜色不可靠（logo 里也有浅粉像素），**宽度可靠**。
+
+    ⚠️ 这条判据只对「输入后的下拉」有效：一旦点了「搜索网络结果」跳进搜一搜结果页，
+    布局完全不同（logo 移到 x≈0.17W~0.24W，见 find_rows），别混用两套坐标。
+    """
+    x0, x1 = int(W * 0.054), int(W * 0.086)      # 69..110，与 find_netsearch_row 同一列
+    rows = {}
+    for y in range(int(H * 0.05), int(H * 0.65)):
+        base = y * W * 3
+        xs = []
+        for x in range(x0, x1):
+            i = base + x * 3
+            r, g, b = buf[i], buf[i + 1], buf[i + 2]
+            if max(r, g, b) - min(r, g, b) > 45:          # 彩色像素（排除灰色图标/文字）
+                xs.append(x)
+        if xs:
+            rows[y] = (min(xs), max(xs))
+    if not rows:
+        return []
+    ys = sorted(rows)
+    bands, cur = [], [ys[0]]
+    for y in ys[1:]:
+        if y - cur[-1] <= 6:
+            cur.append(y)
+        else:
+            bands.append(cur); cur = [y]
+    bands.append(cur)
+    thin = max(int(W * 0.012), 12)                        # 窄于 ~15px 的是 ✳，不是小程序
+    out = []
+    for band in bands:
+        if len(band) < 8:                                 # 太薄，不是图标
+            continue
+        lo = min(rows[y][0] for y in band)
+        hi = max(rows[y][1] for y in band)
+        if hi - lo > thin:
+            out.append((band[0] + band[-1]) // 2)
+    return out
+
+
 def find_rows(buf, W, H):
     """找结果行的 y 中心：结果行左侧有一块方形 logo（高饱和或深色），
     按 y 扫描 logo 列，聚成连续带即为一行。返回行中心 y 列表。"""
@@ -1005,12 +1058,81 @@ def find_rows(buf, W, H):
     return [(b[0] + b[-1]) // 2 for b in bands if len(b) >= 24]
 
 
+# ───────────────────── 匿名模态框：点不动东西时先查它 ─────────────────────
+
+# 判据：无名字 + 尺寸像对话框的顶层窗口。主窗口/面板都是 1280x1024，
+# 辅助窗口是 1x1 / 10x10 / 200x200 —— 都被这个区间过滤掉。
+ANON_MODAL_W = (100, 500)
+ANON_MODAL_H = (80, 400)
+
+
+def find_anon_modal():
+    """找微信的**匿名模态框**（「退出登录？确定/取消」这类），返回 (wid, x, y, w, h) 或 None。
+
+    为什么值得单列一条判据：它是个**独立匿名顶层窗口**（无名、无 WM_CLASS、parent 是 root），
+    既不在 `windows()`（按标题筛）里，也不属于主窗口 —— 但它是 **Qt 模态**，
+    **存在期间主窗口收不到任何点击**。于是症状全都伪装成别的东西：
+    「小程序面板打不开 / 侧边栏点不动 / 坐标算错了 / 分辨率把输入映射搞乱了」。
+
+    ⚠️ 它**会在运行过程中由某次点击冒出来**（2026-09-25 实测：一开始没有，点了几次之后才出现），
+    所以只在每轮开头查一次是不够的 —— 见 close_anon_modal 的调用点。
+    """
+    out = run("DISPLAY=%s xwininfo -root -children" % DISPLAY)
+    for line in out.splitlines():
+        m = re.match(r"\s+(0x[0-9a-fA-F]+) \(has no name\):\s+\(\)\s+"
+                     r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", line)
+        if not m:
+            continue
+        w, h, x, y = int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
+        if ANON_MODAL_W[0] <= w <= ANON_MODAL_W[1] and ANON_MODAL_H[0] <= h <= ANON_MODAL_H[1]:
+            return m.group(1), x, y, w, h
+    return None
+
+
+def close_anon_modal(W, H, verbose=True):
+    """有匿名模态框就关掉它（返回是否关掉了）。
+
+    ⚠️ **必须先 activate 再点**：这种原生对话框不吃「未激活状态下的合成点击」——
+    实测直接 click 连点三次框纹丝不动，而「先 `xdotool windowactivate --sync` 再点同一坐标」
+    一次就成（Esc / Tab+Return 实测也无效）。
+
+    按钮在框内的相对位置是固定的（实测 282x170 的框：「确定」≈(0.23W,0.68H)、
+    「取消」≈(0.69W,0.68H)）—— 这里**只点右侧那颗**（确定在左、取消在右），
+    绝不碰绿色那颗（那是「确定退出登录」，点下去就掉登录，要手机确认、拖久了只能扫码）。
+    """
+    got = find_anon_modal()
+    if not got:
+        return False
+    wid, x, y, w, h = got
+    if verbose:
+        print("[anon] 发现匿名模态框 %s (%dx%d @ %d,%d) → 先激活再点右侧「取消」"
+              % (wid, w, h, x, y))
+    run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
+    time.sleep(0.6)
+    click(int(x + w * 0.69), int(y + h * 0.68), 1.5)
+    if find_anon_modal() is None:
+        if verbose:
+            print("[anon] 已关掉（之前所有点击都被它吃了）")
+        return True
+    if verbose:
+        print("[anon] 没关掉 → 存图 %s" % png(W, H, "anon_modal.png"))
+    return False
+
+
 def open_via_search(W, H):
-    """备选：主窗口搜索 → 搜一搜结果页逐行点。
-    ⚠️ 默认**不跑**（main() 里要 WXSIGN_CHAT_SEARCH=1 才走这条）：这版微信上实测
-    输入框点不中、结果页也点不开，白花时间；更要紧的是，输入框没确认就敲字的话，
-    关键词会落进聊天输入框、回车就直接发出去。"""
+    """主路径（面板）失败后的替代：主窗口顶部全局搜索 → 逐行点结果。
+
+    **2026-09-25 更正：这条现在默认启用。**
+    原注释写「这版微信上实测输入框点不中、结果页也点不开，所以默认不跑」——**那个结论是错的**。
+    当时多半是**匿名模态框在吞点击**（见 find_anon_modal）：关掉框之后实测完全可用 ——
+    点中搜索框、输入中文、点结果、小程序真的打开，并用 appId 复核过。
+    所以现在不再需要 WXSIGN_CHAT_SEARCH=1（那个开关保留但已不起门槛作用）。
+
+    安全阀都还在，别删：输入前先确认那是「微信」标签下的**全局**搜索框 ——
+    否则关键词会落进聊天输入框、回车就直接把消息发出去（原注释担心的就是这个）。
+    """
     for round_no in (1, 2):
+        close_anon_modal(W, H)                 # 框会吞点击：动手前先清掉
         if not ensure_chat_tab(W, H):          # 非「微信」标签下那个框是局部搜索
             return False
         box = find_search_box(W, H)
@@ -1020,18 +1142,29 @@ def open_via_search(W, H):
         if box[3] > PLACEHOLDER_MAX:
             print("[reopen] 搜索框占位文字跨度 %d（像是「搜索收藏」这种局部搜索）→ 不用它" % box[3])
             return False
-        if not do_search(W, H, box):
+        if not do_search(W, H, box):           # 默认停在「输入后的下拉」
             return False
-        rows = find_rows(grab(W, H), W, H)
-        print("[reopen] 第%d轮：结果页找到 %d 行：%s" % (round_no, len(rows), rows))
+        # 小程序条目就在下拉里（手工点开刘一手点的就是这里）；下拉里没有（比如这个词
+        # 没匹配到号）才退回搜一搜结果页 —— 两套坐标体系不同，别混用。
+        rows = find_dropdown_miniapps(grab(W, H), W, H)
+        click_x = int(W * 0.12)
+        print("[reopen] 第%d轮：下拉里找到 %d 个小程序条目：%s" % (round_no, len(rows), rows))
+        if not rows:
+            print("[reopen] 下拉里没有小程序条目 → 退回搜一搜结果页")
+            if not do_search(W, H, box, goto_net=True):
+                continue
+            rows = find_rows(grab(W, H), W, H)
+            click_x = int(W * 0.28)
+            print("[reopen] 第%d轮：结果页找到 %d 行：%s" % (round_no, len(rows), rows))
         if not rows:
             continue
         main = find_main_window()
         baseline = {wid for wid, _ in windows()}
         for i, y in enumerate(rows[:6], 1):
+            close_anon_modal(W, H)             # 逐行点之前都清一次：框一冒出来后面全是白点
             print("[reopen] 第%d轮 试第 %d 行 y=%d" % (round_no, i, y))
             TOUCHED[0] = True
-            click(int(W * 0.28), y, 3.0)
+            click(click_x, y, 3.0)
             wid, title = find_target_window()
             if wid:
                 print("[reopen] 打开成功：%s" % title)
@@ -1249,10 +1382,19 @@ def main():
     if open_via_panel(W, H):
         return 0
 
-    if os.environ.get("WXSIGN_CHAT_SEARCH") == "1" or os.environ.get("LAKEKE_CHAT_SEARCH") == "1":
-        print("[reopen] 面板路径失败，改走主窗口搜索（WXSIGN_CHAT_SEARCH=1）")
-        if open_via_search(W, H):
+    # 面板失败有两类原因，其中一类极阴：**匿名模态框把点击全吃了** —— 症状与「面板坏了」一模一样。
+    # 先清一次框再试一次面板：很便宜，能救回「其实只是被框挡着」的情况。
+    if close_anon_modal(W, H):
+        print("[reopen] 清掉匿名模态框后重试面板")
+        if open_via_panel(W, H):
             return 0
+
+    # 另一类是面板**真的开不出来**（2026-09-25 实测：WMPF 进程健康、无僵尸、点击也正常，
+    # 点侧边栏「小程序」图标时窗口树毫无变化）。别再纠缠面板 ——
+    # 主窗口顶部搜索**不依赖面板**，实测能直接搜到并打开小程序，且能用 appId 复核。
+    print("[reopen] 面板路径失败 → 改走主窗口搜索（不依赖面板）")
+    if open_via_search(W, H):
+        return 0
 
     print("[reopen] 改走甄选兜底")
     if open_via_zhenxuan(W, H):

@@ -236,6 +236,10 @@ def clear_modals(W, H):
         print("[clean] 找不到微信主窗口，跳过弹窗遣散")
         return False
     hits = 0
+    # 先走「结构判据」这条路：直接找匿名顶层窗口（比像素扫描更早命中，也不依赖框内配色）。
+    # 两条路互补 —— 结构那条能确认「框在不在」，像素那条能在框内定位按钮。
+    if R.close_anon_modal(W, H):
+        hits += 1
     for _ in range(3):
         if not dismiss_popups(wid, W, H):
             break

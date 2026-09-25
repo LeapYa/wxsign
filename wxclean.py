@@ -181,10 +181,19 @@ def clear_modals(W, H):
     面板里全是小程序图标，这一下就会点出各种莫名其妙的东西
     （实测：弹出过「退出登录？」确认框，鼠标悬在「确定」上，差一点就把微信登出了）。
     """
+    # ⚠️ 不能依赖 top_window()：模态框是**无名、无 WM_CLASS 的普通顶层窗口**
+    #    （实测那个「退出登录」框是 282x170 @ 499,427 的匿名窗口），不在 windows() 列表里，
+    #    于是 win_under() → None → top_window() → None → 这里直接 return False。
+    #    结果正好是反的：**有模态框时反而遣散不了**。
+    #    改成：先问鼠标底下；认不出（或不是主窗口）就按 WM_CLASS 找主窗口
+    #    —— 模态框本来就挂在主窗口上，直接对主窗口扫就行。
     wid = R.top_window(W, H)
+    if not (wid and R.is_main_window(wid)):
+        if wid:
+            print("[clean] 鼠标底下是窗口 %s（不是主窗口）→ 改用主窗口扫弹窗" % wid)
+        wid = R.find_main_window()
     if not wid:
-        return False
-    if not R.is_main_window(wid):        # 只认主窗口（WM_CLASS 含 wechat）
+        print("[clean] 找不到微信主窗口，跳过弹窗遣散")
         return False
     hits = 0
     for _ in range(3):

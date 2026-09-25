@@ -242,7 +242,12 @@ def win_under(x, y):
     """把鼠标移到 (x,y)，返回该点最上层窗口（在我们窗口列表里的那个）id，认不出返回 None。
     getmouselocation 报的常常是窗口管理器（Openbox）的**框架**窗口，客户窗口是它的子窗口，
     所以要再下一层找；没被 reparent 时它直接就报客户窗口。
-    用途：**每次点击前先问一句「我鼠标底下是谁」**，不是预期目标就不点。"""
+    用途：**每次点击前先问一句「我鼠标底下是谁」**，不是预期目标就不点。
+
+    ⚠️ 还要**往上走**：模态框（如「退出登录？」）是**无名、无 WM_CLASS 的独立顶层窗口**，
+    它盖住屏幕中心时，不加这一步就会返回 None —— 于是 top_window() 认不出任何东西，
+    连带「遣散弹窗」的判断也短路（实测：正因为这个，有模态框时反而遣散不了）。
+    """
     run("DISPLAY=%s xdotool mousemove %d %d" % (DISPLAY, int(x), int(y)))
     time.sleep(0.35)
     wid = ""
@@ -254,12 +259,31 @@ def win_under(x, y):
     known = {str(w) for w, _ in windows()}
     if wid in known:
         return wid
+    # 往下：框架窗口 → 客户窗口
     for line in run("DISPLAY=%s xwininfo -id %s -tree" % (DISPLAY, wid)).splitlines()[1:]:
         m = re.match(r"\s+(0x[0-9a-fA-F]+)\b", line)
         if m:
             dec = str(int(m.group(1), 16))
             if dec in known:
                 return dec
+    # 往上：独立顶层窗口（模态框）→ 它的父/祖先里找我们认识的窗口
+    seen = set()
+    cur = wid
+    for _ in range(6):
+        if cur in seen:
+            break
+        seen.add(cur)
+        parent = ""
+        for line in run("DISPLAY=%s xwininfo -id %s" % (DISPLAY, cur)).splitlines():
+            m = re.match(r"\s*Parent window id:\s*(0x[0-9a-fA-F]+)", line)
+            if m:
+                parent = m.group(1)
+                break
+        if not parent or parent == "0x0":
+            break
+        if str(int(parent, 16)) in known:
+            return str(int(parent, 16))
+        cur = parent
     return None
 
 

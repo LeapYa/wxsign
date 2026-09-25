@@ -175,18 +175,16 @@ def clear_modals(W, H):
     极难联想到弹窗。而旧实现是「没有残留窗口就直接 return」—— 那个分支恰恰**永远不检查弹窗**，
     于是「侧边栏干净 + 一个退出登录框」这个组合直接把整批品牌跑废（实测踩了一整轮）。
 
-    ⚠️ 只对**微信自己的窗口**做（主窗口 / 小程序面板，标题都是「微信」）：
-    小程序页面里到处是绿色按钮，拿这套逻辑去点就是灾难。
+    ⚠️ 只对**微信主窗口**做，判据必须是 **WM_CLASS 含 wechat**，不能只看标题 ==「微信」：
+    小程序面板的标题**也是「微信」但没有 WM_CLASS**（见 wxopen.has_miniapp_tab 的说明）。
+    旧版用标题判，于是在**面板**里也扫「绿药丸按钮」并点它的兄弟按钮 ——
+    面板里全是小程序图标，这一下就会点出各种莫名其妙的东西
+    （实测：弹出过「退出登录？」确认框，鼠标悬在「确定」上，差一点就把微信登出了）。
     """
     wid = R.top_window(W, H)
     if not wid:
         return False
-    title = ""
-    for w, t in R.windows():
-        if str(w) == str(wid):
-            title = t.strip()
-            break
-    if title != "微信":
+    if not R.is_main_window(wid):        # 只认主窗口（WM_CLASS 含 wechat）
         return False
     hits = 0
     for _ in range(3):

@@ -1078,14 +1078,26 @@ def find_anon_modal():
     所以只在每轮开头查一次是不够的 —— 见 close_anon_modal 的调用点。
     """
     out = run("DISPLAY=%s xwininfo -root -children" % DISPLAY)
+    W, H = size()
     for line in out.splitlines():
         m = re.match(r"\s+(0x[0-9a-fA-F]+) \(has no name\):\s+\(\)\s+"
                      r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", line)
         if not m:
             continue
         w, h, x, y = int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
-        if ANON_MODAL_W[0] <= w <= ANON_MODAL_W[1] and ANON_MODAL_H[0] <= h <= ANON_MODAL_H[1]:
-            return m.group(1), x, y, w, h
+        if not (ANON_MODAL_W[0] <= w <= ANON_MODAL_W[1]
+                and ANON_MODAL_H[0] <= h <= ANON_MODAL_H[1]):
+            continue
+        # ⚠️ 再加一道「**必须居中**」—— 这条是踩了坑才补的（2026-09-25）：
+        #    主窗口搜索框的**下拉浮层**同样是「无名顶层窗口 + 尺寸正好落在这个区间」
+        #    （实测 320x298 @ 73,72），但它**贴在左上角**；真正的模态框是**屏幕居中**的
+        #    （实测 282x170：1280x1024 下在 499,427、1024x768 下在 370,298 —— 两次中心都精确等于屏幕中心）。
+        #    只按尺寸判的后果：搜索流程**每点一行结果之前都去「关」自己的下拉**，
+        #    把点卡片的坐标带歪，现象是「点过候选卡片但没等到目标窗口」——
+        #    看起来像微信改了界面，其实是自己的判据误伤了自己。
+        if abs((x + w / 2.0) - W / 2.0) > W * 0.15 or abs((y + h / 2.0) - H / 2.0) > H * 0.15:
+            continue
+        return m.group(1), x, y, w, h
     return None
 
 

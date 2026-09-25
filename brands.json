@@ -198,7 +198,32 @@
       "type": "sign",
       "enabled": true,
       "verified": true,
-      "note": "**第二个后端：易东（eingdong）**的首个条目。链路：小程序逻辑层取 wx.login 的 code 与 ext 里的 storeid（wxyd.py）→ POST /api/login 换 sessionKey → 之后请求带 cookie sessionKey=… → /signin/get_info 查状态 → /signin/check_in_1 签到。接口与逐条实测记录见 survey/YD_API.md。⚠️ 这个 appId 是**巴塞罗那店**（登录返回的 store_name = 巴塞罗那刘一手火锅店），国内门店用不上；同后端另有「巧娘子」wxa8f4bf2bc3913d64，但那个号还没实测过，先不入库。"
+      "note": "**第二个后端：易东（eingdong）**的首个条目。链路：小程序逻辑层取 wx.login 的 code 与 ext 里的 storeid（wxyd.py）→ POST /api/login 换 sessionKey → 之后请求带 cookie sessionKey=… → /signin/get_info 查状态 → /signin/check_in_1 签到。接口与逐条实测记录见 survey/YD_API.md。⚠️ 这个 appId 是**巴塞罗那店**（登录返回的 store_name = 巴塞罗那刘一手火锅店），国内门店用不上；同后端的「巧娘子」见下一条。"
+    },
+    {
+      "slug": "qiaoniangzi",
+      "name": "巧娘子",
+      "appid": "wxa8f4bf2bc3913d64",
+      "keyword": "巧娘子",
+      "miniapp": "巧娘子过桥米线 巨仁广场店",
+      "engine": "eingdong",
+      "type": "sign",
+      "enabled": false,
+      "verified": false,
+      "note": "易东系第二个条目，与刘一手**同一个 base**（zhyx.eingdong.com，`zhyx` 是服务商代号、不是店名 —— 两家包内抠出的域名完全一致，接口路径同为 /api/index.php/<controller>/<action>；包内签到页 /packageA/pages/signin/signin）。**链路实测全通**：开小程序 → 取 code + storeid=67163 → POST /api/login 成功（storeInfo.name = 「巧娘子过桥米线（巨仁广场店）」，江西南昌县）→ 之后调 /signin/get_info 与 /signin/check_in_1 都返回 `{\"status\":-1,\"msg\":\"商家未开启签到\"}`。**所以不是适配问题，是该门店服务端没配签到活动**（对比刘一手同接口返回 signed_today），故 enabled=false；哪天商家开了，把 enabled 改 true 即可。⚠️ miniapp 用**窗口标题全名**（带门店后缀）——`open_via_search` 末尾是按标题**精确相等**确认的，写「巧娘子」会认不出来。"
+    },
+    {
+      "slug": "xujiashuiyin",
+      "name": "许家去水印",
+      "appid": "wx2b979b1c16784d44",
+      "wzl_appid": "app-cf9187c281ff",
+      "keyword": "许家去水印",
+      "miniapp": "许家去水印",
+      "engine": "weizulin",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "**第三个后端：微租林（weizulin / saas.funjs.top）** 的首个条目。链路：小程序逻辑层取 wx.login 的 code（wxcode.py）→ POST /open/auth/mp/silent-login（JSON `{code}`，header `x-appid`）拿 `data.token` → 之后带 `Authorization: Bearer` + `x-appid` + `x-client-source: applet` → GET /open/check-in/status 查状态 → POST /open/check-in 签到。逐条实测见 survey/WZL_API.md。⚠️ 它**不是餐饮会员积分，是工具类应用的「签到送使用次数」**（这个 app 是去水印工具）：签到 +1 次、连签 7 天额外 +5 次。`wzl_appid` 是**微租林平台内**的应用 ID（包内 app.js 顶层配置对象里明文写着），每个小程序一条，不是微信 appId。"
     }
   ]
 }

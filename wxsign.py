@@ -647,7 +647,7 @@ def ensure_helpers():
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
             ("wxfind.py", "wxcdp.py", "wxdom.py", "wxwin.py", "pkgprobe.py",
              "wxclean.py", "wxopen.py", "wxreg.py", "wxagree.py", "wxnet.py",
-             "wxyd.py")]
+             "wxyd.py", "wxcode.py")]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖
@@ -982,11 +982,174 @@ def do_sign_yd(brand, env):
     return False, str(r.get("status")), str(r.get("msg"))[:160]
 
 
+# ───────────────────── 微租林（weizulin）后端 ─────────────────────
+# 第三个后端。base 与 x-appid **都是包内明文**（app.js 顶层一个配置对象）：
+#   {APPID: "app-cf9187c281ff", BASE_URL: "https://saas.funjs.top/api", VERSION: "1.0.0"}
+# 链路（每一步都实测过，见 survey/WZL_API.md）：
+#   逻辑层取 wx.login 的 code（wxcode.py）
+#   → POST {base}/open/auth/mp/silent-login  (JSON {code}，header x-appid)  → data.token
+#   → 之后带 Authorization: Bearer <token> + x-appid + x-client-source: applet
+#   → GET  /open/check-in/status  查状态（data.todayChecked）
+#   → POST /open/check-in         签到（data.checkedIn / streakDays / rewardCount）
+# ⚠️ x-appid 是**微租林平台内**的应用 ID（每个小程序一个），不是微信 appId
+#    → 放 brands.json 的 wzl_appid（从包内 app.js 那个配置对象里抄）。
+WZL_BASE = "https://saas.funjs.top/api"
+_WZL_HOST = WZL_BASE.split("//", 1)[1].split("/", 1)[0]
+_WZL_PREFIX = "/" + WZL_BASE.split("//", 1)[1].split("/", 1)[1].strip("/")
+_WZL_CONN = [None]
+
+
+def _wzl_once(method, path, data=None, token="", appid=""):
+    """单次请求。也复用连接 —— 理由与 _api_post_once 完全相同（临时端口耗尽）。"""
+    headers = {"Content-Type": "application/json", "x-client-source": "applet"}
+    if appid:
+        headers["x-appid"] = appid
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    body = json.dumps(data).encode() if data is not None else None
+    try:
+        conn = _WZL_CONN[0]
+        if conn is None:
+            conn = http.client.HTTPSConnection(_WZL_HOST, timeout=20, context=_SSL)
+            _WZL_CONN[0] = conn
+        conn.request(method, _WZL_PREFIX + path, body=body, headers=headers)
+        r = conn.getresponse()
+        raw = r.read().decode(errors="replace")
+        # ⚠️ 别按 HTTP 状态码判成败：401 也带着 JSON（`{"code":401,"message":"未登录…"}`），
+        #    业务码在 body 的 `code` 里。能解析就当业务返回，解析不了才算传输失败。
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {"_transport": 1, "msg": "HTTP %s 且非 JSON：%s" % (r.status, raw[:200])}
+    except Exception as e:
+        _WZL_CONN[0] = None
+        return {"_transport": 1, "msg": "传输失败：%s" % e}
+
+
+def wzl_request(method, path, data=None, token="", appid="", retries=3):
+    """带重试的请求。判据用 `_transport`（微租林的业务字段是 code/message）。"""
+    r = None
+    for attempt in range(retries + 1):
+        r = _wzl_once(method, path, data, token, appid)
+        if not r.get("_transport"):
+            return r
+        if attempt < retries:
+            wait = 2.0 * (attempt + 1)
+            log("  [net] %s 第 %d 次失败（%s），%.1fs 后重试"
+                % (path, attempt + 1, str(r.get("msg"))[:60], wait))
+            time.sleep(wait)
+    return r
+
+
+def wzl_ident(brand, wait=15):
+    """在小程序逻辑层取 wx.login 的 code；失败返回 None。
+
+    code 一次一用、约 5 分钟失效 —— 拿到就立刻用，不要缓存。
+    前提：目标小程序**正开着**（前一步 ensure_miniapp 刚开过）且 hook 通。
+    """
+    if not INSTANCE:
+        log("  [wzl] 未设 WOC_INSTANCE → 取不到 code")
+        return None
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxcode.py"), brand.get("appid", ""), str(wait)],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        log("  [wzl] 执行异常：%s" % e)
+        return None
+    out = (p.stdout or "") + (p.stderr or "")
+    got = None
+    for line in out.splitlines():
+        if line.startswith("WZ_JSON="):
+            try:
+                got = json.loads(line[len("WZ_JSON="):])
+            except ValueError:
+                pass
+        elif line.strip():
+            log("     " + line.strip()[:180])
+    if not got:
+        log("  [wzl] 没拿到 code（wxcode.py rc=%s）" % p.returncode)
+        return None
+    return got.get("code") or None
+
+
+def do_sign_wzl(brand, env):
+    """微租林后端签到。返回 (是否成功, 业务码, 说明)。"""
+    appid = env.get("WZL_APPID") or brand.get("wzl_appid", "")
+    if not appid:
+        return False, "NOAPP", "缺 wzl_appid（微租林平台内的应用 ID，见包内 app.js 的配置对象）"
+
+    def _say(r):
+        return "%s（code=%s）" % (str(r.get("message", ""))[:120], r.get("code"))
+
+    # ① 先试缓存 token；被拒（401）就丢掉重登 —— token 是 JWT，实测有效期约 7 天。
+    token = env.get("WZL_TOKEN", "")
+    st = None
+    if token:
+        st = wzl_request("GET", "/open/check-in/status", token=token, appid=appid)
+        if str(st.get("code")) == "401" or st.get("_transport"):
+            token = ""
+
+    # ② 重新登录：code → token
+    if not token:
+        code = wzl_ident(brand)
+        if not code:
+            return False, "NOCODE", "拿不到 wx.login 的 code（小程序开着吗？hook 通吗？）"
+        r = wzl_request("POST", "/open/auth/mp/silent-login", {"code": code}, appid=appid)
+        d = r.get("data") if isinstance(r.get("data"), dict) else {}
+        token = d.get("token", "")
+        if not token:
+            return False, "LOGIN", "静默登录失败：%s" % _say(r)
+        log("  [wzl] 已登录：openId=%s 用户=%s"
+            % (d.get("openId", ""), (d.get("user") or {}).get("nickname", "")))
+        env["WZL_TOKEN"] = token
+        env["WZL_APPID"] = appid
+        save_env(brand["slug"], env)
+        st = wzl_request("GET", "/open/check-in/status", token=token, appid=appid)
+
+    # ③ 状态
+    if str(st.get("code")) != "0":
+        return False, "INFO", "查签到状态失败：%s" % _say(st)
+    d = st.get("data") or {}
+    if not d.get("enabled"):
+        return False, "NOACT", "该应用未开启签到"
+    if d.get("todayChecked"):
+        return True, "415", "今天已经签到过了（连续 %s 天）" % d.get("streakDays", "?")
+
+    # ④ 签到
+    r = wzl_request("POST", "/open/check-in", {}, token=token, appid=appid)
+    if str(r.get("code")) != "0":
+        m = str(r.get("message", ""))
+        if "已" in m or "重复" in m:          # 幂等：并发/重跑时它可能已经签过了
+            return True, "415", m[:120]
+        return False, str(r.get("code")), _say(r)
+    d = r.get("data") or {}
+    return True, "200", "签到成功：+%s 次%s，连续 %s 天（余额 %s）" % (
+        d.get("rewardCount", "?"),
+        "（连签奖励）" if d.get("isStreakBonus") else "",
+        d.get("streakDays", "?"), d.get("bonusCountBalance", "?"))
+
+
+# 后端 → 签到实现。往后加新后端只需要三步：写一个 `do_sign_xxx(brand, env)`
+# → 在这张表里注册一行 → brands.json 里给条目写 `engine`（不写 = 吾享）。
+# 主流程（main）也读这张表做分派，别再往 if 链里塞。
+_SIGNERS = {
+    "eingdong": do_sign_yd,
+    "weizulin": do_sign_wzl,
+}
+
+
 def do_sign(brand, env):
     """返回 (是否成功, 业务码, 说明)"""
-    # 后端分派：brands.json 的 engine 缺省 = 吾享（老条目不用动）
-    if (brand.get("engine") or "wuuxiang") == "eingdong":
-        return do_sign_yd(brand, env)
+    engine = brand.get("engine") or "wuuxiang"
+    if engine != "wuuxiang":
+        # 非吾享后端（易东 / 微租林 …）：各家的公开接口 + 各自的身份获取，
+        # 跟吾享的 mpId / token / 签名毫无关系。
+        signer = _SIGNERS.get(engine)
+        if not signer:
+            return False, "NOENGINE", "未知后端 engine=%s（没在 _SIGNERS 里注册）" % engine
+        return signer(brand, env)
     slug = brand["slug"]
     # gameId 不是凭证、是公开的活动常量，所以优先放 brands.json（这样新用户 clone 下来就有）；
     # brands/<slug>.env 里的 WX_GAMEID 优先，便于临时覆盖。
@@ -1144,13 +1307,22 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
         elif need_ident:
             log("  [!] 缺身份且未设 WOC_INSTANCE → 无法自动开小程序取值")
 
-    # 后端分派：易东系不走吾享那套（mpId / token / 签名），直接进它自己的流程。
-    # ⚠️ 必须放在 refresh_token **之前** —— 否则会被「token 刷新失败 → notoken」拦死
-    #    （2026-09-25 实测踩过：报 RESULT code=notoken，根本到不了 do_sign_yd）。
-    if (brand.get("engine") or "wuuxiang") == "eingdong":
-        yd_ok, yd_code, yd_msg = do_sign_yd(brand, env)
-        log("RESULT %s code=%s msg=%s" % (slug, yd_code, yd_msg))
-        return yd_ok, yd_code
+    # 后端分派：非吾享后端完全不走吾享那套（mpId / token / 签名），直接进各自流程。
+    # ⚠️ 必须放在 refresh_token **之前** —— 否则会被「token 刷新失败 → notoken」拦死。
+    #   2026-09-25 实测踩过两次：① 易东报 RESULT code=notoken，根本到不了 do_sign_yd；
+    #   ② 微租林漏注册时被拖进吾享流程 —— refresh_token 对它毫无意义地失败，还白搭一轮
+    #      「关掉重开小程序 + 重启 hook」。所以这里读 _SIGNERS 表，而不是写 if 链。
+    engine = brand.get("engine") or "wuuxiang"
+    if engine != "wuuxiang":
+        signer = _SIGNERS.get(engine)
+        if not signer:
+            # 兜底：engine 写错/忘了注册时明确报出来 —— 别掉进吾享流程去刷一个永远刷不出来的
+            # token，那会把「配置写错」伪装成「环境故障」（上面的 ② 就是这么来的）。
+            log("RESULT %s code=NOENGINE msg=未知后端 engine=%s" % (slug, engine))
+            return False, "NOENGINE"
+        b_ok, b_code, b_msg = signer(brand, env)
+        log("RESULT %s code=%s msg=%s" % (slug, b_code, b_msg))
+        return b_ok, b_code
 
     ok_token = refresh_token(brand, env, force=need_ident)
     if not ok_token and INSTANCE:

@@ -41,6 +41,25 @@ const IDENT_JS = `(function () {
     });
   } catch (e) { out.__err = e.message; }
   try { (getCurrentPages() || []).forEach(function (p) { scan(p.data, 0); }); } catch (e) {}
+  // JWT 兜底：mpId 常常**只在登录 token 的 payload 里**（storage 里没有 mpId 这个键）。
+  // 见 wxident.js 同名段落 —— 解码统一放 Node 侧（小程序环境没有 atob）。
+  try {
+    var jwts = [], seenJ = {};
+    function grabJwt(s) {
+      if (typeof s !== 'string' || s.length < 40) return;
+      var m = s.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/g);
+      if (!m) return;
+      for (var i = 0; i < m.length; i++) { if (!seenJ[m[i]]) { seenJ[m[i]] = 1; jwts.push(m[i]); } }
+    }
+    wx.getStorageInfoSync().keys.forEach(function (k) {
+      try {
+        var v = wx.getStorageSync(k);
+        var s = (typeof v === 'string') ? v : JSON.stringify(v);
+        grabJwt(s);
+      } catch (e) {}
+    });
+    if (jwts.length) out.__jwts = jwts.slice(0, 12);
+  } catch (e) {}
   return JSON.stringify(out);
 })()`;
 
@@ -52,6 +71,25 @@ const LOGIN_JS = `new Promise(function (resolve) {
 
 function mask(v) { const s = String(v || ''); return s.length > 8 ? `${s.slice(0, 4)}${'*'.repeat(s.length - 8)}${s.slice(-4)} (${s.length})` : '*'.repeat(s.length); }
 function jwtExp(t) { try { return JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString()).exp; } catch (e) { return null; } }
+
+// 解小程序 storage 里的登录 token，把 payload 当身份来源（与模板无关）。
+// storage 里可能没有 mpId 这个键（小大董就没有），但登录 token 的 payload 必有 mpid/sub/appid。
+function decodeJwts(list) {
+  const out = {};
+  let bestExp = 0, bestTok = '';
+  for (const t of (list || [])) {
+    let d = null;
+    try { d = JSON.parse(Buffer.from(String(t).split('.')[1], 'base64url').toString()); } catch (e) { continue; }
+    if (!d || typeof d !== 'object') continue;
+    if (d.mpid && out.mpId === undefined) out.mpId = String(d.mpid);
+    if (d.sub && out.openId === undefined) out.openId = String(d.sub);
+    if (d.appid) out.appId = String(d.appid);
+    const e = Number(d.exp) || 0;
+    if (e > bestExp) { bestExp = e; bestTok = String(t); }
+  }
+  if (bestTok) out.token = bestTok;
+  return out;
+}
 function loadEnv() {
   const env = {};
   try { for (const l of fs.readFileSync(ENVFILE, 'utf8').split('\n')) { const i = l.indexOf('='); if (i > 0) env[l.slice(0, i).trim()] = l.slice(i + 1).trim(); } } catch (e) {}
@@ -111,7 +149,17 @@ function collect(seconds) {
         ctxs.push(cid);
         ws.send(JSON.stringify({ id: 2000 + cid, method: 'Runtime.evaluate', params: { expression: IDENT_JS, returnByValue: true, contextId: cid } }));
       } else if (tag === 1) {
-        try { idents[cid] = JSON.parse(val); } catch (e) {}
+        try {
+          const ident = JSON.parse(val);
+          // JWT 兜底：storage 里没有 mpId 键时，从登录 token 的 payload 补
+          const jf = decodeJwts(ident.__jwts);
+          for (const [k, v] of Object.entries(jf)) {
+            if (k === 'token') { const eN = jwtExp(v), eC = ident.token ? jwtExp(ident.token) : 0; if (!eC || eN > eC) ident.token = v; }
+            else if (!ident[k]) ident[k] = v;
+          }
+          delete ident.__jwts;
+          idents[cid] = ident;
+        } catch (e) {}
         ws.send(JSON.stringify({ id: 3000 + cid, method: 'Runtime.evaluate',
           params: { expression: LOGIN_JS, returnByValue: true, awaitPromise: true, contextId: cid } }));
       } else if (tag === 2) {

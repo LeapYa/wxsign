@@ -603,7 +603,7 @@ def ensure_helpers():
         return False
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
             ("wxfind.py", "wxcdp.py", "wxdom.py", "wxwin.py", "pkgprobe.py",
-             "wxclean.py", "wxopen.py", "wxreg.py", "wxagree.py")]
+             "wxclean.py", "wxopen.py", "wxreg.py", "wxagree.py", "wxnet.py")]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖
@@ -1001,9 +1001,10 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
             time.sleep(3)
             ok_token = refresh_token(brand, env, force=True)
     if not ok_token:
-        log("  [!] token 刷新失败 —— 三种可能：① 小程序没开成；② appId 配错；"
-            "③ **hook 没挂上这个运行时**（看上面几行 [enum]/[try] 里有没有目标 appId 的 ctx，"
-            "全是「拿不到 mpId」就是这种）。第 ③ 种脚本已自动硬清+重启 hook 重试过一轮。")
+        log("  [!] token 刷新失败 —— 可能是：① 小程序没开成；② appId 配错；"
+            "③ **hook 没挂上这个运行时**（看上面 [enum]/[try] 里有没有目标 appId 的 ctx）；"
+            "④ **小程序自己还没登录**（storage 里没有带 mpid 的 token，"
+            "常见于小程序停在隐私弹层/未点「我的」）。③④ 脚本都已自动重试过一轮。")
         log("RESULT %s code=notoken msg=token 不可用" % slug)
         return False, "notoken"
     env = load_env(slug)          # 刷新后重新读（身份可能刚被写进来）

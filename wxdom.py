@@ -57,6 +57,14 @@ SIGN_WORDS = ("签到", "打卡", "参与", "领取", "抽奖", "去参与", "�
               # 蜀大侠的活动页也有它（那句「绘图区域 注册后可获取当前游戏抽奖机会」）。
               "绘图区域")
 CONFIRM_WORDS = ("允许", "同意", "确认", "授权", "继续", "确定", "好的")
+# 「登录/注册」入口 —— 专门用来区分**小程序自己的注册弹层**和**微信原生的手机号授权弹窗**。
+# 为什么需要：像素判据（白卡 + 卡内通栏绿按钮）会把小程序自己的「注册登录」底部弹层
+# 也认成手机号弹窗。实测绿茵阁西餐厅：弹层是「Hi，神秘食客 / 更好的会员服务，注册登录后
+# 即可体验」+ 一颗绿色「立即登录」，被判成手机号弹窗 → 走到「没识别到白卡不敢盲点」的
+# 安全阀 → rc=3 直接放弃。而那条边界很清楚：**微信原生弹窗不在小程序 DOM 里**，
+# 所以「DOM 里还能找到登录/注册入口」= 这是小程序自己的弹层，点它就对了。
+LOGIN_WORDS = ("立即登录", "一键登录", "去登录", "登录", "立即注册", "免费注册", "注册",
+               "成为会员", "开通会员", "立即开通")
 # 排除词：含这些的**不点**。它们是「相关但非动作」的元素（记录/规则/导航/其它业务入口），
 # 点了就跑到别的页面去了。
 EXCLUDE_WORDS = ("记录", "规则", "说明", "明细", "商城", "更多", "上月", "下月", "上个月",
@@ -85,7 +93,11 @@ def keywords(mode="sign"):
     env = os.environ.get("WXSIGN_REG_KEYWORDS", "").strip()
     if env:
         return tuple(w.strip() for w in env.split(",") if w.strip())
-    return SIGN_WORDS if mode == "sign" else CONFIRM_WORDS
+    if mode == "confirm":
+        return CONFIRM_WORDS
+    if mode == "login":
+        return LOGIN_WORDS
+    return SIGN_WORDS
 
 
 def pick_action(d, mode="sign", clicked=None, allow_fallback=None):

@@ -348,6 +348,28 @@ def text_bands(buf, W, H, y0, y1, x0, x1):
     return out
 
 
+def raise_miniapp():
+    """把小程序窗口激活并置顶（**每轮都做**）。
+
+    ⚠️ 为什么必须做：小程序是从**全屏的小程序面板**里点开的，面板仍留在最前，于是
+      (a) 抓屏抓到的是**面板** —— 像素判据会把面板里的搜索卡片当成「手机号弹窗」；
+      (b) 所有点击都被面板吃掉。
+    实测绿茵阁西餐厅的注册就死在这：`reg_phone_popup.png` 里是**面板的搜索卡片列表**、
+    根本不是小程序页面 → detect() 误判成手机号弹窗 → rc=3 放弃。
+    （同一课在 wxagree.py 里已经吃过一次，那边补了这一步，wxreg.py 这里漏了。）
+    """
+    try:
+        m = wxwin.miniapp()
+    except Exception:
+        return False
+    if not m:
+        return False
+    wid = m["id"]
+    run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
+    run("DISPLAY=%s xdotool windowraise %s" % (DISPLAY, wid))
+    return True
+
+
 def click(x, y, raw=False):
     """点击。x,y 是**页面坐标**（CSS 像素，与 DOM 坐标同一空间）→ 自动换算成屏幕坐标。
     raw=True 时按屏幕坐标点（给主窗口 / 面板用）。"""
@@ -650,6 +672,9 @@ def main():
     nav_tries = 0            # 已经「退回上一层重来」了几次（设上限，避免来回绕圈）
 
     for step in range(1, 17):
+        # ⭐ 每轮先把小程序窗口置顶：面板会一直赖在最前，不置顶的话抓屏抓到的是**面板**
+        #    （像素判据会把面板的卡片当弹窗），点击也会被面板吃掉。
+        raise_miniapp()
         if ws:
             # 每轮刷新页面几何：窗口可能被拖动；侧边栏形态下布局还可能随内容变化
             refresh_page(ws, ctx)
@@ -659,6 +684,38 @@ def main():
 
         # ① 手机号授权弹窗（最优先 —— 它出现说明流程就快完了）
         if d["phone_popup"]:
+            # ⚠️ 先分辨「这是谁的弹层」——**只在原逻辑本来就要放弃时**才启用（即 `not d["card"]`），
+            #    这样已经跑通的品牌（辣可可/过桥缘…）路径一字不改，风险为零。
+            #    要解决的问题：像素判据（白卡 + 卡内通栏绿按钮）会把**小程序自己**的
+            #    「注册登录」底部弹层也认成手机号弹窗。实测绿茵阁西餐厅：弹层写着
+            #    「Hi，神秘食客 / 更好的会员服务，注册登录后即可体验」+ 一颗绿色「立即登录」，
+            #    被判成手机号弹窗 → 走到「没识别到白卡，不敢盲点」的安全阀 → rc=3 放弃，
+            #    注册整个卡死。而那条边界很清楚：**微信原生弹窗不在小程序 DOM 里**，
+            #    所以「DOM 里还能找到登录/注册入口」= 这是小程序自己的弹层，点它就是对的。
+            if not d["card"] and ws:
+                now = wxdom.find_dom_ctx(ws, 20)
+                if now:
+                    ctx = now
+                dd = wxdom.scan(ws, ctx)
+                it = wxdom.pick_action(dd, "login") if dd else None
+                if it:
+                    key = ("sheet", it["text"], it["cx"], it["cy"])
+                    if key not in clicked:
+                        clicked.add(key)
+                        print("[ui] 白卡+通栏绿按钮，但 DOM 里还有「%s」→ 判定为**小程序自己的**"
+                              "注册弹层（不是微信手机号弹窗）→ 点它"
+                              % it["text"].replace("\n", " ")[:16])
+                        if not a.dry_run:
+                            h0 = page_hash(buf, W, H)
+                            for attempt in range(1, 4):
+                                click(it["cx"], it["cy"])
+                                time.sleep(2.5)
+                                if page_hash(grab(W, H), W, H) != h0:
+                                    break
+                                print("     → 页面没变，重试（%d/3）" % attempt)
+                        scroll_rounds = 0
+                        time.sleep(1.5)
+                        continue
             png = grab_png(W, H, "reg_phone_popup.png")
             rows = d["rows"]
             print("[ui] 手机号弹窗：检测到 %d 个可选号码 %s" % (len(rows), [r[1] for r in rows]))

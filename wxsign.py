@@ -1127,7 +1127,19 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
                 log("  [probe] ⚠️ 传输失败（%s）—— **未判定**，请重跑这个号"
                     % str(r2.get("msg"))[:70])
                 return False, "netfail"
-            log("  [probe] ⚪ 服务端没有活动，也没有可用的 gameId（lot/list=%s）" % r2.get("code"))
+            # ⚠️ 这里**不能**说「没有签到活动」。
+            #    `lot/list` 是**抽奖/游戏**的活动列表，实测辣可可（确实有签到活动
+            #    「可可会员签到」）在这里也返 405 —— 所以「lot/list 非 200」放不出任何
+            #    关于签到的话。加之签到接口要 gameId，而 gameId 只能从小程序页面 data 里抓。
+            #    成员身份是唯一可用的旁证：已是会员却看不到任何活动，值得存疑。
+            if str(r.get("code")) == CODE_OK:
+                log("  [probe] ⚠️ **未判定**：已是该品牌会员，但 lot/list=%s 且抓不到 gameId。"
+                    "这类租户的签到活动不在 lot/list 里（辣可可就如此）—— "
+                    "别据此判「不能签」，要进去读签到页的 gameId。" % r2.get("code"))
+                return False, "nogameid"
+            log("  [probe] ⚪ 未发现活动（lot/list=%s，且抓不到 gameId）—— "
+                "注意：这只排除「抽奖类活动」，**签到活动不在 lot/list 里**，"
+                "所以这个结论对签到是**弱结论**。" % r2.get("code"))
             return True, "probe"
 
         is_member = str(r.get("code")) == CODE_OK
@@ -1212,7 +1224,8 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
                 "重跑一次即可（脚本会重换 token）。")
             return False, "authfail"
         else:
-            log("  [probe] ⚪ 服务端没有活动（该租户未配置）")
+            log("  [probe] ⚪ 这个 gameId（%s）查不到活动（sign/detail=%s）—— "
+                "**只说明这个 id 上没活动**，不等于该租户没有别的签到活动。" % (gid, sd.get("code")))
         return True, "probe"
 
     if register_only:

@@ -232,10 +232,25 @@ def find_target_window():
 def raise_window(wid):
     """把窗口提到最前。windowactivate 走 EWMH（要窗口管理器配合），windowraise 走
     XRaiseWindow，两个都发一遍最稳 —— 有别的窗口挡着时，点侧边栏/面板都会落到别人身上
-    （实测踩过：面板在前台时，点侧边栏其实点到了面板窗口上）。"""
-    run("DISPLAY=%s xdotool windowactivate %s" % (DISPLAY, wid))
-    run("DISPLAY=%s xdotool windowraise %s" % (DISPLAY, wid))
-    time.sleep(0.8)
+    （实测踩过：面板在前台时，点侧边栏其实点到了面板窗口上）。
+
+    ⚠️ `windowactivate` **必须带 `--sync`，而且必须校验结果**（2026-09-25 踩到）：
+    不带 `--sync` 是「发完就返回」，Openbox 可能还没完成聚焦；实测日志里出现**一整片**
+      `⛔ (x,y) 底下是窗口 <主窗口>，不是预期目标 <面板> → 不点`
+    —— `click_expect` 那道理所当然的安全阀把**每一次点击**都拒了，
+    外部症状是「卡片定位坏了 / 找到了 0 张卡片」，真实原因是**窗口根本没抬起来**。
+    手工验证：加 `--sync` 之后 `top_window()` 立刻从主窗口变回面板。
+    所以这里改成「反复抬 + 每次校验」，抬不起来就如实返回 False（让调用方别继续瞎点）。
+    """
+    for _ in range(3):
+        run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
+        run("DISPLAY=%s xdotool windowraise %s" % (DISPLAY, wid))
+        time.sleep(0.6)
+        if str(top_window(WANT_W, WANT_H)) == str(wid):
+            return True
+    print("[reopen] ⚠️ 抬不起窗口 %s（顶上始终是 %s）"
+          % (wid, top_window(WANT_W, WANT_H)))
+    return False
 
 
 def win_under(x, y):
@@ -612,8 +627,37 @@ def open_panel(W, H):
     if not main:
         print("[reopen] 找不到微信主窗口")
         return None
+
+    # ⭐ 面板**已经开着就直接复用，绝不点侧边栏**（2026-09-25 踩到，代价很重）。
+    #    侧边栏那个「小程序」按钮是**切换**语义：面板开着时点它 = **把它关掉**；
+    #    关掉之后微信内部「面板已打开」的状态又不复位，于是再点又变成「开」——
+    #    实测点了两次、状态全乱。更糟的是那一刻**主窗口在最前**（面板还在窗口列表里，
+    #    只是没被抬起来），两次点击都落在**主窗口的侧边栏**上乱点，
+    #    最后弹出了「退出登录？确定 / 取消」确认框 —— 鼠标就悬在「确定」上，
+    #    真点下去立刻掉登录（要手机确认、拖久了只能扫码）。
+    #    所以：先找面板、找到就用；找不到才去点侧边栏。
+    for wid, t in windows():
+        if str(wid) == str(main):
+            continue
+        if win_class(wid) or (t or "").strip() != "微信":
+            continue
+        # ⚠️ 必须**先把它抬到最前、再判** —— `has_miniapp_tab()` 是**抓屏**判据，
+        #    面板被别的窗口盖着时抓到的就是别人，会给出**假否**。
+        #    实测踩到：`clean_leftovers()` 为了扫主窗口上的弹窗会把**主窗口**抬到最前，
+        #    紧接着 open_panel 在这里判 → has_miniapp_tab 假否 → 一路走到点侧边栏 → rc=3，
+        #    日志表现为「面板打不开」，而面板其实好着（手工验证 top_window=面板、
+        #    has_miniapp_tab=True）。
+        raise_window(wid)
+        if has_miniapp_tab(wid, W, H):
+            print("[reopen] 面板已经开着（窗口 %s）→ 直接复用，不点侧边栏" % wid)
+            return wid
+
     for attempt in (1, 2):
-        raise_window(main)                      # 有别的窗口挡着时，侧边栏根本点不到
+        # 点侧边栏前必须确认**主窗口真的在最前**，否则点击会落到别的窗口上乱点
+        # （上面那个「退出登录」框就是这么点出来的）。
+        if not raise_window(main):
+            print("[reopen] 主窗口抬不到最前（顶上不是它）→ 不点侧边栏，免得误点")
+            return None
         buttons = find_rail_buttons(W, H)
         top = [y for y in buttons if y < H * 0.6]     # 顶部那组（排除底部固定图标）
         if len(top) < 2:
@@ -648,12 +692,27 @@ def panel_search_once(W, H, panel):
     """在面板里：放大镜 → 输入 → **回车**（用户确认：回车就会进搜索页）→
     搜索结果页里逐张卡片点，用窗口标题验证；**开错了就关掉继续试下一张**。
     成功返回 True。"""
+    # ⭐ 每次搜索前先把面板 webview 重载一次 —— 这不是保守，是**必需**。
+    #    实测（2026-09-25）踩了一整轮：面板停在「绿茵_搜索」标签、搜索框里**残留着
+    #    上一次的关键词**，而 `type_text` 是把字符**追加**进去、不是替换 ——
+    #    于是搜出来的是「绿茵<新关键词>」的混合结果，逐张卡片试开全是同族的错号
+    #    （实测开出「绿茵约战」「绿茵聚落」，两个都关不掉）→ 窗口越堆越多、整批卡死。
+    #    重载一次同时解决三件事：① 清掉残留搜索词；② 清掉累积的「xxx_搜索」标签
+    #    （标签一多，放大镜/卡片位置都会漂）；③ 顺带治好 webview 掉成
+    #    「没有连接到网络」的错误页（那次也是靠 Ctrl+R 救回来的）。
+    rp = reload_panel(W, H)
+    if rp:
+        panel = rp
     raise_window(panel)
     if str(top_window(W, H)) != str(panel):
         print("[reopen] 面板不在最前（有别的窗口挡着）→ 不输入，退出")
         return False
     if not click_in(panel, R_PANEL_MAGNIFIER[0], R_PANEL_MAGNIFIER[1], 1.5, "（面板放大镜）"):
         return False
+    # 双保险：万一重载没生效、或者点放大镜没真正聚焦，先全选清空再输。
+    # （重载后搜索框本该是空的，这一步是零成本的兜底。）
+    key("ctrl+a", 0.3)
+    key("Delete", 0.5)
     type_text(KEYWORD)
     print("[reopen] 面板搜索框回车")
     key("Return", 6.0)                      # 面板搜索：回车进「关键词_搜索」结果页

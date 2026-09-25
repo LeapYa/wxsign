@@ -716,6 +716,7 @@ def main():
         print("[ui] 页面视口 %dx%d @ %s（来源 %s）" % (W, H, origin(), _PAGE["src"]))
     clicked = set()
     sheet_clicked = False    # 是否已点过「小程序自己的注册弹层」（点一次就够，防死循环）
+    submit_tries = 0         # 点过几次「注册表单提交按钮」（限次，防死循环）
     clicked_px = set()       # 像素捏到的按钮位置，点过就不再点（否则会在同一处反复空点、占着轮次不滚动）
     scroll_rounds = 0        # 连续「没点到任何东西、只能滚」的轮数（用来发现「跑偏了」）
     nav_tries = 0            # 已经「退回上一层重来」了几次（设上限，避免来回绕圈）
@@ -747,6 +748,43 @@ def main():
                 raise_miniapp()
                 time.sleep(1.2)
                 continue
+            # ⭐ 最优先：**注册表单的提交按钮**。
+            #    实测绿茵阁西餐厅（2026-09-25 手工验证通过）：流程走到这里时，页面上
+            #    已经是一个**注册表单** —— wx-user-info 组件弹出来的，内容是
+            #      「绿茵阁西餐厅Greenery 申请使用 / 获取你的手机号码 190****7634 /
+            #       会员头像 / *昵称 神秘顾客 / 设置卡密码 / 邀请码」
+            #    底部一颗 WX-BUTTON「**确认授权开通并绑定会员**」。
+            #    也就是说：**手机号早就授权到手了，只差点这一下**。点完 member/single
+            #    立刻从 401 变 200（真机验证），签到成功拿到 5 积分。
+            #
+            #    之前几轮的实现在这里去找「微信原生弹窗」的「允许」按钮 —— **目标从一开始
+            #    就错了**：那是小程序自己的表单，提交按钮文案是「确认授权开通并绑定会员」，
+            #    不是微信的「允许」。
+            #
+            #    必须**排在「找登录入口」之前**：表单打开后底层那个「立即登录」还在 DOM 里，
+            #    先点它只会白费轮次。用 submit_tries 限次防死循环。
+            if submit_tries < 2 and ws:
+                now = wxdom.find_dom_ctx(ws, 20)
+                if now:
+                    ctx = now
+                dd = wxdom.scan(ws, ctx)
+                it = wxdom.pick_action(dd, "submit") if dd else None
+                if it:
+                    submit_tries += 1
+                    sheet_clicked = True          # 视作「小程序自己的层」，别再走下面那条
+                    print("[ui] DOM 里发现注册表单的**提交按钮**「%s」→ 点它"
+                          "（第 %d 次）" % (it["text"].replace("\n", " ")[:20], submit_tries))
+                    if not a.dry_run:
+                        h0 = page_hash(buf, W, H)
+                        for attempt in range(1, 4):
+                            click(it["cx"], it["cy"])
+                            time.sleep(2.5)
+                            if page_hash(grab(W, H), W, H) != h0:
+                                break
+                            print("     → 页面没变，重试（%d/3）" % attempt)
+                    scroll_rounds = 0
+                    time.sleep(1.5)
+                    continue
             # ⚠️ 再分辨「这是谁的弹层」。判据只用一条，且是代码里本来就写明的边界：
             #    **微信原生弹窗（含手机号授权）不在小程序 DOM 里**（见文件头那句说明）。
             #    所以「DOM 里还能找到登录/注册入口」= 这是**小程序自己的**注册弹层。
@@ -857,7 +895,22 @@ def main():
             #   ① 同义词根命中（面积最小者）  ② 都没命中 → 按「大 + 靠下 + 文案短」评分兜底
             # 弹窗的确认类优先于页面的签到类（弹窗挡在最上层）。
             is_clicked = lambda it: (it["text"], it["cx"], it["cy"]) in clicked      # noqa: E731
-            target = (wxdom.pick_action(dd, "confirm", is_clicked)
+            # ⭐ 四个词表**按「该先点谁」排序**，每一条都对应一段实测踩过的路：
+            #   ① submit —— 注册表单的**提交**按钮（「确认授权开通并绑定会员」）。
+            #      表单一旦打开，这才是唯一该点的东西；此时底层那个「立即登录」还在
+            #      DOM 里，先点它只会白费轮次。
+            #   ② confirm —— 小程序的确认/隐私类（「同意并继续」），它挡着别的操作。
+            #   ③ login —— ⚠️ **这一步以前整个缺失**（原来只有 confirm + sign），
+            #      于是注册流程永远走不到「登录入口」。实测 audit21（我的小板凳街坊火锅）
+            #      就卡死在这：最后只在页面上点了一行**说明文字**，什么都没发生，
+            #      一路「无按钮 → 滚动找目标」到轮次耗尽、报 rc=3。
+            #      文案各品牌不同（绿茵阁「立即登录」/ 板凳「请登录」），所以用**词根**
+            #      （`wxdom.LOGIN_WORDS` 含「登录」「注册」）+「短文案优先」排序
+            #      （按钮文案短、说明文字长）来选。
+            #   ④ sign —— 签到类（正常签到流程）。
+            target = (wxdom.pick_action(dd, "submit", is_clicked)
+                      or wxdom.pick_action(dd, "confirm", is_clicked)
+                      or wxdom.pick_action(dd, "login", is_clicked)
                       or wxdom.pick_action(dd, "sign", is_clicked))
             if target:
                 key = (target["text"], target["cx"], target["cy"])

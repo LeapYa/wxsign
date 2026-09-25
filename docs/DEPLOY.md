@@ -302,7 +302,9 @@ docker run -d --name qinglong \
 > **本合集自身不需要额外准备什么**：
 > - **不用装依赖** —— Python 侧只用标准库；JS 侧跑在 `woc-hook` 里用它自带的 node；
 > - **不用配辅助脚本路径** —— `wxopen.py` / `wxcdp.py` 等都在仓库里，引擎每次跑会自动投递到微信容器；
-> - **不用提供手机号** —— 不是会员时走微信授权弹窗自己注册（想少走几步可配 `WXSIGN_REGISTER_PHONE`，见 [第 5 节](#5-配青龙)）。
+> - **不用提供手机号** —— 不是会员时脚本会**自动注册**：按文案点掉品牌小程序自己弹的
+>   注册表单（提交按钮通常写「确认授权开通并绑定会员」），手机号由小程序自己向微信取
+>   （想少走几步可配 `WXSIGN_REGISTER_PHONE`，见 [第 5 节](#5-配青龙)）。
 
 ---
 
@@ -389,7 +391,7 @@ docker exec woc-hook tail -5 /tmp/wmpf.log     # 期望看到 [frida] script loa
 | `WOC_HOOK` | hook 容器名，默认 `woc-hook` |
 | `WXSIGN_PYTHON` | `/usr/bin/python3`（青龙自带的） |
 | `WXSIGN_HOME_CONTAINER` | 脚本在**青龙容器里**的路径，即 `/ql/data/scripts/wxsign` |
-| `WXSIGN_REGISTER_PHONE` | 可选。配了走 API 直连注册；不配则走微信授权弹窗（不需要手机号） |
+| `WXSIGN_REGISTER_PHONE` | 可选。配了走 API 直连注册；不配则由脚本自动点掉小程序的注册表单（不需要手机号） |
 | `WXSIGN_APPS` | 可选。只签这几个，逗号分隔的 slug 多选（如 `lakeke,laicai`）。**不配 = all** |
 | `WXSIGN_EXCLUDE` | 可选。永不签这几个，逗号分隔的多选（如 `jiucun`）。**优先级最高** |
 
@@ -544,7 +546,7 @@ docker exec woc-hook grep -m1 'script loaded' /tmp/wmpf.log
 | 日志里「点侧边栏『小程序』按钮 y=…」点了两次都「没能确认小程序面板」，整批都这样 | **多半是微信弹着模态框**（最常见是「退出登录？确定/取消」）—— 模态框会吞掉之后所有点击，症状伪装成「面板打不开」。脚本现在每轮都会自动遣散（`clear_modals`），若仍复现就截个图看：`docker exec -e DISPLAY=:1 $WX ffmpeg -f x11grab -video_size 1280x1024 -i :1 -frames:v 1 /tmp/s.png` |
 | 侧边栏堆着「华夏家博 / 永伟美发店 / 媚姐养生会所」这类窗口，关不掉 | 那是微信小程序面板里的**推广位**，常规关窗（点关闭按钮）对它无效，攒到五六个就把侧边栏堵死 → 硬清：`docker exec -e DISPLAY=:1 $WX python3 /tmp/wxclean.py --restart-runtime`，**然后必须** `bash wmpf/restart_hook.sh`（引擎现在也会自己这么做） |
 | `RESULT code=208/211` | token 失效 —— 重跑一次即可（脚本会自己刷） |
-| `RESULT code=401` | 该账号还不是这个品牌的会员 → 脚本会自动走微信授权弹窗注册；若仍失败，看 `[ui]` 日志与 `shots/<slug>/` 截图 |
+| `RESULT code=401` | 该账号还不是这个品牌的会员 → 脚本会自动注册；若仍失败，看 `[ui]` 日志与 `shots/<slug>/` 截图 |
 | `RESULT code=-1` | 网络层错误（已重试仍失败），看 msg |
 | 换了微信账号后「抓不到身份 / invalid code」，换回旧号又好了 | env 里还粘着旧账号的 `WX_OPENID` → `python3 wxsign.py --all --reset-identity`（见 [第 8.3 节](#83-换微信账号小号验证完--换大号)） |
 | 「新建实例」看着是干净的，但旧微信还在 | 删实例时没勾「彻底清除」，数据卷被保留了 → 见 [第 8.2 节](#82-装过云微想彻底卸干净) |
@@ -646,7 +648,7 @@ python3 wxsign.py --all --ensure
 
 换号后要知道的三件事：
 
-- **会重新注册一遍**：会员是绑 openId 的，新账号在每家都还不是会员 → 自动走微信授权弹窗注册；
+- **会重新注册一遍**：会员是绑 openId 的，新账号在每家都还不是会员 → 脚本自动注册；
   卡号、积分从零开始。
 - **旧账号的会员记录不会消失**（那是服务商侧的），只是脚本不再用它。
 - **想两个号都长期在跑**：别在同一个实例里来回切 —— 按 [8.1](#81-再加一个微信实例多开)

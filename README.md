@@ -142,6 +142,8 @@ wxsign/
 ├── wxwin.py             （容器内跑）取小程序窗口几何 —— 页面坐标 → 屏幕坐标的换算
 ├── wxreg.py             （容器内跑）不是会员时驱动微信授权弹窗完成注册（不需要手机号）
 ├── wxlogin.py           （容器内跑）点登录 → 等手机确认 → 拉全屏；过期则提示扫码
+├── wxagree.py           （容器内跑）点掉「隐私保护指引」弹层（不点它页面不初始化）
+├── wxnet.py             （容器内跑）拦逻辑层 wx.request，排查网络/身份用（诊断工具）
 ├── LICENSE              保留所有权利（源码公开，但**不是开源**，见第九节）
 └── README.md
 ```
@@ -212,6 +214,19 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 token 每次现取现用，没有「抓一次长期用」这回事。
 换不到 token 时的标准动作是**关掉小程序重开**（旧窗口里的登录会话会失效，
 `wx.login` 的 code 拿去换会返 `invalid code`）—— 脚本会自己重试一次。
+
+> **`mpId` 从哪来**：它不是小程序包里的常量（全盘 grep 490 个 `.wxapkg` 零命中），
+> 而是**服务端下发**的。小程序自己登录后会把登录 token 存进 storage
+> （键名形如 `authData-<随机串>`），**这个 JWT 的 payload 里就带着 `mpid`**：
+>
+> ```json
+> {"sub":"<openId>","appid":"<小程序 appId>","iss":"mobile","exp":…,"mpid":"gh_xxxxxxxxxxxx"}
+> ```
+>
+> 所以身份一律从「开号后读 storage → 解 token payload」取，**与小程序模板无关**。
+> 早期版本只按 `storage` 里的键名叫 `mpId` 去取 —— 那只在一部分模板上成立
+> （实测 `pages/home/index` 有、`pages/cardhome/home/index2` 没有），
+> 表现就是一批号全报「拿不到 mpId」。
 
 ### 界面操作怎么找按钮：按**文案**，不按颜色
 

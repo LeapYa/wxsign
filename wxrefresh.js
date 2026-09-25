@@ -187,15 +187,33 @@ function collect(seconds) {
   for (let round = 1; round <= 3 && !got; round++) {
     const r = await collect(14);
     console.log(`[enum] 有 wx 的上下文=${JSON.stringify(r.ctxs)}`);
+
+    // ⚠️ appId 只当**优先项**，不当硬门槛。
+    // 为什么：brands.json 里的 appId 来自 `--find`，而 --find 是把搜索结果逐张卡片点开、
+    // 再从窗口里读出 appId —— 多卡片 / 关不掉的残留窗口会让归属错位（实测：卡片标题
+    // 「大董会员商城」实际打开的是 wxfa7ab5e2520cece8，而表里记的是 wx7386c52081da73dd）。
+    // 拿错 appId 当硬过滤 → 正确的上下文被跳过 → 一律 notoken，非常难查。
+    // 现在的顺序：先试 appId 匹配的，没有再试其余的（并告警 + 把实际 appId 报出来）。
+    const usable = [];
     for (const cid of r.ctxs) {
       const ident = r.idents[cid] || {}, codeinfo = r.codes[cid] || {};
-      if (APPID && ident.appId && ident.appId !== APPID) { console.log(`[try] ctx ${cid}: appId=${ident.appId} 跳过（不是目标号）`); continue; }
       if (!codeinfo.ok) { console.log(`[try] ctx ${cid}: 拿不到 code (${codeinfo.err || '-'})`); continue; }
       if (targetOpen && ident.openId && ident.openId !== targetOpen) { console.log(`[try] ctx ${cid}: openId 不是目标账号，跳过`); continue; }
       const mp = ident.mpId || env[PREFIX + 'MPID'] || '';
       if (!mp) { console.log(`[try] ctx ${cid}: 拿不到 mpId，跳过`); continue; }
+      usable.push({ cid, ident, mp, match: !APPID || !ident.appId || ident.appId === APPID });
+    }
+    const matched = usable.filter((u) => u.match), rest = usable.filter((u) => !u.match);
+    if (!matched.length && rest.length) {
+      console.log(`[warn] 没有 ctx 的 appId 等于期望值 ${APPID} —— 改用实际打开的那个：`
+        + rest.map((u) => `ctx ${u.cid} appId=${u.ident.appId}`).join(' / '));
+      console.log('[warn] 说明 brands.json 里这个号的 appId 记错了（--find 的归属不可靠），'
+        + '建议把 appId 改成上面这个值');
+    }
+    for (const u of matched.concat(rest)) {
+      const { cid, ident, mp } = u;
       console.log(`[try] ctx ${cid}: appId=${ident.appId} mpId=${mask(mp)} openId=${mask(ident.openId)} code=ok`);
-      const resp = await post(LOGIN_URL, { code: codeinfo.code, mpid: mp });
+      const resp = await post(LOGIN_URL, { code: r.codes[cid].code, mpid: mp });
       const ok = resp.status === 0 && resp.result && typeof resp.result === 'object';
       console.log(`      /auth/login status=${resp.status}${ok ? '' : ' ' + (resp.message || '')}`);
       if (ok) { got = { ident, result: resp.result }; break; }
@@ -209,6 +227,14 @@ function collect(seconds) {
   env[PREFIX + 'TOKEN'] = token;
   for (const [k, idk] of [['WX_MPID', 'mpId'], ['WX_OPENID', 'openId'], ['WX_UNIONID', 'unionId'], ['WX_GCID', 'gcId']]) {
     if (got.ident[idk] && !env[k]) env[k] = got.ident[idk];
+  }
+  // 把**实际打开的那个小程序**的 appId 记下来：--find 的归属会错位，这里的才是这次真的开了谁。
+  // 用单独的键（WX_APPID 每轮都会被引擎按 brands.json 重新注入，改它没意义）。
+  if (got.ident.appId) {
+    if (APPID && got.ident.appId !== APPID) {
+      console.log(`[fix] 纠正 appId：brands.json 记的是 ${APPID}，实际打开的是 ${got.ident.appId}`);
+    }
+    env[PREFIX + 'APPID_ACTUAL'] = got.ident.appId;
   }
   fs.writeFileSync(ENVFILE, Object.entries(env).filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join('\n') + '\n');
   console.log(`[save] 已更新 ${ENVFILE}`);

@@ -116,10 +116,10 @@ function loadEnv() {
 
 function attempt() {
   return new Promise((resolve) => {
-    let pick = null, pages = '';
+    let pick = null, pickAny = null, pages = '';
     const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
     let done = false;
-    const finish = () => { if (done) return; done = true; try { ws.close(); } catch (e) {} resolve({ pick, pages }); };
+    const finish = () => { if (done) return; done = true; try { ws.close(); } catch (e) {} resolve({ pick, pickAny, pages }); };
     ws.on('open', () => {
       ws.send(JSON.stringify({ id: 1, method: 'Runtime.enable', params: {} }));
       for (let cid = 1; cid <= 60; cid++) setTimeout(() => ws.send(JSON.stringify({ id: 1000 + cid, method: 'Runtime.evaluate',
@@ -142,9 +142,16 @@ function attempt() {
         const n = Object.keys(d).filter((k) => !k.startsWith('__')).length;
         console.log(`[scan] ctx ${cid} appId=${d.__appId || '-'} mpId=${mask(d.mpId) || '-'} pages=${d.__pages || '-'} 字段=${n} jwt=${(d.__jwts || []).length}${byApp || byMp ? '  <== 命中' : ''}`);
         if (Array.isArray(d.__jwts)) for (const t of d.__jwts) if (!ALL_JWTS.includes(t)) ALL_JWTS.push(t);
-        if (!(byApp || byMp || (!APPID && !MPID))) return;
         const fields = {}; for (const k of Object.keys(d)) if (!k.startsWith('__')) fields[k] = d[k];
-        if (!pick || Object.keys(fields).length > Object.keys(pick.fields).length) pick = { cid, fields, appId: d.__appId };
+        if (!Object.keys(fields).length) return;
+        // appId 只当**优先项**：brands.json 里的 appId 来自 `--find`，多卡片场景下归属会错位
+        // （实测：卡片标题「大董会员商城」实际是 wxfa7ab5e2520cece8，表里却记着另一个）。
+        // 拿它当硬门槛会把**正确**的上下文丢掉 → 一律 notoken，且极难查。
+        if (byApp || byMp) {
+          if (!pick || Object.keys(fields).length > Object.keys(pick.fields).length) pick = { cid, fields, appId: d.__appId };
+        } else {
+          if (!pickAny || Object.keys(fields).length > Object.keys(pickAny.fields).length) pickAny = { cid, fields, appId: d.__appId };
+        }
       }
     });
     ws.on('error', () => finish());
@@ -157,9 +164,17 @@ const ALL_JWTS = [];
   const env0 = loadEnv();
   let found = null;
   const end = Date.now() + WAIT * 1000;
+  let warned = false;
   while (Date.now() < end) {
     const r = await attempt();
-    if (r.pick && (!found || Object.keys(r.pick.fields).length > Object.keys(found).length)) found = r.pick.fields;
+    const chosen = r.pick || r.pickAny;
+    if (chosen && !r.pick && !warned) {
+      console.log(`[warn] 没有 ctx 的 appId 等于期望值 ${APPID || '(未指定)'}，`
+        + `改用实际打开的那个（ctx ${chosen.cid} appId=${chosen.appId}）—— `
+        + 'brands.json 里的 appId 多半是 --find 归属错位，建议改成这个值');
+      warned = true;
+    }
+    if (chosen && (!found || Object.keys(chosen.fields).length > Object.keys(found).length)) found = chosen.fields;
     // 只要拿到 openId + mpId 就够了（登录只要这两个）；memberId 对**非会员**永远没有，
     // 卡在 memberId 上会让非会员的号白等到超时（实测）。
     if (found && found.openId && found.mpId) break;

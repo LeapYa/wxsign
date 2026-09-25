@@ -224,6 +224,19 @@
       "enabled": true,
       "verified": false,
       "note": "**第三个后端：微租林（weizulin / saas.funjs.top）** 的首个条目。链路：小程序逻辑层取 wx.login 的 code（wxcode.py）→ POST /open/auth/mp/silent-login（JSON `{code}`，header `x-appid`）拿 `data.token` → 之后带 `Authorization: Bearer` + `x-appid` + `x-client-source: applet` → GET /open/check-in/status 查状态 → POST /open/check-in 签到。逐条实测见 survey/WZL_API.md。⚠️ 它**不是餐饮会员积分，是工具类应用的「签到送使用次数」**（这个 app 是去水印工具）：签到 +1 次、连签 7 天额外 +5 次。`wzl_appid` 是**微租林平台内**的应用 ID（包内 app.js 顶层配置对象里明文写着），每个小程序一条，不是微信 appId。"
+    },
+    {
+      "slug": "lixiansheng",
+      "name": "李先生牛肉面大王",
+      "appid": "wx9710b09df6cb09a9",
+      "keyword": "李先生牛肉面大王",
+      "miniapp": "李先生牛肉面大王会员",
+      "engine": "qmai",
+      "qm_biz": "catering",
+      "type": "sign",
+      "enabled": false,
+      "verified": false,
+      "note": "**第四个后端：企迈（qmai / webapi.qmai.cn）** 的首个条目。链路：小程序逻辑层读 storage 的 `loginData`（wxqm.py）拿 `token`（= Qm-User-Token）与 `store.id`（= 商户号，这里是 49112）→ 之后每次请求带 `Qm-User-Token` + `store-id` 两个头 → POST /web/catering/integral/sign/detail 查状态 → /signIn 签到。**认证没有签名**，比吾享还简单。⚠️ 但 `enabled=false`：该商户**只配了签到规则、没发布活动** —— `detail` 明确回 `{\"code\":\"400042\",\"message\":\"商家未开启此功能\"}`，而 `rule` 却能返回完整奖励配置（1/7/19/30 天各 +1 积分）。**这是小程序自己也逃不掉的**：用 CDP 抓它自己发的那个请求（同 URL、同 body、带它自己的 token），响应一字不差；签到页数据 `activityId` 空、`isLoad=false`，界面上就是空的。同一个后端下的呷哺呷哺（storeId 214176）也一样。所以「签不了」既不是环境、也不是登录、更不是自动化的问题，**是商户没开这个功能**。哪天商户开了，把 enabled 改 true 即可。"
     }
   ]
 }

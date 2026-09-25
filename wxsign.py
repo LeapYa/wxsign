@@ -647,7 +647,7 @@ def ensure_helpers():
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
             ("wxfind.py", "wxcdp.py", "wxdom.py", "wxwin.py", "pkgprobe.py",
              "wxclean.py", "wxopen.py", "wxreg.py", "wxagree.py", "wxnet.py",
-             "wxyd.py", "wxcode.py")]
+             "wxyd.py", "wxcode.py", "wxqm.py")]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖
@@ -1131,12 +1131,176 @@ def do_sign_wzl(brand, env):
         d.get("streakDays", "?"), d.get("bonusCountBalance", "?"))
 
 
+# ── 企迈（qmai）后端 ──────────────────────────────────────────────────
+# 商户号 storeId 与 Qm-User-Token 都是**服务端下发的 config**，存在小程序逻辑层
+# storage 的 `loginData` 里（由 wxqm.py 读出来）。接口是平台级 REST：
+#     POST https://webapi.qmai.cn/web/<biz>/integral/sign/detail | rule | signIn
+# 认证只要两个头 —— `store-id: <商户号>` + `Qm-User-Token: <会话>`，**没有签名**。
+#
+# ⚠️ 两个容易栽的坑（都是实测踩出来的）：
+#   1) **路径必须带 `/web` 前缀**。少这一节，阿里云 WAF 会拿「不存在的路由」
+#      甩回一个 110310 字节的 JS 挑战页 —— 极易被误读成「被墙了」，
+#      实际只是自己拼错了 URL（Punish-Loc: keepper 是这么来的）。
+#   2) **`<biz>` 按业务线不同**：餐饮大盘是 `catering`，呷哺系是 `mealmate-apiserver`。
+#      实测两条前缀**都能通**，所以缺省用 `catering`，要覆盖就在 brands.json 写 `qm_biz`。
+QM_BASE = "https://webapi.qmai.cn"
+_QM_HOST = QM_BASE.split("//", 1)[1]
+_QM_CONN = [None]
+QM_BIZ = {"catering": "catering", "mealmate": "mealmate-apiserver"}
+
+
+def _qm_once(path, data, token="", store_id="", biz="catering"):
+    """单次请求。复用连接 —— 理由与 _api_post_once / _wzl_once 相同（临时端口耗尽）。"""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "v=1.0",
+        "Qm-From": "wechat",
+        "Qm-From-Type": biz,
+        "store-id": str(store_id),
+        "scene": "1101",
+    }
+    if token:
+        headers["Qm-User-Token"] = token
+    body = json.dumps(data).encode() if data is not None else b"{}"
+    try:
+        conn = _QM_CONN[0]
+        if conn is None:
+            conn = http.client.HTTPSConnection(_QM_HOST, timeout=20, context=_SSL)
+            _QM_CONN[0] = conn
+        conn.request("POST", path, body=body, headers=headers)
+        r = conn.getresponse()
+        raw = r.read().decode(errors="replace")
+        # 别按 HTTP 状态码判成败：业务码全在 body 的 `code` 里
+        # （10008 未登录 / 9001 登录超时 / 400042 商户未开启 / 20013 活动ID为空）。
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {"_transport": 1, "msg": "HTTP %s 且非 JSON（前 160 字：%s）"
+                                            % (r.status, raw[:160])}
+    except Exception as e:
+        _QM_CONN[0] = None
+        return {"_transport": 1, "msg": "传输失败：%s" % e}
+
+
+def qm_request(path, data, token="", store_id="", biz="catering", retries=3):
+    """带重试。判据用 `_transport`（企迈的业务字段是 status/code/message）。"""
+    r = None
+    for attempt in range(retries + 1):
+        r = _qm_once(path, data, token, store_id, biz)
+        if not r.get("_transport"):
+            return r
+        if attempt < retries:
+            wait = 2.0 * (attempt + 1)
+            log("  [net] %s 第 %d 次失败（%s），%.1fs 后重试"
+                % (path, attempt + 1, str(r.get("msg"))[:60], wait))
+            time.sleep(wait)
+    return r
+
+
+def qm_ident(brand, wait=12):
+    """在小程序逻辑层读企迈的登录态（Qm-User-Token + 商户 storeId）。
+
+    与易东（wxyd.py 要 wx.login 的 code）不同：**企迈只要现成的会话**。
+    小程序打开时会自己完成一次静默登录并把结果写进 storage 的 `loginData`，
+    我们直接读即可 —— 所以这一步是同步的，没有异步等待。
+    """
+    if not INSTANCE:
+        log("  [qm] 未设 WOC_INSTANCE → 取不到登录态")
+        return None
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxqm.py"), brand.get("appid", ""), str(wait)],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        log("  [qm] 执行异常：%s" % e)
+        return None
+    out = (p.stdout or "") + (p.stderr or "")
+    got = None
+    for line in out.splitlines():
+        if line.startswith("QM_JSON="):
+            try:
+                got = json.loads(line[len("QM_JSON="):])
+            except ValueError:
+                pass
+        elif line.strip():
+            log("     " + line.strip()[:180])
+    if not got:
+        log("  [qm] 没读到登录态（wxqm.py rc=%s）" % p.returncode)
+        return None
+    return got
+
+
+def do_sign_qm(brand, env):
+    """企迈后端签到。返回 (是否成功, 业务码, 说明)。
+
+    ⚠️ 现实提醒：企迈的签到是**商户级开关**，后台「配了规则」不等于「发布了活动」。
+        实测两家（呷哺呷哺 214176、李先生牛肉面大王 49112）都只配了规则、
+        活动没开 —— `detail` 报 `400042 商家未开启此功能`，**小程序自己也签不了**
+        （界面上签到页是空的：activityId 空、isLoad=false）。这跟环境/登录/自动化都无关。
+    """
+    biz = QM_BIZ.get(brand.get("qm_biz") or "catering", "catering")
+    pre = "/web/" + biz
+
+    ident = qm_ident(brand)
+    if not ident:
+        return False, "NOIDENT", "拿不到企迈登录态（小程序开着吗？hook 通吗？）"
+    token = ident.get("token") or ""
+    store_id = str(ident.get("storeId") or "")
+    appid = brand.get("appid") or ident.get("appid") or ""
+    if not (token and store_id):
+        return False, "NOIDENT", "登录态不完整：token=%s storeId=%s" % (bool(token), store_id or "(空)")
+
+    def _say(r):
+        return "%s（code=%s）" % (str(r.get("message", ""))[:120], r.get("code"))
+
+    def _call(action, extra=None):
+        body = {"appid": appid}
+        if extra:
+            body.update(extra)
+        return qm_request(pre + "/integral/sign/" + action, body, token, store_id, biz)
+
+    # ① 查签到详情 —— 这是唯一的权威判据（商家没开活动时它明确报 400042）
+    d = _call("detail")
+    if d.get("_transport"):
+        return False, "NETFAIL", "网络失败：%s" % str(d.get("msg"))[:120]
+    code = str(d.get("code"))
+    if code in ("10008", "9001"):
+        return False, "NOTOKEN", "企迈会话失效（%s）→ 重开小程序刷新登录态" % code
+    if code == "400042":
+        return False, "NOACT", "该商户未开启签到活动（400042）"
+    if not d.get("status"):
+        return False, code, "查签到详情失败：%s" % _say(d)
+
+    info = d.get("data") or {}
+    if info.get("signed_today") or info.get("signInToday") or str(info.get("is_signIn")) == "1":
+        return True, "415", "今天已经签到过了（连续 %s 天）" % (
+            info.get("keep_days") or info.get("signInDays") or "?")
+
+    # ② 签到（activityId 由 detail 下发；为空时服务端会回 20013）
+    r = _call("signIn", {"activityId": info.get("activityId") or ""})
+    if r.get("_transport"):
+        return False, "NETFAIL", "网络失败：%s" % str(r.get("msg"))[:120]
+    rc = str(r.get("code"))
+    if rc == "20013":
+        return False, "QMNOID", "服务端没下发 activityId（20013）—— 与未开启活动同源"
+    if r.get("status"):
+        dd = r.get("data")
+        return True, "200", "签到成功%s" % (
+            ("：" + json.dumps(dd, ensure_ascii=False)[:150]) if dd else "")
+    msg = str(r.get("message", ""))
+    if "已" in msg or "重复" in msg:      # 幂等：重跑时它可能已经签过了
+        return True, "415", msg[:120]
+    return False, rc, _say(r)
+
+
 # 后端 → 签到实现。往后加新后端只需要三步：写一个 `do_sign_xxx(brand, env)`
 # → 在这张表里注册一行 → brands.json 里给条目写 `engine`（不写 = 吾享）。
 # 主流程（main）也读这张表做分派，别再往 if 链里塞。
 _SIGNERS = {
     "eingdong": do_sign_yd,
     "weizulin": do_sign_wzl,
+    "qmai": do_sign_qm,
 }
 
 

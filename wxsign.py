@@ -1059,8 +1059,19 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
     # 缺 gameId 时补抓一次（wxident.js 会读页面 data 取 gameId）。
     # 不判 carrier：那个分类已证伪（来菜包里没有 sign 字面串，运行时走的却是 sign 接口）。
     if not (env.get("WX_GAMEID") or brand.get("gameid")):
+        mp_before = env.get("WX_MPID", "")
         harvest_ident(brand)
         env = load_env(slug)
+        # ⚠️ harvest_ident 可能**改写 mpId**（它是从登录 token 的 payload 里取的，
+        #    比 wxrefresh 早一步拿到真值）。而 refresh_token 是在它**之前**跑的，
+        #    于是就会出现「token 属于旧租户、mpId 是新的」→ 之后所有接口返
+        #    `208 授权码错误`，表现得像「这个号没有活动」（假结论，实测踩过 3 个号）。
+        #    mpId 一变就强制重换 token。
+        if env.get("WX_MPID") and env.get("WX_MPID") != mp_before:
+            log("  [init] mpId 更新为 %s（原 %s）→ 强制重换 token（否则接口会返 208）"
+                % (env["WX_MPID"], mp_before or "(空)"))
+            if refresh_token(brand, env, force=True):
+                env = load_env(slug)
 
 
     if discover:
@@ -1073,6 +1084,16 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
     #    「探测，并且需要注册就给这个号注册后再终判」（见下面 probe 分支里的 register_only）。
     if probe:
         r, mem = member_info(env, env.get("WX_GAMEID", ""), env.get("WX_THIRDSHOPID", ""))
+        # 兜底：token 与租户不匹配（208/211）就强制重换一次再问。
+        # 208 是「授权码错误」——token 签发时的 mpid 与我们现在发的不一致。
+        # 不处理的话后面每条接口都返 208，最后会走进「服务端没有活动」那个 else，
+        # 把「没答上」写成「查过了、没有」（实测污染过 3 个号）。
+        if str(r.get("code")) in (CODE_AUTH_BAD, CODE_AUTH_EXP):
+            log("  [auth] 接口返 %s（%s）→ token 与租户不匹配，强制刷新后重试"
+                % (r.get("code"), str(r.get("msg"))[:40]))
+            if refresh_token(brand, env, force=True):
+                env = load_env(slug)
+                r, mem = member_info(env, env.get("WX_GAMEID", ""), env.get("WX_THIRDSHOPID", ""))
         log("  [probe·member] code=%s content=%s"
             % (r.get("code"), json.dumps(mem, ensure_ascii=False)[:300]))
         r2, items = lot_list(env)
@@ -1185,6 +1206,11 @@ def run_brand(brand, do_ensure=False, probe=False, discover=False, register_only
             log("  [probe] ⚠️ 传输失败 —— **未判定**（接口返 code=-1，属本机/链路问题，"
                 "不是「没有活动」）。请重跑这个号。")
             return False, "netfail"
+        elif str(sd.get("code")) in (CODE_AUTH_BAD, CODE_AUTH_EXP) \
+                or str(sv.get("code")) in (CODE_AUTH_BAD, CODE_AUTH_EXP):
+            log("  [probe] ⚠️ 鉴权失败（208/211）—— **未判定**，不是「没有活动」。"
+                "重跑一次即可（脚本会重换 token）。")
+            return False, "authfail"
         else:
             log("  [probe] ⚪ 服务端没有活动（该租户未配置）")
         return True, "probe"

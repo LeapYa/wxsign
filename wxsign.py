@@ -503,7 +503,42 @@ def ensure_miniapp(brand, retry_hard=True):
         # 出错了就把所有输出都打出来 —— 只过滤 [reopen] 会把真正的报错吞掉（踩过）
         if line.startswith("[reopen]") or (not ok and line.strip()):
             log("     " + line[:200])
+    if ok:
+        agree_privacy()
     return ok
+
+
+def agree_privacy(rounds=4):
+    """把小程序开屏的「隐私保护提示」弹层点掉，让页面真正初始化。
+
+    ⚠️ 这一步是**刷 token 的前置条件**，不点就等于白开：
+    小程序在用户同意隐私协议之前**页面根本没初始化** → storage 里没有 mpId →
+    wxrefresh 报「拿不到 mpId / invalid code」。实测一整批 53 个号里 80% 死在这，
+    日志表现极具误导性：`[ensure] … rc=0 (已就绪)` 紧接着 `[enum] 有 wx 的上下文=[…]`
+    每个 ctx 都「拿不到 mpId」—— 看着像 hook 没挂上，其实是弹层没点。
+    （`--find` 之所以不受影响：它只读 appId，appId 在逻辑层随时可取，不需要页面初始化。）
+    """
+    if not INSTANCE:
+        return 0
+    if os.environ.get("WXSIGN_NO_AGREE", "") == "1":
+        return 0
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxagree.py"), str(rounds)],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        log("  [agree] 跳过（%s）" % e)
+        return 0
+    out = (p.stdout or "") + (p.stderr or "")
+    n = 0
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("[agree]"):
+            log("  " + s)
+            m = re.match(r"\[agree\] 共点 (\d+) 下", s)
+            if m:
+                n = int(m.group(1))
+    return n
 
 
 def refresh_token(brand, env, force=False):
@@ -568,7 +603,7 @@ def ensure_helpers():
         return False
     srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
             ("wxfind.py", "wxcdp.py", "wxdom.py", "wxwin.py", "pkgprobe.py",
-             "wxclean.py", "wxopen.py", "wxreg.py")]
+             "wxclean.py", "wxopen.py", "wxreg.py", "wxagree.py")]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖

@@ -484,6 +484,48 @@ docker exec $WX sh -c 'for p in $(ls /proc | grep -E "^[0-9]+$"); do \
 
 > **绝不要用 `xdotool windowclose` 关微信的窗口**：X 窗口销毁了，但微信内部「面板/小程序已打开」
 > 的状态不复位 → 之后点侧边栏变成「切换关闭」，面板再也召不回来，只能重启微信。
+
+### 8.x 微信实例容器重启之后（掉登录 + hook 必须重建）
+
+微信实例容器**任何时候重启**（`docker restart`、Docker 服务重启、宿主重启），都会带来两件事：
+
+**① 掉登录** —— 重启后停在登录页（280×380 的小窗，账号名 + 绿色「登录」）。
+**这个登录窗不吃合成点击**：`xdotool mousemove --sync` 能把指针放到按钮正中心、
+`click 1` 也返回成功，但界面**纹丝不动**。只能让用户在网页控制台（`http://127.0.0.1:36080`）
+用真鼠标点，然后手机确认；或点「切换账号」扫码。
+
+**② `woc-hook` **无法 `docker start`**，只能重建。**
+hook 是用 `--pid=container:<wx>` + `--network=container:<wx>` 建的，Docker 把这两个值
+**解析成 wx 容器的 ID** 固化了下来；wx 一重启 ID 就变了，于是：
+
+```
+Error response from daemon: joining network namespace of container:
+  No such container: 5fab5474e45201a6cfdacc1a68c2c87f0f28d1d8ed7ab96d85253e5d1a249999
+```
+
+重建（**必须用固化过的镜像** `woc-hook:1`，裸 `node:22-slim` 会丢掉 WMPFDebugger 和 frida）：
+
+```bash
+WX=$(docker ps --format '{{.Names}}' | grep '^woc-wx-' | head -1)
+VOL=woc-data-${WX#woc-wx-}
+docker rm -f woc-hook
+docker run -d --name woc-hook --pid=container:$WX --network=container:$WX \
+  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  -v $SCRIPTS:/work -v $VOL:/config:ro woc-hook:1 sleep infinity
+docker start woc-hook 2>/dev/null; docker exec -d woc-hook sh -c \
+  'cd /opt/wmpf && node node_modules/ts-node/dist/bin.js src/index.ts > /tmp/wmpf.log 2>&1'
+docker exec woc-hook grep -m1 'script loaded' /tmp/wmpf.log
+```
+
+> ⚠️ **重建后一定先验场景号补丁在不在**（这一步救过一次整批扫描）：
+> ```bash
+> docker exec woc-hook grep -c 1183 /opt/wmpf/frida/hook.js     # 必须是 1
+> ```
+> 不在就跑 `bash wmpf/hook_patch.sh woc-hook` 打上，然后**重新固化**：
+> `docker commit woc-hook woc-hook:1`。
+> 症状很隐蔽：小程序**能开**、窗口标题也对，但 CDP 里 `[enum] 有 wx 的上下文=[]`
+> —— 因为从面板搜索打开的小程序场景号是 1183，不在白名单里就不会被改写成 1101，
+> 也就不连 `ws://localhost:9421`。hook 日志里同样没有 `miniapp client connected`。
 > 关窗一律点微信自己的关闭按钮。
 
 ---

@@ -16,7 +16,7 @@
 
 ---
 
-## 一、能签到的小程序（9 个）
+## 一、能签到的小程序（10 个）
 
 | 品牌 | 小程序 | appId | 签到活动 | 后端 | 状态 |
 |---|---|---|---|---|---|
@@ -29,12 +29,16 @@
 | 酒煮江湖 | 积膳餐饮游戏 | `wx5fb9d9352a88e693` | 酒煮江湖日常积签到活动 | 吾享 | ✅ 已跑通 |
 | 刘一手 | 刘一手火锅店 | `wx757e678caa41a2a6` | 每日签到 | **易东** | ✅ 已跑通 |
 | 许家去水印 | 许家去水印 | `wx2b979b1c16784d44` | 每日签到（送**去水印次数**） | **微租林** | ✅ 已跑通 |
+| 呷哺呷哺 | 呷哺呷哺 | `wx6822e696198e2763` | 签到得好礼（送哺币） | **企迈** | ✅ 已跑通 |
 
-> **状态**：这 9 个都已真机跑通（自动开小程序 → 取身份 → 不是会员则**自动注册** → 签到），
+> **状态**：这 10 个都已真机跑通（自动开小程序 → 取身份 → 不是会员则**自动注册** → 签到），
 > 返回 `415 今日已签到` 或 `200 签到成功` 都算完成。
 >
+> ⚠️ 唯一的例外是**呷哺呷哺**：企迈的签到要求**已绑手机号的会员**，所以它**首次需要人工过一次授权**
+> （进签到页 → 点「立即签到」→ 勾选 → 「手机号一键登录」→ 微信授权框点允许），之后每天自动。
+>
 > 返回码语义（吾享接口原文）：`200` 签到成功 / `415` 今日已签到 / `406` 不在可签时段 /
-> `401` 还不是会员 / `405` 该租户没有活动。易东、微租林沿用同一套语义（`415` 也是「今天签过了」）。
+> `401` 还不是会员 / `405` 该租户没有活动。易东 / 微租林 / 企迈沿用同一套语义（`415` 也是「今天签过了」）。
 >
 > 过桥缘名下有**三个**小程序（过桥缘游戏中心 / 过桥缘 / 过桥缘积分商城），活动与 gameId
 > 是同一个 —— 签一个就够了，别把三个都放进范围里重复签。
@@ -46,7 +50,12 @@
 > ⚠️ 「刘一手」这个 appId 对应的是**巴塞罗那店**（登录应答里的门店名就是它），国内门店用不上 ——
 > 留着它是因为它是**易东后端**的第一个样本，能证明第二个引擎是通的。
 > 同后端的「巧娘子」链路已完全打通（登录成功），但**该门店服务端没开签到活动**
-> （接口原话「商家未开启签到」），所以没算进这 9 个。
+> （接口原话「商家未开启签到」），所以没算进这 10 个。
+>
+> **企迈**（呷哺呷哺）走的是 **`cmk-center/sign/*`** 那套接口 —— 详见第五节与
+> [`docs/QMAI_API.md`](docs/QMAI_API.md)。这个后端的坑比前几个加起来还多，
+> 那条文档把我犯过的错也一并记了（一个重要提醒：包里另有一套 `integral/sign/*`，
+> 它对同一商户会回 `400042 商家未开启此功能`，**那是误导性错误码，别拿它当判据**）。
 
 > 签到给的一般是**会员积分**，攒着到小程序【商城】兑换。
 > 以辣可可为例：每天 +1 积分，连续 10 / 20 / 30 天分别加赠 10 / 15 / 20 积分，积分有效期 365 天。
@@ -56,11 +65,8 @@
 大龙燚、呷哺呷哺、李先生牛肉面大王等）。它们不是吾享体系、接口各不相同，
 本合集**按后端逐个适配**：目前支持 **吾享 / 易东 / 微租林 / 企迈** 四个后端（后三个见第五节）。
 
-> 其中**企迈**（呷哺呷哺、李先生牛肉面大王）的适配器是好的、链路实测全通，但这两家商户
-> **只配了签到规则、没发布活动** —— 服务端明确回 `400042 商家未开启此功能`。
-> 而这是**小程序自己也逃不掉**的：抓到它自己发的那个请求（同 URL、同 body、带它自己的 token），
-> 响应一字不差；签到页上 `activityId` 是空的、界面就是空白的。所以它们**没有列进上表**，
-> 等哪天商户开了活动，把 `brands.json` 里的 `enabled` 改成 true 就能用。
+> **企迈**（呷哺呷哺）已经做完了 —— 走的是 `cmk-center/sign/*`，见第五节。同后端的
+> **李先生牛肉面大王**（`wx9710b09df6cb09a9`）还没验：缺它的 `activityId`，且属于另一个业务线。
 
 剩下那些里，美团 / 有赞 / 口碑·饿了么 走**平台级账号体系**（用各自的账号登录，
 签到也只是平台 H5），成本与收益不成比例，暂不做。
@@ -170,7 +176,7 @@ wxsign/
 ├── wxnet.py             （容器内跑）拦逻辑层 wx.request，排查网络/身份用（诊断工具）
 ├── wxyd.py              （容器内跑）易东后端取身份：wx.login 的 code + 门店 storeid
 ├── wxcode.py            （容器内跑）通用取码器：只取 appId + wx.login 的 code（微租林用它）
-├── wxqm.py              （容器内跑）企迈后端取登录态：storage 里的 Qm-User-Token + 商户号
+├── wxqm.py              （容器内跑）企迈后端取登录态：storage 优先，取不到就抓真实请求头
 ├── LICENSE              保留所有权利（源码公开，但**不是开源**，见第九节）
 └── README.md
 ```
@@ -207,7 +213,7 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 | （缺省） | 吾享 `scrm.wuuxiang.com/crm7game-api` | `Authorization` + `crm7-mpId` 请求头 | mpId 从登录 token 的 payload 取 |
 | `eingdong` | 易东 `zhyx.eingdong.com/api/index.php` | cookie `sessionKey=<sessionId>` | `wx.login` 的 code + ext 里的 storeid |
 | `weizulin` | 微租林 `saas.funjs.top/api` | `Authorization: Bearer <JWT>` | `wx.login` 的 code（换 token 时用） |
-| `qmai` | 企迈 `webapi.qmai.cn/web/<biz>` | `Qm-User-Token` + `store-id` 请求头 | storage 的 `loginData`：token + 商户号 |
+| `qmai` | 企迈 `webapi.qmai.cn/web/cmk-center` | `Qm-User-Token` + `store-id` 请求头 | `wxqm.py` **双路**：storage 的 `loginData`，取不到就抓真实请求头 |
 
 **易东**（`刘一手`）：**没有签名、没有 nonce**，就是一个 cookie —— 比吾享还简单。
 
@@ -236,28 +242,31 @@ POST /open/check-in          Authorization: Bearer <token>  →  签到
 两家能做成的共同原因：**code 都由服务端自己持 appsecret 去换 openId** —— 我们不需要 secret
 （传假 code 会返回微信的 `errcode:40029` / `invalid code`，正好证明这点），且全程**无人工确认**。
 
-**企迈**（`呷哺呷哺`、`李先生牛肉面大王`）：登录态与商户号都在小程序逻辑层的 storage 里
-（`loginData`），认证只要两个请求头、**没有签名**，比吾享还简单。
+**企迈**（`呷哺呷哺`）：认证只要两个请求头、**没有签名**，比吾享还简单。
+身份走 `wxqm.py` 的**双路**（有的商户持久化、有的不持久化）：
 
 ```
-storage: loginData   ← 小程序打开时自己完成一次静默登录   ─┐ wxqm.py 直接读它
-  {token, store:{id:"49112", …}, user:{eOpenId, eMobile}}  │
-        ↓                                                  │
-POST /web/<biz>/integral/sign/detail   Qm-User-Token + store-id  →  活动状态
-POST /web/<biz>/integral/sign/signIn   同上                      →  签到
+① storage 有 loginData  → 直接读 token + store.id（实测：李先生会写）
+② storage 是空的        → 开 CDP Network domain，从它自己的请求头里读
+                          Qm-User-Token + store-id（实测：呷哺走的是这条）
+        ↓
+POST /web/cmk-center/sign/userSignStatistics   {activityId, storeId}  →  今天签没签
+POST /web/cmk-center/sign/takePartInSign       {activityId, storeId}  →  签到
 ```
 
-> ⚠️ 两个坑（都踩过）：
-> 1. **路径必须带 `/web` 前缀**。少这一节，阿里云 WAF 会对「不存在的路由」甩回一个
->    110310 字节的 JS 挑战页（`Punish-Loc: keepper`）—— 极易被误读成「被墙了」，其实只是
->    自己拼错了 URL；
-> 2. **`<biz>` 按业务线不同**：餐饮大盘是 `catering`，呷哺系是 `mealmate-apiserver`
->    （`brands.json` 里用 `qm_biz` 覆盖，缺省 `catering`）。
+> ⚠️ 四个坑 —— 每一个都让我错判过一轮，细节见 [`docs/QMAI_API.md`](docs/QMAI_API.md)：
+> 1. **真正的是 `cmk-center/sign/*`**。包里另有一套 `integral/sign/*`（积分商城那套），
+>    它对同一商户会回 **`400042 商家未开启此功能`** —— **那是误导性错误码**，
+>    我据此连着下了三次「商户没开活动」的错误结论；
+> 2. **`cmk-center` 不带业务线前缀**：写成 `/web/mealmate-apiserver/cmk-center/...` 会回
+>    `43004 http状态码异常`。业务线只体现在 `Qm-From-Type` 头里；
+> 3. **路径必须带 `/web`**：少这一节，阿里云 WAF 会对「不存在的路由」甩回 110310 字节的
+>    JS 挑战页（`Punish-Loc: keepper`）—— 极易被误读成「被墙了」，其实只是 URL 拼错；
+> 4. **必须已绑手机号**：未登录时签到页**根本不发请求**（`onClickCheckin` 先弹授权），
+>    接口层回 `100005 用户未登录` —— 所以**首次需要人工过一次授权**。
 >
-> **但这两家商户都没开签到活动**：`detail` 回 `400042 商家未开启此功能`，而 `rule` 却能
-> 返回完整的奖励配置（1/7/19/30 天各 +1 积分）—— 规则配了、活动没发布。**小程序自己也一样**
-> （用 CDP 抓到它自己发的请求，同 URL、同 body、带它自己的 token，响应一字不差；
-> 签到页上 `activityId` 是空的、界面就是空白的）。所以它们暂时是 `enabled: false`。
+> `activityId` 是**商户级活动的固定 ID**（随签到入口由服务端下发，包里没有），
+> 所以配在 `brands.json` 的 `qm_activity` 里。
 
 逐条实测记录见 [`docs/YD_API.md`](docs/YD_API.md)、[`docs/WZL_API.md`](docs/WZL_API.md)
 与 [`docs/QMAI_API.md`](docs/QMAI_API.md)。

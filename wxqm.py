@@ -2,25 +2,29 @@
 # -*- coding: utf-8 -*-
 """在微信实例容器内取「企迈（qmai）」小程序的身份：Qm-User-Token + 商户 storeId。
 
-为什么非在小程序里跑不可：
-  · `Qm-User-Token` 是企迈服务端按「静默登录」签发的会话，存在**逻辑层的 storage** 里
-    （`loginData.token`）—— 包内、宿主机都拿不到；
-  · 商户号 `storeId` 同样在 `loginData.store.id` 里（也来自服务端下发的 config）。
-  两者都拿不到，后面调签到接口就无从谈起。
+两条路，优先第一条：
 
-⚠️ 与易东（wxyd.py）的关键差别：**企迈只要 token，不要 `wx.login` 的 code**。
-   小程序打开时会自己完成一次静默登录并写进 storage，我们直接读现成的即可；
-   所以这里**不做异步**（普通表达式，不是 Promise）。
+  ① **读 storage**（快）：小程序打开时会自己完成一次静默登录，有些商户把它
+     持久化成 `loginData = {token, store:{id,name}, user:{eOpenId,eMobile}}`。
+     → 直接读，不用发任何请求。
+
+  ② **抓真实请求头**（兜底）：**有些商户不持久化** —— 实测呷哺呷哺的 storage 里
+     干干净净（`loginData` 是空串），token 只活在内存里、每个请求现取现用。
+     这时只能开 CDP 的 Network domain，逼它发一次请求，从它自己的请求头里读
+     `Qm-User-Token` 与 `store-id`。顺带还能读到 `Qm-From-Type`（业务线），
+     连 `qm_biz` 都不用配。
 
 输出（给 wxsign.py 解析）：
     QM_JSON={"appid": "...", "token": "...", "storeId": "...", "storeName": "...",
-             "openId": "...", "mobile": "...", "userId": "..."}
+             "openId": "", "mobile": "", "userId": "", "biz": "catering",
+             "from": "storage|network"}
 
 用法（容器内）：DISPLAY=:1 python3 wxqm.py [目标appId] [等待秒数]
 退出码：0 = 拿到 token + storeId；1 = 没拿到（原因见打印）
 """
 import json
 import os
+import re
 import sys
 import time
 
@@ -31,7 +35,7 @@ except ImportError:
     sys.path.insert(0, "/tmp")
     from wxcdp import WS
 
-# 每一项都单独 try：有些 context 里的 `wx` 只是残壳，别让一项失败带崩整个探针。
+# ── 路线 ①：storage 探针（同步）。每项单独 try，别让一项失败带崩整个探针。 ──
 PROBE = """
 (function () {
   var out = {};
@@ -42,7 +46,6 @@ PROBE = """
     out.token = d.token || '';
     out.storeId = String(st.id || '');
     out.storeName = st.name || '';
-    out.storeType = String(st.store_type || '');
     out.openId = u.eOpenId || '';
     out.mobile = u.eMobile || '';
   } catch (e) { out.err = '' + e; }
@@ -54,9 +57,22 @@ PROBE = """
 })()
 """
 
+# 触发一次重载，逼小程序重新发请求（reLaunch 到当前页 —— 比写死首页路径通用）
+RELOAD = """
+(function () {
+  try {
+    var p = getCurrentPages();
+    var c = p[p.length - 1];
+    if (!c) return 'no-page';
+    wx.reLaunch({ url: '/' + c.route });
+    return 'reload:' + c.route;
+  } catch (e) { return 'ERR:' + e; }
+})()
+"""
 
-def collect(want_appid="", wait=10.0):
-    """对所有 context 求值一次，返回结果 dict（优先 appid 匹配且带 token 的）。"""
+
+def collect_by_storage(want_appid="", wait=8.0):
+    """路线 ①：读 storage 的 loginData。返回 dict 或 None。"""
     ws = WS()
     got = []
     try:
@@ -82,27 +98,81 @@ def collect(want_appid="", wait=10.0):
     finally:
         ws.close()
     for d in got:
-        if d.get("token") and (not want_appid or d.get("appid") == want_appid):
+        if d.get("token") and d.get("storeId") and (not want_appid or d.get("appid") == want_appid):
+            d["from"] = "storage"
             return d
-    return got[0] if got else None
+    return None
+
+
+def collect_by_network(want_appid="", wait=20.0):
+    """路线 ②：抓小程序**真实请求头**里的 Qm-User-Token + store-id（+ 业务线）。
+
+    为什么非此不可：有些商户（实测呷哺呷哺）**不把登录态写进 storage** ——
+    token 只在内存里，每个请求现取现用，读 storage 永远是空的。
+    """
+    ws = WS()
+    got = None
+    try:
+        ws.send({"id": 1, "method": "Runtime.enable", "params": {}})
+        ws.send({"id": 2, "method": "Network.enable", "params": {}})
+        time.sleep(0.6)
+        ws.send({"id": 3, "method": "Runtime.evaluate",
+                 "params": {"expression": RELOAD, "returnByValue": True}})
+        t0 = time.time()
+        while time.time() - t0 < wait and not got:
+            try:
+                m = json.loads(ws.recv_msg())
+            except Exception:
+                break
+            if m.get("method") != "Network.requestWillBeSent":
+                continue
+            p = m.get("params") or {}
+            q = p.get("request") or {}
+            h = {k.lower(): v for k, v in (q.get("headers") or {}).items()}
+            tok = h.get("qm-user-token")
+            sid = h.get("store-id")
+            if not (tok and sid):
+                continue
+            url = q.get("url") or ""
+            ref = h.get("referer") or ""
+            mm = re.search(r"servicewechat\.com/(wx[0-9a-f]+)", ref + " " + url)
+            # 路径形如 /web/<biz>/... —— 顺手把业务线抠出来，省得配 qm_biz
+            mb = re.search(r"/web/([a-z0-9\-]+)/", url)
+            got = {"token": tok, "storeId": str(sid), "storeName": "",
+                   "appid": (mm.group(1) if mm else ""), "openId": "", "mobile": "",
+                   "userId": "", "biz": (h.get("qm-from-type") or (mb.group(1) if mb else "")),
+                   "from": "network", "sample": url}
+    finally:
+        ws.close()
+    if got and want_appid and got.get("appid") and got["appid"] != want_appid:
+        print("[qm] ⚠️ 抓到的请求属于 %s，不是目标 %s" % (got["appid"], want_appid))
+    return got
 
 
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else ""
     wait = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
-    d = collect(want, wait)
+
+    d = collect_by_storage(want, min(wait, 10.0))
+    if d:
+        print("[qm] 走 storage：拿到 loginData")
+    else:
+        print("[qm] storage 里没有登录态（这个商户可能不持久化）→ 改抓真实请求头")
+        d = collect_by_network(want, max(wait, 20.0))
+
     if not d:
-        print("[qm] 逻辑层没响应 —— 小程序真开着吗？hook 通吗？")
+        print("[qm] 两条路都没拿到 —— 小程序真开着吗？hook 通吗？")
         return 1
-    if want and d.get("appid") and d["appid"] != want:
-        print("[qm] ⚠️ 当前开着的是 %s，不是目标 %s" % (d["appid"], want))
+
     out = {"appid": d.get("appid", ""), "token": d.get("token", ""),
            "storeId": d.get("storeId", ""), "storeName": d.get("storeName", ""),
            "openId": d.get("openId", ""), "mobile": d.get("mobile", ""),
-           "userId": d.get("userId", "")}
-    print("[qm] appid=%s storeId=%s(%s) token=%s… mobile=%s"
-          % (out["appid"], out["storeId"], out["storeName"],
-             (out["token"] or "")[:10], out["mobile"] or "(未绑定)"))
+           "userId": d.get("userId", ""), "biz": d.get("biz", ""),
+           "from": d.get("from", "")}
+    print("[qm] appid=%s storeId=%s%s token=%s… biz=%s source=%s"
+          % (out["appid"], out["storeId"],
+             ("(%s)" % out["storeName"]) if out["storeName"] else "",
+             (out["token"] or "")[:10], out["biz"] or "?", out["from"]))
     print("QM_JSON=" + json.dumps(out, ensure_ascii=False))
     return 0 if (out["token"] and out["storeId"]) else 1
 

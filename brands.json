@@ -237,6 +237,20 @@
       "enabled": false,
       "verified": false,
       "note": "**第四个后端：企迈（qmai / webapi.qmai.cn）** 的首个条目。链路：小程序逻辑层读 storage 的 `loginData`（wxqm.py）拿 `token`（= Qm-User-Token）与 `store.id`（= 商户号，这里是 49112）→ 之后每次请求带 `Qm-User-Token` + `store-id` 两个头 → POST /web/catering/integral/sign/detail 查状态 → /signIn 签到。**认证没有签名**，比吾享还简单。⚠️ 但 `enabled=false`：该商户**只配了签到规则、没发布活动** —— `detail` 明确回 `{\"code\":\"400042\",\"message\":\"商家未开启此功能\"}`，而 `rule` 却能返回完整奖励配置（1/7/19/30 天各 +1 积分）。**这是小程序自己也逃不掉的**：用 CDP 抓它自己发的那个请求（同 URL、同 body、带它自己的 token），响应一字不差；签到页数据 `activityId` 空、`isLoad=false`，界面上就是空的。同一个后端下的呷哺呷哺（storeId 214176）也一样。所以「签不了」既不是环境、也不是登录、更不是自动化的问题，**是商户没开这个功能**。哪天商户开了，把 enabled 改 true 即可。"
+    },
+    {
+      "slug": "xiabuxiabu",
+      "name": "呷哺呷哺",
+      "appid": "wx6822e696198e2763",
+      "keyword": "呷哺呷哺",
+      "miniapp": "呷哺呷哺",
+      "engine": "qmai",
+      "qm_biz": "mealmate",
+      "qm_activity": "1212715500988841985",
+      "type": "sign",
+      "enabled": true,
+      "verified": true,
+      "note": "**企迈系·已跑通真机签到**（2026-09-26）。商户号 storeId=214176，签到活动 `qm_activity`=1212715500988841985（商户级固定，随「我的 →每日签到」入口由服务端下发，包里没有，所以要配在这里）。\n\n链路（两个接口、参数只有 `{activityId, storeId}`）：`POST /web/mealmate-apiserver/cmk-center/sign/userSignStatistics` 查今天签没签 → `POST .../takePartInSign` 签到。\n\n⚠️ 与李先生的**关键差别**：呷哺**不把登录态持久化到 storage**（`loginData` 是空串），token 只活在内存里 —— 所以 wxqm.py 对它走**第二条路：抓真实请求头**（开 CDP Network domain → 重载页面 → 从它自己的请求头读 `Qm-User-Token` + `store-id`，顺带读到 `Qm-From-Type=mealmate`）。\n\n⚠️ **首次需要人工过一次手机号授权**：未登录时签到页的 `onClickCheckin()` 会先弹授权、根本不发请求；接口层回 `100005 用户未登录`。授权后会话在内存里，重启小程序就没了。\n\n⚠️ 别被 `integral/sign/*` 骗了：包里另有一套积分商城的签到，它对同一商户的 `detail` 回 `400042 商家未开启此功能` —— **那是误导性错误码**，我据此连着下了三次「商户没开活动」的错误结论。真正的是 `cmk-center/sign/*`。"
     }
   ]
 }

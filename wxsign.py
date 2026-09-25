@@ -1234,62 +1234,74 @@ def qm_ident(brand, wait=12):
 def do_sign_qm(brand, env):
     """企迈后端签到。返回 (是否成功, 业务码, 说明)。
 
-    ⚠️ 现实提醒：企迈的签到是**商户级开关**，后台「配了规则」不等于「发布了活动」。
-        实测两家（呷哺呷哺 214176、李先生牛肉面大王 49112）都只配了规则、
-        活动没开 —— `detail` 报 `400042 商家未开启此功能`，**小程序自己也签不了**
-        （界面上签到页是空的：activityId 空、isLoad=false）。这跟环境/登录/自动化都无关。
+    ✅ 2026-09-26 **真机跑通**（呷哺呷哺：界面弹「签到成功！恭喜获得 1 哺币」，
+       积分 0→1、连签 0→1 天），随后三个接口用 curl 复核全部返回真实数据。
+
+    链路（参数就两个：`activityId` + `storeId`）：
+        POST /web/<biz>/cmk-center/sign/userSignStatistics  先看今天签没签
+        POST /web/<biz>/cmk-center/sign/takePartInSign      签到
+
+    ⚠️ 三个坑 —— 每一个都让我错判过一轮，记下来：
+      1. **`cmk-center/sign/*` 才是「签到有礼」活动**。包里另有一套 `integral/sign/*`
+         （积分商城那套），它对同一商户的 `detail` 会回 `400042 商家未开启此功能` ——
+         **那是个误导性的错误码，别拿它当判据**。我先后用错页面（`subpackages/sign-in`）
+         和错接口（`integral/sign`），连着下了三次「这商户没开活动」的错误结论。
+      2. **必须已登录（绑手机号）**。未登录时签到页的 `onClickCheckin()` 会先
+         `popAuthorization()` 弹授权、**根本不发请求**；接口层回 `100005 用户未登录`。
+         所以本后端**首次需要人工过一次手机号授权**（之后会话在内存里，重启小程序就没了）。
+      3. **`activityId` 是商户级活动的固定 ID**（随签到入口由服务端下发，包里没有），
+         写进 brands.json 的 `qm_activity`。取法：进「我的」→「每日签到」，
+         读签到页 data 的 `activityId`，或抓 `userSignStatistics` 的请求体。
     """
-    biz = QM_BIZ.get(brand.get("qm_biz") or "catering", "catering")
-    pre = "/web/" + biz
+    activity = env.get("QM_ACTIVITY") or brand.get("qm_activity") or ""
+    if not activity:
+        return False, "NOACTID", "缺 qm_activity（商户级签到活动 ID，取法见本函数 docstring）"
 
     ident = qm_ident(brand)
     if not ident:
         return False, "NOIDENT", "拿不到企迈登录态（小程序开着吗？hook 通吗？）"
     token = ident.get("token") or ""
     store_id = str(ident.get("storeId") or "")
-    appid = brand.get("appid") or ident.get("appid") or ""
     if not (token and store_id):
         return False, "NOIDENT", "登录态不完整：token=%s storeId=%s" % (bool(token), store_id or "(空)")
+    # 业务线优先用**抓包读到的** `Qm-From-Type`（最准，不用配）；其次 brands.json 的 qm_biz。
+    biz_key = ident.get("biz") or brand.get("qm_biz") or "catering"
+    biz = QM_BIZ.get(biz_key, biz_key)
+    # ⚠️ `cmk-center` 是**不带业务线前缀**的一级路径 —— 实测带 `/mealmate-apiserver`
+    #    会回 `43004 http状态码异常`（"路径不存在"的伪装）。业务线只体现在
+    #    `Qm-From-Type` 请求头里，不进 URL。
+    pre = "/web"
+    body = {"activityId": str(activity), "storeId": store_id}
 
     def _say(r):
         return "%s（code=%s）" % (str(r.get("message", ""))[:120], r.get("code"))
 
-    def _call(action, extra=None):
-        body = {"appid": appid}
-        if extra:
-            body.update(extra)
-        return qm_request(pre + "/integral/sign/" + action, body, token, store_id, biz)
+    # ① 查统计：既判断今天签没签，也顺手验证会话是否有效
+    st = qm_request(pre + "/cmk-center/sign/userSignStatistics", body, token, store_id, biz)
+    if st.get("_transport"):
+        return False, "NETFAIL", "网络失败：%s" % str(st.get("msg"))[:120]
+    sc = str(st.get("code"))
+    if sc in ("100005", "10008", "9001"):
+        return False, "NOTOKEN", "企迈会话失效/未登录（%s）→ 需在小程序里过一次手机号授权" % sc
 
-    # ① 查签到详情 —— 这是唯一的权威判据（商家没开活动时它明确报 400042）
-    d = _call("detail")
-    if d.get("_transport"):
-        return False, "NETFAIL", "网络失败：%s" % str(d.get("msg"))[:120]
-    code = str(d.get("code"))
-    if code in ("10008", "9001"):
-        return False, "NOTOKEN", "企迈会话失效（%s）→ 重开小程序刷新登录态" % code
-    if code == "400042":
-        return False, "NOACT", "该商户未开启签到活动（400042）"
-    if not d.get("status"):
-        return False, code, "查签到详情失败：%s" % _say(d)
+    sd = st.get("data") or {}
+    if sd.get("todaySign") or sd.get("signToday") or sd.get("todaySigned"):
+        return True, "415", "今天已经签到过了（连签 %s 天）" % (
+            sd.get("continueSignDays") or sd.get("continuousDays") or "?")
 
-    info = d.get("data") or {}
-    if info.get("signed_today") or info.get("signInToday") or str(info.get("is_signIn")) == "1":
-        return True, "415", "今天已经签到过了（连续 %s 天）" % (
-            info.get("keep_days") or info.get("signInDays") or "?")
-
-    # ② 签到（activityId 由 detail 下发；为空时服务端会回 20013）
-    r = _call("signIn", {"activityId": info.get("activityId") or ""})
+    # ② 签到
+    r = qm_request(pre + "/cmk-center/sign/takePartInSign", body, token, store_id, biz)
     if r.get("_transport"):
         return False, "NETFAIL", "网络失败：%s" % str(r.get("msg"))[:120]
     rc = str(r.get("code"))
-    if rc == "20013":
-        return False, "QMNOID", "服务端没下发 activityId（20013）—— 与未开启活动同源"
-    if r.get("status"):
-        dd = r.get("data")
-        return True, "200", "签到成功%s" % (
-            ("：" + json.dumps(dd, ensure_ascii=False)[:150]) if dd else "")
+    if rc in ("100005", "10008", "9001"):
+        return False, "NOTOKEN", "企迈会话失效/未登录（%s）" % rc
     msg = str(r.get("message", ""))
-    if "已" in msg or "重复" in msg:      # 幂等：重跑时它可能已经签过了
+    if r.get("status"):
+        dd = r.get("data") or {}
+        got = dd.get("rewardName") or dd.get("points") or dd.get("rewardValue")
+        return True, "200", "签到成功%s" % (("：%s" % got) if got else "")
+    if "已签到" in msg or "已经签到" in msg:
         return True, "415", msg[:120]
     return False, rc, _say(r)
 

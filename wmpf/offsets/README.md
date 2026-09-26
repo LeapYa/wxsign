@@ -62,12 +62,13 @@ python verify_batch.py <放二进制的目录>    # 批量跑 + 自动判卷
 > `judge.py` 的第二个参数是上游配置，从 hook 容器里取：
 > `docker cp woc-hook:/opt/wmpf/frida/config/linux/addresses.<版本>.json upstream.<版本>.json`
 
-本目录里的 `addresses.*.recovered.json` 就是两次的产出，可以直接对照。
+本目录里**只有我们自己算出来的那两份**（`addresses.11459` / `addresses.14664`.recovered.json），可以直接对照；
+上游自带的三版（14910 / 14978 / 25665）**不放进来** —— 那是上游 WMPFDebugger 的文件，版权不归本项目。
 
 ## 五条恢复规则
 
-规则与上游 `frida/autodetect/win32.js` 的自动化实现对齐（把 frida 换成离线 ELF 解析），
-并补上了 Linux 两份二进制实测出来的差异。
+规则与上游 `frida/autodetect/win32.js` 采用的判据一致（找字符串锚点 + 反查引用），
+实现路径不同：这里把 frida 换成离线 ELF 解析，并补上了 Linux 两份二进制实测出来的差异。
 
 | 字段 | 怎么找 |
 |---|---|

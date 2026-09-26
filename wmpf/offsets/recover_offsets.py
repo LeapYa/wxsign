@@ -1,7 +1,7 @@
 """从 WeChatAppEx 二进制自动恢复 WMPF hook 偏移配置（离线静态分析，不需要 IDA / 不需要运行微信）。
 
-锚点规则对齐上游 WMPFDebugger 的自动化实现（frida/autodetect/win32.js），只是把
-frida/IDA 换成离线 ELF 解析，并补上 Linux 两份二进制实测出来的差异。
+锚点规则与上游 WMPFDebugger 的自动化实现采用同一套判据（同为「找字符串锚点 + 反查引用」），
+但实现路径不同：这里把 frida / IDA 换成离线 ELF 解析，并补上 Linux 两份二进制实测出来的差异。
 
 已在两个版本上机器判卷通过：
   · WMPF 2.5.6.25665（微信 Linux 4.1.13.23 / 4.1.13.9）——5 个字段与上游 addresses.25665.json 全一致
@@ -33,7 +33,8 @@ import numpy as np
 SCENE_MAGIC = 0x44D                    # 1101：官方文档提到的场景判定值
 ARG_REGS = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
 
-# 锚点字符串（照搬上游 buildStringTargets）
+# 锚点字符串。选这些串是因为它们都是 WeChatAppEx 自身编译进去的稳定字面量
+# （类名 / 函数签名 / 日志前缀），跨版本在场且唯一 —— 用它反向定位引用代码最省事。
 A_LOAD_FILE = b"applet_index_container.cc"
 A_LOAD_NAME = b"AppletIndexContainer::OnLoadStart(bool"
 A_LOAD_PERF = b"[Perf] AppletIndexContainer::OnLoadStart"      # 旧版专有
@@ -447,7 +448,7 @@ def main():
     elif a.cdp_rule == "callee":
         rule = "callee"
     else:
-        # 上游的划分：新版布局里 OnLoadStart 的 RTTI 签名串在场；旧版不在场。
+        # 判据：新版布局里 OnLoadStart 的 RTTI 签名串在场；旧版不在场。
         rule = "self" if xr.get(A_LOAD_NAME) else "callee"
         print(f"  auto 判定：`AppletIndexContainer::OnLoadStart(bool` "
               f"{'在场 → 新版' if xr.get(A_LOAD_NAME) else '不在场 → 旧版'}，取规则 {rule}")

@@ -184,8 +184,16 @@ def pick_action(d, mode="sign", clicked=None, allow_fallback=None):
     return cand[0]
 
 
-def evaluate(ws, expr, ctx=0, timeout=5.0):
-    """执行一段 JS，返回结果（失败/超时返回 None）。"""
+def evaluate(ws, expr, ctx=0, timeout=8.0):
+    """执行一段 JS，返回结果（失败/超时返回 None）。
+
+    ⚠️ **必须跳过 error 响应**（2026-09-26 修正，这是本模块一度整体失效的真因）：
+    WMPFDebugger 代理会把每条请求回**两次** —— 一条
+    `{"id":N,"error":{"code":-32600,"message":"Duplicate \\`id\\` in protocol request"}}`、
+    一条正常的 `{"id":N,"result":…}`。原实现「id 匹配就返回」，于是经常撞上 error 那条，
+    `result` 取不到 → 一律返回 None，整个模块报 `DOM=不可用`。
+    逻辑层的轻量调用恰好常拿到 result 那条，所以那边一直没暴露。
+    """
     mid = (int(time.time() * 1000) % 100000) + 7
     p = {"expression": expr, "returnByValue": True}
     if ctx:
@@ -199,36 +207,123 @@ def evaluate(ws, expr, ctx=0, timeout=5.0):
             return None
         except Exception:
             return None
-        if m.get("id") == mid:
-            return (((m.get("result") or {}).get("result")) or {}).get("value")
+        if m.get("id") != mid:
+            continue
+        if "error" in m:
+            continue                      # ⚠️ 代理重复回的那条 error，继续等真正的 result
+        return (((m.get("result") or {}).get("result")) or {}).get("value")
     return None
 
 
+def find_ctx_with(ws, selectors, limit=80, timeout=12.0, visible=False):
+    """找**哪个渲染层 ctx 里出现了这些选择器**。返回 {ctx: 命中数}（命中数 > 0 才有）。
+
+    ⭐ 为什么必须有这个函数（2026-09-26 的关键教训）：
+
+    同一个逻辑层页面**可以有多个渲染面**。实测呷哺签到页 + 授权层弹出时：
+        ctx=6  302 节点 / 161 个 wx-* 标签 / **没有授权层**  ← 底层页面（「我的」页）
+        ctx=9  221 节点 / 152 个 wx-* 标签 / **有授权层**    ← `#authorization` 在这儿
+    两者 url 一样、title 都是 `Page-Frame`。
+
+    `find_dom_ctx` 是「谁元素多选谁」，于是**必然选到 ctx=6**，再去里面找授权层当然找不到 ——
+    我一度因此断定「授权层不在渲染层」，是错的。**授权层一直是普通 view 组件**，
+    源码里就是 `onAuthorization(){this.selectComponent("#authorization").show()}`
+    （`pluginMarketing/components/authorization-4e03c673`）。
+
+    所以正确姿势不是「先挑一个 ctx 再在里面找」，而是**反过来：先说要找什么，再看哪个 ctx 有**。
+    `selectors` 传 CSS 选择器列表（如 `["#authorization"]`）。
+
+    ⚠️ `visible=True` 时只数**当前真的可见**的（矩形非 0 且中心在视口内）——
+    很多组件 hide 之后**节点仍留在 DOM 里**，只按「选择器在不在」判断会误以为它还开着。
+    实测：呷哺授权层关闭后 `#authorization` 一直在树上，只有矩形会塌成 0。
+    """
+    if visible:
+        js = ("(function(){try{var n=0;var s=%s;"
+              "for(var i=0;i<s.length;i++){var ns=document.querySelectorAll(s[i]);"
+              "for(var j=0;j<ns.length;j++){var r=ns[j].getBoundingClientRect();"
+              "if(r.width<6||r.height<6)continue;"
+              "var cx=r.x+r.width/2,cy=r.y+r.height/2;"
+              "if(cx<0||cx>window.innerWidth||cy<0||cy>window.innerHeight)continue;"
+              "n++;}}}return n}catch(e){return -1}})()"
+              % json.dumps(list(selectors), ensure_ascii=False))
+    else:
+        js = ("(function(){try{var n=0;var s=%s;"
+              "for(var i=0;i<s.length;i++){try{n+=document.querySelectorAll(s[i]).length}"
+              "catch(e){}}return n}catch(e){return -1}})()"
+              % json.dumps(list(selectors), ensure_ascii=False))
+    return _broadcast(ws, js, limit, timeout, kind="int")
+
+
+def _broadcast(ws, js, limit, timeout, kind="int"):
+    """把一段 JS 盲撒给 ctx 1..limit，返回 {ctx: 值}（值非空/非 -1 才有）。
+
+    ⚠️ **必须「批量发、统一收」**（2026-09-26 修正）：原实现是「逐个 ctx 发一条、立刻等 2 秒」，
+    在手机竖版窗口形态下**一条都收不到**（响应比 2 秒慢），于是整模块报「DOM=不可用」——
+    而实际上渲染层好好地在 ctx 6/8/9/12（探针实测 wxTags=119/140/120/52）。
+    改成一口气发完再统一收（和 `survey/qm_eval.js` 同一套路）。
+    ```
+    """
+    base = 5000
+    for c in range(1, limit + 1):
+        ws.send({"id": base + c, "method": "Runtime.evaluate",
+                 "params": {"expression": js, "returnByValue": True, "contextId": c}})
+    out = {}
+    t0 = time.time()
+    # 收集窗口 12 秒：这轮要一口气收 80 条响应，收不完的话**残留响应会拖慢后面每一次读取**
+    # （evaluate 得先把它们读掉才能等到自己那条）—— 实测 6 秒不够，会连锁失败。
+    while time.time() - t0 < timeout:
+        try:
+            m = json.loads(ws.recv_msg())
+        except Exception:
+            break
+        mid = m.get("id")
+        if not (isinstance(mid, int) and base < mid <= base + limit):
+            continue
+        v = ((m.get("result") or {}).get("result") or {}).get("value")
+        if v is None:
+            continue
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            out[mid - base] = n
+    return out
+
+
 def find_dom_ctx(ws, limit=80):
-    """找**小程序页面**的渲染层 contextId。
+    """找**小程序页面**的渲染层 contextId（默认那个 —— 一般就是底层页面）。
 
     ⚠️ 不能只挑「元素最多的」：实测微信自己的搜索页/面板也是个 WebView，元素反而更多
     （285 个 vs 来菜页面的 62 个），会把真正的小程序页面盖过去 —— 踩过。
     小程序页面的特征是它渲染成自定义标签 `wx-view / wx-button / wx-text / wx-image`，
     据此判断；顺便这条也能用来确认「当前在小程序里」。
+
+    ⚠️ 多个渲染面时它只会返回**元素最多的那个**（实测是底层页面，不是弹层）。
+    要找弹层/覆盖层请用 `find_ctx_with()` —— 见那个函数的注释。
     """
     cand_js = ("(function(){try{return document.querySelectorAll("
                "'wx-view,wx-button,wx-text,wx-image,wx-scroll-view').length}"
                "catch(e){return -1}})()")
-    best, best_n = 0, 0
-    for c in range(1, limit + 1):
-        try:
-            n = int(evaluate(ws, cand_js, ctx=c, timeout=2.0))
-        except (TypeError, ValueError):
-            continue
-        if n > best_n:
-            best, best_n = c, n
-    return best
+    hits = _broadcast(ws, cand_js, limit, 12.0)
+
+    # ⭐ 最终判据是「**能不能真扫出内容**」，不是「自定义标签多不多」。
+    #    实测（2026-09-26 云微、手机竖版窗口）：ctx 6 的自定义标签最多（140 个）却扫不出内容，
+    #    真正可用的是 ctx 12（119 个）。只按数量挑就会稳定选错，整模块报「DOM=读不到内容」。
+    for c, _n in sorted(hits.items(), key=lambda kv: -kv[1]):
+        if scan(ws, c):
+            return c
+    return 0
 
 
 def scan(ws, ctx):
-    """返回 {"vw","vh","items":[...]}；读不到返回 None。"""
-    v = evaluate(ws, SCAN_JS, ctx=ctx, timeout=6.0)
+    """返回 {"vw","vh","items":[...]}；读不到返回 None。
+
+    超时给到 30 秒：SCAN_JS 要遍历整棵渲染树逐个 `getBoundingClientRect()`，本身就重；
+    而且这个等待窗口**必须大于连接的 socket 超时**（`open_dom` 给的是 25 秒），
+    否则慢响应还没到、循环就先因为「等够久了」退出去，照样拿到 None。
+    """
+    v = evaluate(ws, SCAN_JS, ctx=ctx, timeout=30.0)
     if not v or str(v).startswith("ERR"):
         return None
     try:
@@ -249,15 +344,119 @@ def find(d, keywords):
     return hits
 
 
+# ⭐ 按**结构**取元素几何 —— 不猜颜色、不假设只有一层渲染面。
+#
+# 判据是「这个文案/这些选择器所在的**最小盒子**」，因此：
+#   · 与主题色无关（呷哺橙 / 李先生蓝 / 将来任何商户色，同一套代码通吃）
+#   · 与窗口形态无关（坐标系是页面自己的 CSS 像素，`wxreg.click` 再换算成屏幕）
+#   · 不受「多个渲染面」影响（由调用方先用 find_ctx_with 挑对 ctx）
+#
+# why 不用 `querySelector('#authorization')` 直接拿根节点矩形：实测组件根节点
+# 报的是 `w:0 h:0, x:0 y:832`（组件根没有自己的盒子，真盒子在子节点上），
+# 所以必须**往下找最小的、真有尺寸的、文案匹配的叶子**。
+RECT_JS = r"""(function(){
+  var WANT = %s;          // 要匹配的文案片段
+  var SEL  = %s;          // 限定在这些选择器之下找（空 = 全文档）
+  try{
+    var root = document;
+    if (SEL && SEL.length) root = document.querySelector(SEL) || document;
+    var all = [root];
+    var nodes = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (var i = 0; i < nodes.length; i++) all.push(nodes[i]);
+    var out = [];
+    for (var j = 0; j < all.length; j++) {
+      var e = all[j];
+      var t = (e.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!t) continue;
+      var ok = false;
+      for (var k = 0; k < WANT.length; k++) {
+        if (t.indexOf(WANT[k]) >= 0) { ok = true; break; }
+      }
+      if (!ok) continue;
+      var r = e.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;      // 丢掉组件根那种零尺寸壳子
+      // ⚠️ 还要排除「正在播离场动画」的节点 —— 它们的矩形会塌成 0 或移到视口外，
+      //    但节点**还在 DOM 里**。实测踩过：授权层关闭动画期间 `暂时跳过` 还在树上，
+      //    拿它的假坐标去点会点到 (6,590) 这种离谱位置。判据：中心必须在视口内。
+      var cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+      if (cx < 0 || cx > window.innerWidth || cy < 0 || cy > window.innerHeight) continue;
+      out.push({tag: e.tagName, id: e.id || '', cls: String(e.className || '').slice(0, 60),
+                text: t.slice(0, 40),
+                cx: Math.round(cx), cy: Math.round(cy),
+                w: Math.round(r.width), h: Math.round(r.height),
+                area: Math.round(r.width * r.height)});
+    }
+    return JSON.stringify({vw: window.innerWidth, vh: window.innerHeight, items: out});
+  }catch(e){ return 'ERR:' + (e.message || e); }
+})()"""
+
+
+def rect_of(ws, ctx, want, selector="", timeout=20.0):
+    """在 `ctx` 里按**文案**取元素矩形，返回按面积升序的列表。
+
+    `want` = 文案片段列表（如 `("手机号一键登录","一键登录")`）；
+    `selector` = 限定范围（如 `"#authorization"`，空 = 整页）。
+    返回的 `items` 与 `scan()` 同构（`cx/cy/w/h/area/text/tag/cls`），可直接喂 `find` 之外的排序逻辑。
+
+    失败返回 None。**这是替代「按颜色找按钮」的正式手段。**
+    """
+    v = evaluate(ws, RECT_JS % (json.dumps(list(want), ensure_ascii=False),
+                                json.dumps(selector)), ctx=ctx, timeout=timeout)
+    if not v or str(v).startswith("ERR"):
+        return None
+    try:
+        d = json.loads(v)
+    except ValueError:
+        return None
+    d["items"].sort(key=lambda x: x["area"])
+    return d
+
+
+def clickable(ws, ctx, selector, timeout=20.0):
+    """取某个选择器下**所有有尺寸的元素**的几何（不给文案也行）。
+
+    用来找「没有文案的可点元素」—— 最典型的是**授权协议的勾选框**（它就是个圆圈，
+    里面没有文字）。之前只能靠「它旁边那行小字的左边界往左推 CHECK_GAP 像素」，
+    本质还是在猜偏移量；有了这个函数就能**直接按选择器定位那个圆圈本身**。
+    """
+    js = ("(function(){try{var ns=document.querySelectorAll(%s);var out=[];"
+          "for(var i=0;i<ns.length;i++){var e=ns[i];var r=e.getBoundingClientRect();"
+          "if(r.width<6||r.height<6)continue;"
+          "var cx=r.x+r.width/2,cy=r.y+r.height/2;"
+          "if(cx<0||cx>window.innerWidth||cy<0||cy>window.innerHeight)continue;"   # 排除离场动画中的节点
+          "out.push({tag:e.tagName,id:e.id||'',cls:String(e.className||'').slice(0,60),"
+          "cx:Math.round(cx),cy:Math.round(cy),"
+          "w:Math.round(r.width),h:Math.round(r.height),"
+          "area:Math.round(r.width*r.height)});}"
+          "return JSON.stringify({vw:window.innerWidth,vh:window.innerHeight,items:out});"
+          "}catch(e){return 'ERR:'+(e.message||e)}})()" % json.dumps(selector))
+    v = evaluate(ws, js, ctx=ctx, timeout=timeout)
+    if not v or str(v).startswith("ERR"):
+        return None
+    try:
+        d = json.loads(v)
+    except ValueError:
+        return None
+    d["items"].sort(key=lambda x: x["area"])
+    return d
+
+
 def page_text(d):
     """当前页面的全部可见文字（用来判断"我在哪个页面"）。"""
     return " ".join(it["text"] for it in (d or {}).get("items", []))
 
 
 def open_dom(limit=80):
-    """连 CDP 并找到渲染层 context。返回 (ws, ctx)；失败返回 (None, 0)。"""
+    """连 CDP 并找到渲染层 context。返回 (ws, ctx)；失败返回 (None, 0)。
+
+    ⚠️ socket 超时给到 25 秒（`wxcdp.WS` 默认只有 8 秒）—— **这是本模块一度整体失效的真因**：
+    渲染层的 `Runtime.evaluate` 响应可能超过 8 秒（SCAN_JS 要遍历整棵渲染树），
+    8 秒一到 `recv_msg()` 抛 socket.timeout，`evaluate` 就把它当「读不到」返回 None，
+    于是 `find_dom_ctx` 里所有候选都判失败 → 整个模块报 `DOM=不可用/读不到内容`。
+    而逻辑层的轻量调用（读 appId、调页面方法）很快，所以那边一直没暴露这个问题。
+    """
     try:
-        ws = wxcdp.WS()
+        ws = wxcdp.WS(timeout=25)
     except Exception as e:
         print("[dom] 连不上 CDP：%s" % e)
         return None, 0

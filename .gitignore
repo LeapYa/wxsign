@@ -4,3 +4,19 @@ brands/*.env
 state/
 *.log
 __pycache__/
+
+# 算偏移时的临时产出，以及从上游 hook 容器里 docker cp 出来的配置副本
+# （后者是上游 WMPFDebugger 的文件，不能进本仓库 —— 见 README 第九节）
+upstream.*.json
+addresses.14910*.json
+addresses.14978*.json
+addresses.25665*.json
+
+# 排查用的截图（一次性产物，别进仓库）
+shots/
+
+# survey/ 是一次性调查现场（截图、解包产物、临时探针），整体忽略；
+# 只留一个真正有长期价值的诊断工具 —— 见下面的反向规则。
+survey/*
+!survey/diagnostics_auth_ctx.py
+!survey/dump_auth_tree.py

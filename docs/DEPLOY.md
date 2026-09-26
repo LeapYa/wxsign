@@ -145,8 +145,12 @@ bash wmpf/check_wmpf.sh $WX
 | 4.0.0.30 | 2.1.4.**11459** | 本仓库自算 | ✅ 真机跑通（另需上游那两条补丁，见 [第 4.1 节](#41-必须打的两个补丁)） |
 | 4.1.0.13 | 2.2.4.**14664** | 本仓库自算 | ❌ 偏移算得出，但**微信服务端拒绝登录**（提示「版本过低」） |
 
-**上游 linux 配置只有 3 份**（14910 / 14978 / 25665），其余是我们自己算出来的。
-这 5 份的产出都留在 [`wmpf/offsets/`](../wmpf/offsets/)（`addresses.*.recovered.json`），可直接对照。
+**「上游自带」三份不用管** —— hook 装好就已经在 `frida/config/linux/` 里了。
+**「本仓库自算」两份**的产出留在 [`wmpf/offsets/`](../wmpf/offsets/)
+（`addresses.11459.recovered.json` / `addresses.14664.recovered.json`），可直接对照。
+
+> 上游自带的那三份**没有**放进本仓库 —— 它们是上游 WMPFDebugger 的文件副本，
+> 版权不归本项目（见 [README 第九节](../README.md#关于授权源码公开但不是开源)）。要用就装上游。
 
 #### 微信升级了、上游还没适配 —— 四条路
 
@@ -378,6 +382,60 @@ docker exec woc-hook tail -5 /tmp/wmpf.log     # 期望看到 [frida] script loa
 > 以后要重启它（换配置 / 微信版本后）：`bash wmpf/restart_hook.sh`。
 > ⚠️ 它**只在启动时 attach 一次** —— 不重启的话，新拉起的小程序实例不会被挂上，
 > 表现为 CDP 一个 context 都拿不到（`ctx=0`）。
+
+### 4.2 企迈系的「首次手机号授权」（每个品牌跑一次）
+
+**只对 `engine=qmai` 的品牌需要**（`brands.json` 里 `呷哺呷哺`、`李先生牛肉面大王` 等；
+吾享 / 易东 / 微租林都不用 —— 它们的接口压根没有授权弹窗）。
+
+企迈的签到要求**已绑手机号的会员**。绑定本身是**一次性**的（企迈服务端绑 openid、
+**永久有效**），所以只有**接入该品牌的第一次**要过一遍 —— 跑完这条命令，之后每天的
+定时任务就是全自动的，跟吾享系一样。
+
+```bash
+# 先确保只开目标小程序（渲染层拿不到 appId，多开时会读错页面 —— 见 README 第七节第 3 条）
+docker exec -e DISPLAY=:1 $WX python3 /tmp/wxclean.py          # 清残留
+docker cp wxsign/wxqm_auth.py $WX:/tmp/ && docker cp wxsign/wxdom.py $WX:/tmp/
+docker cp wxsign/wxreg.py     $WX:/tmp/ && docker cp wxsign/wxwin.py $WX:/tmp/
+docker cp wxsign/wxcdp.py     $WX:/tmp/ && docker cp wxsign/brands.json $WX:/tmp/
+
+# 跑（--title 填该品牌的小程序窗口标题，也就是 brands.json 里的 miniapp）
+docker exec -e DISPLAY=:1 $WX python3 /tmp/wxqm_auth.py --title 呷哺呷哺
+docker exec -e DISPLAY=:1 $WX python3 /tmp/wxqm_auth.py --title 呷哺呷哺 --dry-run  # 只弹授权层，不点
+```
+
+退出码：`0` = 走完（含「已授权过、微信静默跳过」）；`3` = 没找到授权层 / 页面不对；
+`4` = 连不上渲染层（hook 不通或小程序没开）。
+
+> 脚本**零硬编码坐标、零颜色判断**：授权层是小程序自己的**普通 view 组件**
+> （源码 `onAuthorization(){ this.selectComponent("#authorization").show() }`，
+> 渲染成 `<wx-std-authorization id="authorization">`），所以**按选择器 + 文案**定位即可
+> —— 勾选走 `.i-circle`，主按钮走「手机号一键登录」文案。
+> 只有微信**原生**「允许」框在小程序 DOM 之外、走像素（判据是「白卡里的**绿色横向主段**」），
+> 且**坐标系一律问页面自己**（CDP 的 `window.screenX/screenY`）——
+> 所以窗口改成**侧边栏 / 分栏**形态也照样成立（见 README 第五节）。
+>
+> ⚠️⚠️ **排查「找不到授权层」时先看这一条**：同一个页面会有**多个渲染面**，
+> 而 `wxdom` 默认挑「元素最多的那个」→ 会挑到**底层页面**，在里面永远找不到授权层。
+> 实测呷哺签到页弹授权层时，`ctx=6`（302 节点，底层页）与 `ctx=9`（221 节点，
+> 授权层在这）**url 和 title 完全一样**。
+> 诊断工具：`docker cp survey/diagnostics_auth_ctx.py survey/dump_auth_tree.py $WX:/tmp/`，
+> 然后 `docker exec -e DISPLAY=:1 $WX python3 /tmp/diagnostics_auth_ctx.py --tree`
+> —— 它会直接告诉你「授权层在哪个 ctx」并把结构倒出来。
+>
+> ⚠️ 另：授权层**关闭后节点仍留在 DOM 里**（只是矩形塌成 0），
+> 所以「选择器还在不在」不能当「授权层有没有弹出」的判据，要用可见性判断
+> （脚本内部用 `find_ctx_with(..., visible=True)`）。
+>
+> ⚠️ 别照搬上面的文件名清单就以为万事大吉 —— 引擎平时跑签到时是**自动投递** helper 的
+> （`ensure_helpers()`），但 `wxqm_auth.py` 是**你手动跑**的，所以要自己 `docker cp`。
+> 更省事的做法：`docker cp wxsign/. $WX:/tmp/`（整目录拷过去）。
+
+**没跑过的症状**：日常签到打印 `RESULT <slug> code=NOIDENT msg=企迈会话失效/未登录`。
+
+> 另有两个企迈专属退出码（都来自 `wxsign.py::do_sign_qm`）：
+> `NOACTID` = `brands.json` 里缺 `qm_activity`（商户级签到活动 ID，取法见该字段的注释）；
+> `NOIDENT` = 拿不到企迈登录态（小程序没开 / hook 不通）。
 
 ---
 

@@ -33,8 +33,51 @@ if grep -q "1183" "$F"; then
   exit 0
 fi
 cp "$F" /tmp/hook.js.orig
-sed -i 's/1256, 1260, 1302, 1308,/1256, 1260, 1302, 1308, 1183,/' "$F"
-sed -i 's|if (!sceneNumberArray.includes(miniappScenePtr.readInt())) {|if (!sceneNumberArray.includes(miniappScenePtr.readInt())) {\n        send("[hook] scene NOT in whitelist: " + miniappScenePtr.readInt());|' "$F"
+# ⚠️ 这里**故意不内嵌上游源码的任何字面量**（既避免分发上游代码片段，也让补丁对上游改写
+#    更鲁棒）：全部改成结构无关的插入式改写 ——
+#    ① 白名单：在 hook.js 里找到那个「场景号数组」的任何一处字面量，往里插一个 1183；
+#    ② 诊断日志：找到「读场景号 + 判断是否在白名单」的那个 includes 调用，在它前面插一行 send。
+#    两者都用锚点定位（数组形态 / includes 调用形态），不依赖具体数字与变量名。
+node -e '
+const fs = require("fs");
+// ⚠️ 取最后一个参数，别写 process.argv[1]：
+//    `node -e "…" path` 时 argv[1] 就是 path；但换成 `node script.js path` 时
+//    argv[1] 是脚本路径、argv[2] 才是 path —— 两种跑法共用一行更稳（实测踩过）。
+const p = process.argv[process.argv.length - 1];
+let s = fs.readFileSync(p, "utf8");
+const orig = s;
+
+// ① 场景号白名单：补一个 1183。
+//    定位任意「多个整数组成的数组字面量」（上游那串白名单就长这样），
+//    在其中最后一个元素后追加 1183。只改第一处匹配，避免误伤无关数组。
+//    ⚠️ 尾部那个 `,?` 不能省：上游数组带**尾逗号**（`[1145, 1256, …, 1308,]`），
+//    少了它整个正则匹配不上（实测踩过，补丁会静默不生效）。
+let patchedList = false;
+s = s.replace(/\[(\s*\d{3,5}\s*(?:,\s*\d{3,5}\s*)+,?)\]/, (m, inner) => {
+  if (inner.includes("1183")) { patchedList = true; return m; }
+  patchedList = true;
+  return "[" + inner.replace(/[\s,]*$/, "") + ", 1183]";
+});
+
+// ② 诊断日志：在「判断场景号是否在白名单」那个 includes 调用前插一行 send。
+//    锚点是调用形态本身（任意数组变量名 / 任意读出方式），不引用上游的变量名。
+let patchedLog = false;
+s = s.replace(
+  /([ \t]*)(if\s*\(\s*!\s*([A-Za-z_$][\w$]*)\s*\.\s*includes\s*\()/,
+  (m, indent, head, arr) => {
+    patchedLog = true;
+    return indent + "send(\"[hook] scene NOT in whitelist: \" + " + arr + ".readInt());\n" + indent + head;
+  }
+);
+
+if (!patchedList || !patchedLog) {
+  console.log("[patch1] 失败：锚点没找到（清单=" + patchedList + " 日志=" + patchedLog + "），已回滚");
+  fs.writeFileSync(p, orig, "utf8");
+  process.exit(1);
+}
+fs.writeFileSync(p, s, "utf8");
+console.log("[patch1] hook.js 已打补丁：白名单 +1183，并加上了场景号诊断日志");
+' "$F"
 if grep -q "1183" "$F"; then
   echo "[patch1] hook.js 已打补丁：白名单 +1183，并加上了场景号诊断日志（原文件备份 /tmp/hook.js.orig）"
 else

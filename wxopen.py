@@ -440,6 +440,28 @@ def click_in(wid, fx, fy, wait=0.7, what=""):
     return click_expect(wid, X + int(Wd * fx), Y + int(Hd * fy), wait, what)
 
 
+def click_rail(wid, y_abs, wait=2.5, what="（侧边栏）"):
+    """点侧边栏按钮 —— `y_abs` 是**屏幕绝对 y**（`find_rail_buttons()` 返回的就是绝对值）。
+
+    x 仍按窗口宽取比例（侧边栏竖条贴着窗口左边），**y 直接用绝对值**。
+
+    ⚠️ 2026-09-27 治本：旧写法是
+        `click_in(main, R_RAIL_X, y / float(H))`   # H = **屏幕**高
+    把**已经是绝对的 y** 又除以**屏幕高**当比例，而 `click_in` 内部再乘**窗口高** ——
+    等于做了两次换算。窗口 ≈ 全屏（1276x1024）时两者数值接近、蒙对了；
+    窗口变 759x674 后：114 → `674 × (114/1024)` = **75**，正落在**微信头像**上
+    （头像占 y 42..82）。实测现象是「先点击我的微信头像两遍」（第一遍悬停出
+    资料卡挡住后续操作）就是这个。侧边栏第 2 个按钮才是「微信」标签，
+    点错到头像上就永远切不回去 → 后面所有坐标全歪。
+    """
+    g = geo(wid)
+    try:
+        X, Wd = int(g["X"]), int(g["WIDTH"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return click_expect(wid, X + int(Wd * R_RAIL_X), y_abs, wait, what)
+
+
 # ───────────────────── 关闭窗口：先认身份，再取按钮位置 ─────────────────────
 
 def probe_close_glyph(buf, W, H, X, Y, Wd, Hd):
@@ -915,7 +937,7 @@ def open_panel(W, H):
             if not raise_window(main):
                 return None
             print("[reopen] 第%d轮·试第%d个侧边栏按钮 y=%d" % (attempt, n, y))
-            if not click_in(main, R_RAIL_X, y / float(H), 2.5, "（侧边栏·试小程序）"):
+            if not click_rail(main, y, 2.5, "（侧边栏·试小程序）"):
                 return None
             for _ in range(4):
                 time.sleep(1.2)
@@ -938,7 +960,7 @@ def open_panel(W, H):
 
 
 def panel_search_once(W, H, panel):
-    """在面板里：放大镜 → 输入 → **回车**（用户确认：回车就会进搜索页）→
+    """在面板里：放大镜 → 输入 → **回车**（实测：回车就会进搜索页）→
     搜索结果页里逐张卡片点，用窗口标题验证；**开错了就关掉继续试下一张**。
     成功返回 True。"""
     # ⭐ 每次搜索前先把面板 webview 重载一次 —— 这不是保守，是**必需**。
@@ -1096,7 +1118,7 @@ def ensure_chat_tab(W, H):
     i = 1 if looks_like_avatar(buf, W, H, buttons[0]) else 0
     y = buttons[i]
     print("[reopen] 点侧边栏第%d个按钮 y=%d（切回「微信」标签）" % (i + 1, y))
-    return click_in(main, R_RAIL_X, y / float(H), 2.5, "（侧边栏·微信）")
+    return click_rail(main, y, 2.5, "（侧边栏·微信）")
 
 
 def find_search_box(W, H):
@@ -1163,24 +1185,57 @@ def do_search(W, H, box, goto_net=False):
     png(W, H, "reopen_search_dropdown.png")
     if not goto_net:
         return True                     # 就停在下拉，交给调用方去点小程序条目
-    ny = find_netsearch_row(buf, W, H)
+    ny = find_netsearch_row(buf, W, H, box)
     if not ny:
         # 定位不到就**什么都不按**退出（老代码这里按 Down+回车，
         # 万一焦点还在聊天输入框，那一回车就是把关键词发出去）
         print("[reopen] 没定位到「搜索网络结果」行 → 不按回车，直接退出这条路径")
         return False
-    print("[reopen] 点「搜索网络结果」y=%d" % ny)
-    click(int(W * 0.12), ny, 4.0)
+    # ⚠️ 2026-09-27（实测定案）：进搜索页要点的是 **✳ 行下面第一条搜索建议**，
+    #    不是 ✳ 那一行字本身（点它没有任何反应，症状是「迟迟进不去搜索页」）。
+    sy = find_first_suggestion(buf, W, H, box, ny)
+    if not sy:
+        print("[reopen] ✳ 行（y=%d）下面没扫到搜索建议行 → 不点（宁可不做也不乱点）" % ny)
+        return False
+    print("[reopen] 点搜索建议第 1 行 y=%d（「搜索网络结果」那行字点了没反应，跳过）" % sy)
+    click(int(W * 0.12), sy, 4.0)
     png(W, H, "reopen_search_page.png")
     return True
 
 
-def find_netsearch_row(buf, W, H):
+def dropdown_logo_cols(W, box=None):
+    """搜索下拉里「图标列」的 x 范围（屏幕绝对坐标）—— 按**搜索框左缘**算。
+
+    ⚠️ 2026-09-27 治本：**不能再写死屏幕比例**。
+    旧值 `(int(W*0.054), int(W*0.086))` = 69..110 是**按屏幕宽 1280** 算的，
+    而下拉是**在主窗口里**、图标相对**搜索框左缘**定位。窗口一旦不是全屏，两者就对不上。
+
+    实测（主窗口 759x674、搜索框左缘 x=74、搜索框返回的点击 x=106）：
+      · ✳「搜索网络结果」图标      x≈88..99
+      · 小程序条目 logo            x≈108..130（宽 22px）
+      · 搜索建议行的蓝色放大镜      x≈108..120
+    全部落在 **左缘 +14 .. +56** 这个带里；旧列 69..110 只覆盖到左半截 ——
+    小程序 logo 只剩 3 个像素能命中 → band 判不过 → 判成「下拉里没有小程序条目」
+    → 退化去点「搜索网络结果」（实测现象正是「为什么一直点搜索网络结果」）。
+
+    `box` 是 `find_search_box()` 的返回值 `(点击x, 点击y, 框宽, 占位跨度)`，
+    它的 x 在框内偏左约 32px，所以左缘 = `box[0] - 32`（实测 106-32=74 ✓）。
+    """
+    if box:
+        left = box[0] - 32
+        return left + 12, left + 60
+    return int(W * 0.054), int(W * 0.086)     # 没有 box 时退回旧值（兼容旧调用）
+
+
+def find_netsearch_row(buf, W, H, box=None):
     """找搜索下拉里「搜索网络结果」那一行的 y。
     判据用**图标宽度**：它是窄的 ✳（只占 x≈89..98，约 9px），
     而小程序行的 logo 占 x≈76..98（约 22px）—— 颜色不可靠（logo 里也有浅粉像素），
-    宽度可靠。（🔍 建议行的放大镜是灰色，不参与。）"""
-    x0, x1 = int(W * 0.054), int(W * 0.086)      # 69..110
+    宽度可靠。（🔍 建议行的放大镜是灰色，不参与。）
+
+    ⚠️ 2026-09-27：扫描列改由 `dropdown_logo_cols()` 按搜索框左缘算（见其说明）。
+    """
+    x0, x1 = dropdown_logo_cols(W, box)
     rows = {}
     for y in range(int(H * 0.05), int(H * 0.65)):
         base = y * W * 3
@@ -1213,19 +1268,36 @@ def find_netsearch_row(buf, W, H):
     return None
 
 
-def find_dropdown_miniapps(buf, W, H):
+def find_dropdown_miniapps(buf, W, H, box=None):
     """找搜索下拉里**小程序条目**的 y 中心列表（按 y 升序）。
 
-    判据与 find_netsearch_row 同源、方向相反：两类行的图标都落在同一条竖列里，
-    但**小程序行的 logo 横向跨度约 22px**（x≈76..98，实测），
-    而「搜索网络结果」的 ✳ 只有约 9px —— 颜色不可靠（logo 里也有浅粉像素），**宽度可靠**。
+    ⚠️ 2026-09-27 重写（依据实测：主窗口 759x674 / 搜索框左缘 x=74）：
 
-    ⚠️ 这条判据只对「输入后的下拉」有效：一旦点了「搜索网络结果」跳进搜一搜结果页，
-    布局完全不同（logo 移到 x≈0.17W~0.24W，见 find_rows），别混用两套坐标。
+    ① **扫描列**：旧值写死 `69..110`（按屏幕宽算），而图标实际在 x≈88..130
+       （相对搜索框左缘 +14..+56）→ 旧列只覆盖左半截，小程序 logo（宽 22px）
+       只剩 3 个像素命中 → band 判不过 → **判成「下拉里没有小程序条目」** →
+       退化去点「搜索网络结果」。改成 `dropdown_logo_cols()` 按左缘算。
+
+    ② **y 范围**：只在「搜索网络结果」行的**上方**找。下拉布局是
+           [最近使用过的小程序]      ← 有匹配时才出现这一段
+             小程序条目…
+           ✳ 搜索网络结果
+             [搜索建议] 建议行…
+       建议行的放大镜与条目 logo **落在同一列、文字同样绿色**，靠 x/颜色分不开；
+       但位置关系稳定：**条目必在 ✳ 行之上**。
+       实测（输入未匹配到小程序的诊断那次）：✳ 在最上（y=87），下面全是建议行
+       （从 y=115 起）—— 不限制 y 就会把建议行当成小程序条目、点开一堆无关搜索页。
+
+    判据与 find_netsearch_row 同源、方向相反：两类行的图标都落在同一条竖列里，
+    但**小程序行的 logo 横向跨度约 22px**，而「搜索网络结果」的 ✳ 只有约 9px ——
+    颜色不可靠（logo 里也有浅粉像素），**宽度可靠**。
     """
-    x0, x1 = int(W * 0.054), int(W * 0.086)      # 69..110，与 find_netsearch_row 同一列
+    x0, x1 = dropdown_logo_cols(W, box)
+    y_top = (box[1] + 20) if box else int(H * 0.05)     # 搜索框下方
+    net_y = find_netsearch_row(buf, W, H, box)
+    y_bot = net_y if net_y else int(H * 0.65)           # ✳ 行之上
     rows = {}
-    for y in range(int(H * 0.05), int(H * 0.65)):
+    for y in range(max(0, y_top), max(y_top + 1, y_bot)):
         base = y * W * 3
         xs = []
         for x in range(x0, x1):
@@ -1255,6 +1327,62 @@ def find_dropdown_miniapps(buf, W, H):
         if hi - lo > thin:
             out.append((band[0] + band[-1]) // 2)
     return out
+
+
+def find_first_suggestion(buf, W, H, box=None, net_y=None):
+    """找搜索下拉里**搜索建议列表的第一条**的 y 中心 —— 进搜索页要点就是这一条。
+
+    ⚠️ 2026-09-27 实测定案（这条是布局知识，别再改回去）：
+      ① 点「✳ 搜索网络结果」那一行字**没有任何反应** —— 所以不能点它（旧实现就点的它，
+         症状是「迟迟进不去搜索页」，最后只能退化成面板路径）；
+      ② 「最近使用过的小程序」里的条目**也不该点** —— 同名号会点错（九村烤脑花
+         VIP / YX 就是），且那段有没有、排在哪都随历史变化；
+      ③ **点 ✳ 行下面的第一条搜索建议**才会真正执行搜索、进搜索页。
+         实测：点 y=121（✳ 行在 y=87）→ 立刻开出搜一搜窗口 1279x1023，
+         页面第一条就是目标小程序（带「小程序」标记）。
+
+    布局（实测，主窗口 759x674、搜索框左缘 x=74）：
+        [最近使用过的小程序]              ← 不点
+          小程序条目…
+        ✳ 搜索网络结果        y≈87        ← 不点（点了没反应）
+        建议行 1              y≈121       ← ✅ 点这条
+        建议行 2              y≈154
+        建议行 3              y≈187
+    """
+    if net_y is None:
+        net_y = find_netsearch_row(buf, W, H, box)
+    if net_y is None:
+        return None
+    x0, x1 = dropdown_logo_cols(W, box)
+    y0 = net_y + 10                                    # 跳过 ✳ 行自身
+    y1 = min(int(H * 0.85), net_y + 150)               # 只看紧邻的几行
+    rows = {}
+    for y in range(y0, y1):
+        base = y * W * 3
+        xs = []
+        for x in range(x0, x1):
+            i = base + x * 3
+            r, g, b = buf[i], buf[i + 1], buf[i + 2]
+            if max(r, g, b) - min(r, g, b) > 40:       # 彩色（建议行的放大镜是蓝的、文字是绿的）
+                xs.append(x)
+        if len(xs) >= 3:
+            rows[y] = (min(xs), max(xs))
+    if not rows:
+        return None
+    ys = sorted(rows)
+    bands, cur = [], [ys[0]]
+    for y in ys[1:]:
+        if y - cur[-1] <= 8:
+            cur.append(y)
+        else:
+            bands.append(cur); cur = [y]
+    bands.append(cur)
+    for b in bands:
+        # 一行约 13~15px 高（实测 117..129），逐行扫描下应有 ≥8 个采样点；
+        # ⚠️ 别用 step=2 + 更低的阈值：行矮一点就会漏（自己静态自测踩过）。
+        if len(b) >= 8:
+            return (b[0] + b[-1]) // 2
+    return None
 
 
 def find_rows(buf, W, H):
@@ -1360,16 +1488,21 @@ def close_anon_modal(W, H, verbose=True):
 
 
 def open_via_search(W, H):
-    """主路径（面板）失败后的替代：主窗口顶部全局搜索 → 逐行点结果。
+    """⛔ **已弃用（2026-09-27 实测定案），别再调用** —— 保留定义只为留档。
 
-    **2026-09-25 更正：这条现在默认启用。**
-    原注释写「这版微信上实测输入框点不中、结果页也点不开，所以默认不跑」——**那个结论是错的**。
-    当时多半是**匿名模态框在吞点击**（见 find_anon_modal）：关掉框之后实测完全可用 ——
-    点中搜索框、输入中文、点结果、小程序真的打开，并用 appId 复核过。
-    所以现在不再需要 WXSIGN_CHAT_SEARCH=1（那个开关保留但已不起门槛作用）。
+    它做的是「输入关键词 → 在下拉里逐行点**小程序条目**（即『最近使用过的小程序』那段）」。
+    两个问题：
+      · 那段条目会**点错号** —— 同名不同号就在同一段里（九村烤脑花 VIP / YX、
+        辣可可现炒黄牛肉 / …i），谁排前面全看使用历史；
+      · 正确做法是「点 ✳ 下面第一条搜索建议 → 进搜索页」，
+        搜索页布局固定、第一条结果恒是目标小程序（见 `open_via_souyisou`）。
 
-    安全阀都还在，别删：输入前先确认那是「微信」标签下的**全局**搜索框 ——
-    否则关键词会落进聊天输入框、回车就直接把消息发出去（原注释担心的就是这个）。
+    另外它内部依赖的 `find_dropdown_miniapps()` 现在只在「✳ 行之上」找条目，
+    语义也已与这里不再匹配 —— 留着只会误导，真要复活请先读 `open_via_souyisou` 的说明。
+
+    历史沿革：这函数曾被当作「面板失败后的替代主路径」（2026-09-26 一度排在面板之前）。
+    它当初之所以看起来是"主路径"，是因为**旧版坐标算错**（扫描列按屏幕比例、
+    侧边栏 y 二次换算）导致它必然失败并退化成面板 —— 面板跑通给了它"兜底有效"的假象。
     """
     for round_no in (1, 2):
         close_anon_modal(W, H)                 # 框会吞点击：动手前先清掉
@@ -1386,7 +1519,7 @@ def open_via_search(W, H):
             return False
         # 小程序条目就在下拉里（手工点开刘一手点的就是这里）；下拉里没有（比如这个词
         # 没匹配到号）才退回搜一搜结果页 —— 两套坐标体系不同，别混用。
-        rows = find_dropdown_miniapps(grab(W, H), W, H)
+        rows = find_dropdown_miniapps(grab(W, H), W, H, box)
         click_x = int(W * 0.12)
         is_dropdown = True               # 下拉是临时弹层：点开真实条目就收；搜一搜页不收
         print("[reopen] 第%d轮：下拉里找到 %d 个小程序条目：%s" % (round_no, len(rows), rows))
@@ -1450,20 +1583,52 @@ def open_via_search(W, H):
             #    两轮白跑直到外层超时被 SIGTERM，还连累 hook 被 restart_hook 杀死）。
             #    正解：每行点完只要没开成，就探一次下拉是否还在（「搜索网络结果」行在 = 下拉在），
             #    不在就 do_search 重建并重扫，再从未试过的行继续；搜一搜结果页是持久页面，不用重建。
-            if is_dropdown and not find_netsearch_row(grab(W, H), W, H):
+            if is_dropdown and not find_netsearch_row(grab(W, H), W, H, box):
                 print("[reopen] 下拉已收 → 重新展开再试下一行")
                 if not do_search(W, H, box):
                     break
-                rows = find_dropdown_miniapps(grab(W, H), W, H)
+                rows = find_dropdown_miniapps(grab(W, H), W, H, box)
                 print("[reopen] 重建下拉：%d 个条目 %s" % (len(rows), rows))
     print("[reopen] 两轮都扫完还没打开")
     return False
 
 
 def open_via_souyisou(W, H):
-    """搜一搜结果页路径：主窗口搜索 → 点「搜索网络结果」进搜一搜 → 点第一行小程序结果。
+    """搜一搜结果页路径：主窗口搜索 → 点搜索建议第 1 行进搜一搜 → 点第一行小程序结果。
 
-    **2026-09-26 新增为主力路径。** 为什么需要它：
+    # ╔══════════════════════════════════════════════════════════════════════════╗
+    # ║ ⛔ **2026-09-27 停用**：这条路先不做，改用小程序面板搜索（已跑通）      ║
+    # ║   `main()` 里对它的调用已注释掉，代码与配套修复全部保留，日后有精力再续。║
+    # ╚══════════════════════════════════════════════════════════════════════════╝
+
+    **为什么停用（实测现象）**：这条路能进搜索页，但会把环境搞坏 ——
+    实测现象：走几次之后**小程序面板就进不去了**（侧边栏的小程序/搜一搜按钮
+    点了无响应）。面板是本环境唯一跑通全流程的路径，把它搞坏等于断了后路。
+    此外它还会冒出「朋友圈」等额外窗口（2026-09-27 01:52 手工关掉）。
+    而面板路径**已跑通**：2026-09-27 00:52 那批 lakeke / guoqiaoyuan 都是它签到的。
+
+    **已经做对的修复（别丢，续做时直接能用）**：
+      · `click_rail()`：侧边栏 y 不再被二次换算（旧写法在 759x674 窗口下把 114 算成 75
+        → 点中微信头像；这条**面板路径也用**，必须留着）；
+      · `dropdown_logo_cols()`：下拉图标列改按**搜索框左缘**算（旧值按屏幕宽写死，
+        小窗口下只覆盖半截 → 漏判「下拉里没有小程序条目」）；
+      · `find_first_suggestion()`：点 ✳ 行**下方第一条搜索建议**才进搜索页
+        （点「搜索网络结果」那行字**没有任何反应** —— 这条是实测得出的布局知识）。
+      2026-09-27 01:47 端到端验证：这三条**都生效了**（日志显示点侧边栏 y=114、
+      点建议行 y=216、搜一搜窗口就位）。
+
+    **续做时要解决的问题（已定位但没修）**：
+      进了搜索页后 `find_rows()` 扫出的行点不中目标小程序。
+      实测 01:47：扫到 `[371, 618, 689, 853, 925]`（逐行点全部失败），
+      而手工观察到目标小程序卡片（带「小程序」标记）在 **y≈237..344** —— 差约 80px。
+      怀疑：`find_rows` 的扫描列 `x0,x1 = int(W*0.17), int(W*0.24)` 同样是**按屏幕宽写死**，
+      而搜索页窗口尺寸/位置不一定等于屏幕（屏幕被 `xrandr` 钉成 1280x1024，
+      主窗口却只有 1024x768）。修法参照 `dropdown_logo_cols()`：
+      **按搜索页窗口自己的几何算扫描列**，别用屏幕比例。
+      另外注意：屏幕分辨率是**动态的**（云微网页端打开时会被改成 767x731 之类），
+      `main()` 里的 `xrandr` 钉屏只是补救，任何按屏幕比例算的坐标都不牢靠。
+
+    **2026-09-26 新增时的初衷（保留参考）**：为什么当初想走这条路 ——
     搜索下拉的布局是**动态的** —— 搜索建议行数随历史/热词变化（实测同一关键词，
     「最近使用过的小程序」条目一次在 y=133、一次被 5 行建议挤到 y=338），
     任何「固定 y / 前 N 行试错」都会漂；`find_dropdown_miniapps` 的彩色-logo 扫描
@@ -1735,34 +1900,26 @@ def main():
         print("[reopen] 已经打开：%s" % t)
         return 0
 
-    # ⚠️ 顺序在 2026-09-26 调整过：**先走主窗口搜索**，再轮面板。
-    #    为什么：实测本环境里「小程序面板」**根本开不出来**（WMPF 正常、侧边栏 7 个按钮
-    #    全试两遍、窗口树毫无变化，右侧始终只有微信水印），而面板路径的 7×2 次尝试
-    #    把 `timeout` 全烧光 —— 轮到本该能救场的搜索兜底时**已经被外部 timeout 杀掉了**
-    #    （症状：`wxopen` 无产出、exit 124，看起来像「整个挂死」）。
-    #    搜索路径**不依赖面板**，实测能直接搜到并打开小程序 —— 它是本环境的事实主路径。
-    #    面板路径保留在搜索失败之后，作为换环境的兼容兜底。
-    print("[reopen] 主路径：主窗口搜索（不依赖面板）")
-    if open_via_search(W, H):
-        return 0
-
-    # 搜索失败可能是**匿名模态框把点击全吃了** —— 症状与「搜索坏了」一模一样。
-    # 先清一次框再试一次搜索：很便宜，能救回「其实只是被框挡着」的情况。
-    if close_anon_modal(W, H):
-        print("[reopen] 清掉匿名模态框后重试搜索")
-        if open_via_search(W, H):
-            return 0
-
-    # ⚠️ 2026-09-26：下拉布局是动态的（建议行数变化会把小程序条目挤到任意 y），
-    #    下拉路径失败后**先走搜一搜结果页**（布局固定、第一行恒为目标小程序，
-    #    实测最稳），再退到面板。
-    print("[reopen] 下拉路径失败 → 改走搜一搜结果页")
-    if open_via_souyisou(W, H):
-        return 0
-
-    print("[reopen] 搜索路径失败 → 改走小程序面板")
+    # ⚠️ 2026-09-27 定案：**主路径 = 小程序面板搜索**（这是本环境唯一跑通全流程的路径）。
+    #    「点搜索建议行 → 搜一搜结果页」那条（open_via_souyisou）已于同日**停用**，
+    #    原因见该函数的停用说明：它会把环境搞成「小程序面板进不去」。
+    print("[reopen] 主路径：小程序面板搜索")
     if open_via_panel(W, H):
         return 0
+
+    # 失败可能是**匿名模态框把点击全吃了** —— 症状与「面板打不开」一模一样。
+    # 先清一次框再试一次：很便宜，能救回「其实只是被框挡着」的情况。
+    if close_anon_modal(W, H):
+        print("[reopen] 清掉匿名模态框后重试面板")
+        if open_via_panel(W, H):
+            return 0
+
+    # ────────────────────────────────────────────────────────────────────
+    # 搜索页路径（2026-09-27 停用，代码保留待续）
+    #   if open_via_souyisou(W, H):
+    #       return 0
+    # 详见 open_via_souyisou 的停用说明。
+    # ────────────────────────────────────────────────────────────────────
 
     print("[reopen] 改走甄选兜底")
     if open_via_zhenxuan(W, H):

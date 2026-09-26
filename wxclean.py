@@ -150,23 +150,23 @@ def sibling_button(buf, W, box):
 
 
 def find_anon_dialog():
-    """找出「小尺寸匿名顶层窗口」（= 微信原生对话框）的窗口 id，没有则 None。
+    """找出「微信原生对话框」的窗口 id，没有则 None。
 
-    判据：无名字 + 尺寸在 100~500 × 80~400 之间的顶层窗口 = 微信原生对话框
-    （主窗口/面板都是 1280x1024；辅助窗口是 1x1/10x10/200x200，都被尺寸过滤掉）。
+    ⚠️ 2026-09-27 治本修正：**改为复用 wxopen.find_anon_modal() 的判据**，不再自己
+    重复实现一份。原来这里只抄了「尺寸 100~500 × 80~400」这半条判据，**漏掉了
+    「必须屏幕居中」** —— 而环境里恒有一个 **100x100 @ (0,0) 的匿名辅助窗口**
+    （xwininfo 里的 `0x558`）正好落进尺寸区间 → 本函数**永远返回非 None** →
+    `dismiss_popups` 的「无框不点」硬前置形同虚设 → `green_button()` 把主窗口
+    聊天列表里的普通绿元素误判成「弹窗药丸」→ `sibling_button` 算出的坐标落在
+    侧边栏「退出登录」那一行 → **本该是防线的前置反而亲手造出退登框**，之后所有
+    点击被它吞掉（2026-09-27 00:45 实测：批跑第一个品牌就踩中）。
+
+    wxopen 那份判据早就补过「居中」这一道（踩过「搜索下拉浮层也是无名顶层窗口、
+    尺寸也落在区间，但贴在左上角」的坑，见其注释）。**同一判据两处实现必然会漂移**
+    —— 所以现在只留一份，这里直接调用。
     """
-    try:
-        out = R.run("DISPLAY=%s xwininfo -root -children" % R.DISPLAY)
-    except Exception:
-        return None
-    for line in out.splitlines():
-        m = re.match(r"\s+(0x[0-9a-fA-F]+) \(has no name\):\s+\(\)\s+(\d+)x(\d+)\+", line)
-        if not m:
-            continue
-        w, h = int(m.group(2)), int(m.group(3))
-        if 100 <= w <= 500 and 80 <= h <= 400:
-            return m.group(1)
-    return None
+    m = R.find_anon_modal()
+    return m[0] if m else None
 
 
 def _activate_popup():

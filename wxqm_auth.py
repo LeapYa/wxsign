@@ -86,8 +86,17 @@ AUTH_SELECTORS = ("#authorization", "[class*=authorization]", "[class*=auth-pop]
 # 授权层的**标志文案** —— 用来确认「它真弹出来了」，也用来兜底找它的 ctx。
 AUTH_MARKS = ("手机号一键登录", "一键登录", "暂时跳过", "欢迎加入")
 # 勾选框的**选择器**（它自己没文案，所以只能按结构找）。
+# ⚠️⚠️ 2026-09-26 实测：勾选框的**两态是两个不同的类名**，不是一个类的两种样式 ——
+#   未勾选 = `.i-circle`（空心圆），勾选后 = `.i-xuanze_xuanzhong`（选择_选中，实心勾）。
+#   所以只写 `.i-circle` 会有个**隐蔽的坑**：如果它**本来就已勾上**（上一次弹层留下的状态、
+#   或用户手点过），`.i-circle` 命中 0 个 → 脚本误以为「选择器都不行」→ 掉进下面那个
+#   「按说明文字反推」的兜底，反推出 `(6,590)` 这种明显错误的坐标**乱点**。
+#   实测就是这样：跑出来 `[auth] 勾选框（兜底推算）(页面坐标 6,590)`。
+#   → 因此两态都要认：`CHECKED_SELECTORS` 用来判断「已经勾好了、跳过即可」。
 CHECK_SELECTORS = (".i-circle", "[class*=circle][class*=check]", "[class*=agree-icon]",
                    "[class*=checkbox]")
+# 已勾选态（`i-xuanze_xuanzhong` = 选择_选中）。命中的意思是「无需再点」。
+CHECKED_SELECTORS = (".i-xuanze_xuanzhong", "[class*=xuanze][class*=xuanzhong]")
 # 兜底：勾选框没有可识别选择器时，用「同意说明那行小字的左边界往左推」。
 AGREE_WORDS = ("允许我们在必要场景", "合理使用您的个人信息", "请阅读并同意")
 CHECK_GAP = 22          # 该兜底路径下，勾选框圆心到那行小字左边界的距离（视口像素）
@@ -331,9 +340,23 @@ def _check_agree(ws, ctx, dry_run=False):
     为什么优先选择器：勾选框是个**没有文案的圆圈**，之前只能「拿旁边那行说明文字的
     左边界，往左推 22 像素」—— 那 22 是个魔数，换个字号/内边距就偏。
     实测企迈的圆圈是 `.i-circle`，`clickable()` 能直接拿到它的真实盒子
-    （`(35,740) 19x52`，19 是圆的直径、52 是行高）。
+    （`(25,714) 19x52`，19 是圆的直径、52 是行高）。
+
+    ⚠️⚠️ 2026-09-26 补：**两态是两个类名**，所以顺序必须是「先看已勾 → 再找未勾 → 才兜底」。
+      未勾 = `.i-circle`（空心），已勾 = `.i-xuanze_xuanzhong`（实心勾）。
+      少了第 ⓪ 步（已勾判断）时，若它本来就勾着，第 ① 步会在「未勾选择器」上命中 0 个 →
+      掉进第 ② 步兜底 → 用离场/异常几何反推出 `(6,590)` 这种坐标**乱点**。
     """
-    # ① 选择器直取（推荐路径）
+    # ⓪ 先看**是不是已经勾好了** —— 命中即无需再点（这是上面那个坑的正面修法）
+    for sel in CHECKED_SELECTORS:
+        c = wxdom.clickable(ws, ctx, sel)
+        if c and c["items"]:
+            it = c["items"][0]
+            print("[auth] 勾选框（%s）**已经是勾选态** → 跳过点击 (页面坐标 %d,%d)"
+                  % (sel, it["cx"], it["cy"]))
+            return True
+
+    # ① 未勾选态：选择器直取（推荐路径）
     for sel in CHECK_SELECTORS:
         c = wxdom.clickable(ws, ctx, sel)
         if c and c["items"]:
@@ -357,7 +380,15 @@ def _check_agree(ws, ctx, dry_run=False):
             print("[auth] ⚠️ 说明文字位置异常（y=%d / vh=%d）→ 不勾选，交给被拦后重试"
                   % (a["cy"], d["vh"]))
             return False
-        cxx = max(6, a["cx"] - a["w"] // 2 - CHECK_GAP)
+        # ⚠️ 反推出来的坐标必须**落在视口内**才算数。
+        #    实测踩过：授权层在播 `std-bottom-leave-to`（离场）时说明文字还在树上、
+        #    矩形塌成 0，反推出来是 `(6,590)` —— 那个 `6` 就是下面这行的 `max(6, …)` 夹出来的，
+        #    点下去完全是误操作。所以宁可**不勾选**（交给「被拦后重试」），也别乱点。
+        cxx = a["cx"] - a["w"] // 2 - CHECK_GAP
+        if not (a["w"] > 0) or cxx < 4 or cxx > d["vw"] - 4:
+            print("[auth] ⚠️ 兜底反推的勾选框坐标越界（x=%d / vw=%d）→ 不勾选，"
+                  "交给被拦后重试" % (cxx, d["vw"]))
+            return False
         print("[auth] 勾选框（兜底推算）(页面坐标 %d,%d)" % (cxx, a["cy"]))
         if not dry_run:
             wxreg.click(cxx, a["cy"])
@@ -430,22 +461,85 @@ def main():
         else:
             print("[auth] 授权层没能弹出 → 该账号可能已授权，或页面/活动不对")
         print("[auth] 按「无需处理」继续走第 ⑤ 步（万一原生框真弹了还能兜住）")
-        return _wait_allow(ws, a)
+        return _wait_allow(ws, a, want)
 
     # ③ 勾选 → ④ 「手机号一键登录」
     if not click_auth_layer(ws, ctx=vctx):
         return 3
 
-    return _wait_allow(ws, a)
+    return _wait_allow(ws, a, want)
 
 
-def _wait_allow(ws, a):
+def verify_bound(ws, want_appid="", wait=6.0):
+    """验证**服务端**是否真的绑上了手机号。返回 (bool, 说明)。
+
+    ⚠️⚠️ 为什么必须有这一步 —— 这是本脚本曾经**假成功**的根因：
+      旧版把「微信原生框没弹」当成「已授权过 → 成功」，但那只证明**微信侧**有记录，
+      **完全不能证明企迈服务端把这个 openid 认成了会员**。实测踩到：
+      脚本报「已授权过、静默返回」，而企迈服务端 `loginData.user.eMobile` **是空串**，
+      签到接口回 `100027 当前渠道不能参与活动`（=「你不是本渠道有效会员」的委婉说法）。
+      → 于是「第 11 个品牌跑通」的结论是错的，白白绕了一大圈。
+      **教训：绑定动作的成败只能由「被绑的那一方」来确认，不能由「我方有没有弹窗」推断。**
+
+    判据用**两层**，从权威到兜底：
+      ① 服务端接口（最权威）：`userSignStatistics` 不再是 `100027`。
+         —— 但这一步需要 token，而 token 由 wxqm.py 另取，耦合较重，故不在此做。
+      ② storage 的 `loginData.user.eMobile` **非空**（本函数采用）。
+         实测：绑定成功后它从 `""` 变成 `"Fyf8yS3lcAnSSmjhFBUjTg=="`。
+         ⚠️ 它是 **base64 密文、不是明文手机号** —— 所以判据只能是「非空」，别去解它、
+         也别指望拿它当手机号用。
+    """
+    JS = ("(function(){try{"
+          "var d=wx.getStorageSync('loginData')||{};var u=d.user||{};"
+          "var appid='';try{appid=wx.getAccountInfoSync().miniProgram.appId}catch(e){}"
+          "return JSON.stringify({appid:appid,openId:u.eOpenId||'',"
+          "mobile:u.eMobile||'',storeId:String((d.store||{}).id||'')})"
+          "}catch(e){return 'ERR:'+e}})()")
+    best = {}
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        for c in range(1, 41):
+            ws.send({"id": 5000 + c, "method": "Runtime.evaluate",
+                     "params": {"expression": JS, "returnByValue": True, "contextId": c}})
+        got = {}
+        t1 = time.time()
+        while time.time() - t1 < 2.5:
+            try:
+                m = json.loads(ws.recv_msg())
+            except Exception:
+                break
+            mid = m.get("id")
+            if isinstance(mid, int) and 5000 < mid <= 5040:
+                v = ((m.get("result") or {}).get("result") or {}).get("value")
+                if isinstance(v, str) and v.startswith("{"):
+                    try:
+                        got = json.loads(v)
+                    except ValueError:
+                        pass
+        if got and (not want_appid or got.get("appid") == want_appid):
+            best = got
+            if got.get("mobile"):
+                return True, "服务端已绑定（eOpenId=%s…，eMobile 非空）" \
+                    % (got.get("openId") or "")[:20]
+        time.sleep(1.0)
+    if not best:
+        return False, "读不到 loginData（页面在吗？hook 通吗？）"
+    return False, ("服务端**仍未绑定**：eMobile 为空（eOpenId=%s…）" % (best.get("openId") or "")[:20])
+
+
+def _wait_allow(ws, a, want_appid=""):
     """第 ⑤ 步：等微信**原生**「允许」框并点掉。**只有首次接入才有。**
 
     ⚠️ 这一步**是**真的读不到 DOM（微信原生框不在小程序里，与授权层性质完全不同），
     只能用像素。但只有这一步允许用颜色，理由：它的配色由**微信客户端**决定，
     不随品牌/活动变 —— 与「品牌按钮不能按颜色找」不矛盾。
+
+    ⚠️ 出口判据 = **服务端绑定结果**（见 `verify_bound`），不再是「原生框有没有弹」。
+    没弹有两种可能，必须分开报，否则又回到「假成功」：
+      (a) 原本就已绑过 → 真正成功；
+      (b) 弹窗被遮挡/没点中 → 其实没绑上（旧版在这里误报成功）。
     """
+    clicked = False
     t0 = time.time()
     while time.time() - t0 < a.wait_allow:
         wxreg.raise_miniapp()
@@ -460,13 +554,24 @@ def _wait_allow(ws, a):
         if hit:
             print("[auth] 点原生「允许」(页面坐标 %d,%d)" % hit)
             wxreg.click(hit[0], hit[1])
+            clicked = True
             time.sleep(2.5)
-            print("[auth] ✓ 首次手机号授权已全自动完成")
-            return 0
+            break
         time.sleep(1.0)
 
-    print("[auth] 没出现原生授权框 → 该账号已经授权过、微信静默返回，无需处理")
-    return 0
+    # ── 出口：一律以**服务端绑定结果**为准 ──
+    ok, why = verify_bound(ws, want_appid)
+    if ok:
+        print("[auth] ✓ 手机号授权完成 —— %s" % why)
+        return 0
+    if clicked:
+        print("[auth] ✗ 点了「允许」但服务端仍未绑定 —— %s" % why)
+        print("[auth]   可能是点了但没生效（窗口被遮挡？），或该号已在别的 openid 上")
+        return 3
+    print("[auth] ✗ 没出现原生授权框，且服务端仍未绑定 —— %s" % why)
+    print("[auth]   注：若该账号**本该已绑**，说明旧版「静默返回=成功」的判据是错的，"
+          "需要人工确认一次")
+    return 3
 
 
 if __name__ == "__main__":

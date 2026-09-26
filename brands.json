@@ -234,9 +234,10 @@
       "engine": "qmai",
       "qm_biz": "catering",
       "type": "sign",
-      "enabled": false,
-      "verified": false,
-      "note": "**企迈（qmai / webapi.qmai.cn）** 系条目。商户号 `storeId=49112`，业务线 `catering`（企迈的两条业务线：`mealmate` 呷哺系 / `catering` 餐饮大盘）。链路与呷哺完全一致：`POST /web/cmk-center/sign/userSignStatistics` 查状态 → `/takePartInSign` 签到，参数只有 `{activityId, storeId}`。\n\n⚠️ `enabled=false` 的真正原因是**还没取到它的 `qm_activity`**（商户级签到活动 ID，随「我的 →每日签到」入口由服务端下发、包里没有）—— **不是「商户没开功能」**。\n\n⚠️ **本条 note 最初写错了，留个记号**：原结论是「该商户只配了签到规则、没发布活动，`integral/sign/detail` 明确回 `400042 商家未开启此功能`」。**那是全错的** —— `integral/sign/*` 是积分商城那套接口，对它恒回 400042（误导性错误码）；真正的签到接口是 `cmk-center/sign/*`，同一后端下的呷哺用它实测能签。我据此连着下过三次错误结论，详见 `docs/QMAI_API.md`。\n\n**待办（2026-09-26 更新）**：链路其余各步**都已实测完成** —— 账号已登录、`wxqm.py` 双路取登录态正常（它会写 storage，走第 ① 路）、**手机号授权已用 `wxqm_auth.py` 绑过**（页面显示「微信用户 · 白金牛」）。**只差 `qm_activity`**：进它小程序走「我的 →每日签到」，读签到页 data 的 `activityId`（或抓一次 `userSignStatistics` 的请求体），填进本条目的 `qm_activity`，再把 `enabled` 改 true 即可。"
+      "enabled": true,
+      "verified": true,
+      "note": "**企迈系·第 2 个跑通真机签到的品牌**（2026-09-26）。商户号 `storeId=49112`，业务线 `catering`（企迈两条业务线：`mealmate` 呷哺系 / `catering` 餐饮大盘），签到活动 `qm_activity`=1073906345701101569（商户级固定 ID，随「我的 →每日签到」入口由服务端下发，包里没有，所以要配在这里）。\n\n链路与呷哺同构、且**URL 不带业务线前缀**：`POST /web/cmk-center/sign/userSignStatistics` 查状态 → `/takePartInSign` 签到，请求体 `{activityId, storeId}`，业务线只走 `Qm-From-Type` 头。实测：签到前 `signStatus=2 signDays=0` → 签到后 `signStatus=1 signDays=1`，拿到「满35减2元券」，界面变「已签到」。\n\n**怎么取到 `activityId` 的（留个正确方法，别再去猜像素）**：企迈「我的」页那四个入口（我的订单 / 邀请有礼 / 签到有礼 / 团餐预定）**是图片热区** —— 组件 `WX-QM-IMAGE-HOT`，文字画在图片里，`innerText` 永远读不到。所以「按文案找入口」这条路根本不通。正确做法：读热区组件的 data → `hotList[]`，每个热区带 `linkText` / `link` / `linkType`，**按 `linkType` 匹配**（签到 = `newCheckIn`，跨品牌稳定，比文字可靠），从它的 `link` 里取 `activityId`。顺带得到邀请有礼的 activityId=1243584503764271104。\n\n⚠️ **本条 note 早先写错过两次，留个记号**：\n  ① 原结论「该商户只配了签到规则、没发布活动，`integral/sign/detail` 明确回 `400042 商家未开启此功能`」—— **全错**。`integral/sign/*` 是积分商城那套接口，对它恒回 400042（**误导性错误码**）；真正的签到接口是 `cmk-center/sign/*`。\n  ② 中途「只差 `qm_activity`、其余全跑通」的结论也不准 —— 当时**账号根本没绑手机号**（`eMobile` 为空），签到接口回 `100027 当前渠道不能参与活动`。那个错误码读起来像「渠道参数错」，**真因是「你不是本渠道有效会员」**（服务端没绑手机号）→ 在渠道路径上白绕了一圈。绑完手机号后立刻跑通。\n\n⚠️ 首次那一步已全自动：`wxqm_auth.py --title 李先生牛肉面大王会员` （零硬编码坐标：授权层勾选/登录按钮走 `wxdom` 按结构定位，微信原生「允许」框走像素）。绑定绑在**服务端 openid** 上、**永久有效**，日常签到全自动。\n\n⚠️ **本号与 memory 里记的不是同一个微信**（原记录那个号绑的是 190\\*\\*\\*\\*7634、显示「白金牛」）；本容器里的号是 178\\*\\*\\*\\*6631，重新走过一次授权才绑上。",
+      "qm_activity": "1073906345701101569"
     },
     {
       "slug": "xiabuxiabu",

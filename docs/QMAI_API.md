@@ -14,8 +14,8 @@
 | 接口链路 | ✅ 完全打通 |
 | 适配器 | ✅ `wxqm.py` + `wxsign.py::do_sign_qm`（engine `qmai`） |
 | **呷哺呷哺**（storeId `214176`） | ✅ **真机签到成功**，界面弹「签到成功！恭喜获得 1 哺币」，积分 0→1、连签 0→1 天 |
-| 引擎端到端 | ✅ `RESULT xiabuxiabu code=415 msg=该用户今日已签到`（重跑幂等正确） |
-| 李先生牛肉面大王（storeId `49112`） | ⚠️ 未验证（缺它的 `activityId`，且它属于另一业务线 `catering`） |
+| **李先生牛肉面大王**（storeId `49112`） | ✅ **真机签到成功**（2026-09-26），`takePartInSign` 回 `status:true`，拿到「满35减2元券」，界面变「已签到」；签到前后 `signStatus` 2→1、`signDays` 0→1 |
+| 引擎端到端 | ✅ `RESULT lixiansheng code=415 msg=今天已经签到过了（连签 1 天）`（重跑幂等正确） |
 
 ---
 
@@ -51,6 +51,39 @@ POST /web/cmk-center/common/getCrmAvailablePoints 可用积分
 ```json
 {"activityId": "1212715500988841985", "storeId": "214176"}
 ```
+
+> ⚠️ **2026-09-26 实测补记**：CDP 抓到的**真实请求体**其实是
+> `{"activityId": "...", "appid": "wx..."}` —— **带 `appid`、不带 `storeId`**
+> （storeId 只在 `store-id` 请求头里）。我一度以为 body 该改成 `appid`，
+> 但**实测四种写法全部可行**：
+>
+> | body | `userSignStatistics` 返回 |
+> |---|---|
+> | `{activityId, storeId}` | `code=0 status=true` |
+> | `{activityId, appid}` | `code=0 status=true` |
+> | `{activityId, storeId, appid}` | `code=0 status=true` |
+> | `{activityId}` 单独 | `code=0 status=true` |
+>
+> 结论：**身份来自 `Qm-User-Token` + `store-id` 请求头，body 里那点差异它不挑**。
+> 所以沿用 `{activityId, storeId}` 即可，**别为这个改代码**。
+
+### 响应字段（⚠️ 曾据此写错判据）
+
+`userSignStatistics` 的 `data` 里：
+
+| 字段 | 含义 |
+|---|---|
+| `signStatus` | **`1` = 今天已签，`2` = 未签** |
+| `signDays` | 连签天数 |
+| `rewardList` / `nextRewardList` | 奖励阶梯（`rewardName` 如「满35减2元券」） |
+
+`takePartInSign` 成功时 `status=true`，奖励在 **`data.rewardDetailList[].rewardName`**
+（是个列表，不是单个 `rewardName` 字段）。
+
+> ⚠️ `do_sign_qm` 旧版判的是 `todaySign` / `signToday` / `todaySigned` ——
+> **这三个字段一个都不存在** → 恒判「今天没签」→ 每天多打一次 `takePartInSign`。
+> 已改成判 `signStatus == "1"`（旧字段名留作兜底）。实测李先生那天：签到前
+> `signStatus=2 signDays=0`、签到后 `signStatus=1 signDays=1`。
 
 ### 请求头
 
@@ -91,8 +124,29 @@ scene: 1101
 它由服务端随「我的 →每日签到」入口下发，**包里没有**，所以写进 `brands.json` 的
 `qm_activity`。
 
-**取法**：打开小程序 → 进「我的」→ 点「**每日签到**」→ 读签到页 data 的 `activityId`
-（或抓一次 `userSignStatistics` 的请求体）。
+⚠️ **取它的正确方法（2026-09-26 实测踩坑后定稿）**：企迈「我的」页那四个入口
+（我的订单 / 邀请有礼 / 签到有礼 / 团餐预定）**是图片热区**，不是普通按钮 ——
+组件是 **`WX-QM-IMAGE-HOT`**，**文字画在图片里**，所以 `innerText` / `textContent`
+**永远读不到**（排查了很久才想通：不是「找不到 DOM」，是「这套组件根本没有文字节点」）。
+
+所以「按文案找入口」这条路**从根上不通**；按像素猜坐标当然更不行（复现不了）。
+正确做法是**读热区组件的 data**：
+
+```js
+// 每个 WX-QM-IMAGE-HOT 节点的 __wxElement.data.hotList[] 里：
+//   linkText  = "签到有礼|签到有礼"        （呈现文字，仅参考）
+//   link      = "/pluginMarketing/checkin/index/index?activityId=1073906345701101569"
+//   linkType  = "newCheckIn"               （★ 匹配用这个，跨品牌稳定）
+```
+
+**按 `linkType` 匹配**（签到 = `newCheckIn`，邀请 = `newInvitation@YX_2`，自定义页 = `dialogPage`），
+再从 `link` 里抠 `activityId`。这是**零坐标、零文字识别、可复现**的路子。
+
+> 顺带：这种方式一次能拿到**全部**入口，所以将来要做「邀请有礼」等其它活动，
+> 同一份 `hotList` 就能用（李先生的邀请活动 `activityId` = `1243584503764271104`）。
+
+（旧的写法「读签到页 data 的 `activityId`」在**已经进到签到页**的前提下仍然成立，
+可作为交叉验证；难的是「怎么从『我的』页找到签到入口」这一步。）
 
 ### 2. 必须**已登录（绑手机号）**
 
@@ -243,6 +297,8 @@ wxdom.clickable(ws, 9, ".i-circle")            # → 勾选框 (35,740) 19x52
 | 3 | 「被阿里云 WAF 挡住，环境不可做」（还为此写了 WAF 求解器、换宿主机重测） | **路径漏了 `/web` 前缀** —— WAF 对「不存在的路由」甩 110310 字节的 JS 挑战页，我把「接口不存在」当成了「被墙」 |
 | 4 | 「两家商户都没开签到活动（400042）」 | 我用的是**错的那套接口**（`integral/sign`）+ **错的页面**（`subpackages/sign-in`） |
 | 5 | 「必须找一个开着活动的企迈商户才能验证」 | 呷哺本来就能签 —— **用户一句「呷哺呷哺是不是能签到」把我拉回正轨** |
+| 6 | 「李先生的 `100027` 是渠道参数（`Qm-From-Type`）配错了」 | **真因是服务端没绑手机号** —— `100027 当前渠道不能参与活动` 读起来像渠道问题，实际意思是「你不是本渠道有效会员」。我在渠道这条路上白绕了一圈，回到「先绑手机号」后立刻通了 |
+| 7 | 「签到页入口按文案找即可」 | 那四个入口是**图片热区**，文字画在图里、`innerText` 永远读不到 —— 必须读 `hotZone.data.hotList[].linkType` |
 
 **共同病根**：**每次都把「我自己搞错了」包装成「对方有防御/没开功能」**。
 每一层都"看起来很合理"，所以没有回头质疑前提。
@@ -250,6 +306,12 @@ wxdom.clickable(ws, 9, ".i-circle")            # → 勾选框 (35,740) 19x52
 **真正救回来的那一步**：**用 CDP 抓「小程序自己发的请求」**（`survey/host_net.py`）——
 判「服务端到底怎么响应」这类问题，这是唯一硬判据；自己复刻的请求只能回答
 「我构造得对不对」。
+
+> ⚠️ 第 6 条还有一个**判断方法论**的教训：遇到一个**语义模糊的错误码**
+> （`100027 当前渠道不能参与活动`）时，**先问「它的字面意思有几种可能」**，
+> 别顺着最像技术原因的那一种一路查下去。这里的正确动作是**先在 UI 上把「会员身份」跑通**
+> （点一次「手机号一键登录」），再回头调接口 —— **UI 通了接口就通了**，
+> 比在参数上穷举快得多。
 
 ---
 
@@ -267,6 +329,21 @@ wxdom.clickable(ws, 9, ".i-circle")            # → 勾选框 (35,740) 19x52
    所以「调了没反应」≠「接口不通」。
 5. ⚠️ **企迈的隐私页可以直接调方法**：`confirm()` / `checkboxChange()` /
    `handleAgreePrivacyAuthorization()` —— 比猜「同意」按钮坐标快且不会点错。
+6. ⚠️ **「我的」页入口是图片热区，不是 DOM 文字**：组件 `WX-QM-IMAGE-HOT` 把
+   文案画进了背景图，`innerText` 永远为空。要拿入口信息只能读
+   `节点.__wxElement.data.hotList[]`（含 `linkText`/`link`/`linkType`）。
+7. ⚠️ **授权层勾选框的两态是两个类名**：未勾 = `.i-circle`（空心），
+   勾选后 = `.i-xuanze_xuanzhong`（选择_选中，实心勾）。只判 `.i-circle`
+   会在「本来就勾着」时命中 0 个 → 掉进「按说明文字反推」的兜底 → 反推出 `(6,590)` 乱点。
+   正解：先判已勾态（`.i-xuanze_xuanzhong`）跳过，再找未勾态。
+8. ⚠️ **`signStatus` 才是「今天签没签」的字段**（1=已签 / 2=未签），
+   不是 `todaySign`。企迈不同活动的字段命名不统一，**写代码前先用真机抓一次响应**。
+9. ⚠️ **微信主窗口（全屏 1276×1024）会盖住小程序窗口**，且 `xdotool windowraise`
+   **压不过它**（微信立刻顶回来）。症状：坐标对、DOM 正常，但**点击全落空**。
+   判据：`xdotool getmouselocation` 在屏幕两点返回**同一个窗口 id**。
+   解法：`xdotool windowmove <主窗口id> <屏宽+10> 0` 挪出屏幕（不是最小化 —— 会触发重排把主窗顶回来）。
+10. ⚠️ **微信内置「图片和视频」窗口会冒充小程序**：它标题不叫「微信」、面积比小程序大，
+    于是被 `miniapp()` 按「面积最大」选中。判据要加「宽度 ≤ 半屏」+ 标题黑名单。
 
 ---
 

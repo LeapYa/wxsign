@@ -1236,12 +1236,22 @@ def do_sign_qm(brand, env):
 
     ✅ 2026-09-26 **真机跑通**（呷哺呷哺：界面弹「签到成功！恭喜获得 1 哺币」，
        积分 0→1、连签 0→1 天），随后三个接口用 curl 复核全部返回真实数据。
+    ✅ 2026-09-26 **第二个品牌跑通**（李先生牛肉面大王：`takePartInSign` 回 `status=true`，
+       界面变「已签到」、连签 0→1 天、拿到「满35减2元券」）。
 
-    链路（参数就两个：`activityId` + `storeId`）：
-        POST /web/<biz>/cmk-center/sign/userSignStatistics  先看今天签没签
-        POST /web/<biz>/cmk-center/sign/takePartInSign      签到
+    链路（URL 里**不带业务线前缀**，业务线只在 `Qm-From-Type` 头里）：
+        POST /web/cmk-center/sign/userSignStatistics  先看今天签没签
+        POST /web/cmk-center/sign/takePartInSign      签到
+    请求体两个字段：`activityId`（商户级活动 ID）+ `storeId`。
+    ⚠️ 抓包看到真实请求体里带 `appid`、不带 `storeId`，于是我以为 body 该用 appid；
+       但**实测两者都行** —— `userSignStatistics` 对 `{activityId}` / `{activityId,storeId}` /
+       `{activityId,appid}` / 全带 **四种都回 code=0**。身份其实来自
+       `Qm-User-Token` + `store-id` **请求头**，body 里那点差异它不挑。
+       所以沿用 `{activityId, storeId}` 即可，别为这个改。
+    响应字段（⚠️ 曾据此写错判据）：`signStatus`（**1=今日已签 / 2=未签**）+ `signDays`（连签天数）；
+       奖励在 `rewardDetailList[].rewardName`。
 
-    ⚠️ 三个坑 —— 每一个都让我错判过一轮，记下来：
+    ⚠️ 四个坑 —— 每一个都让我错判过一轮，记下来：
       1. **`cmk-center/sign/*` 才是「签到有礼」活动**。包里另有一套 `integral/sign/*`
          （积分商城那套），它对同一商户的 `detail` 会回 `400042 商家未开启此功能` ——
          **那是个误导性的错误码，别拿它当判据**。我先后用错页面（`subpackages/sign-in`）
@@ -1257,6 +1267,13 @@ def do_sign_qm(brand, env):
       3. **`activityId` 是商户级活动的固定 ID**（随签到入口由服务端下发，包里没有），
          写进 brands.json 的 `qm_activity`。取法：进「我的」→「每日签到」，
          读签到页 data 的 `activityId`，或抓 `userSignStatistics` 的请求体。
+         ⚠️ 2026-09-26 补充：企迈「我的」页那四个入口**是图片热区**
+         （`WX-QM-IMAGE-HOT`，文字画在图里、`innerText` 读不到），
+         所以「按文案找入口」这条路走不通 —— 正确做法是读热区组件 data 的
+         `hotList[].linkType`（签到 = `newCheckIn`），从它的 `link` 里取 `activityId`。
+      4. **未绑手机号时签到回的是 `100027 当前渠道不能参与活动`**，不是渠道参数错。
+         这个错误码读起来像「Qm-From-Type 配错了」，**其实真因是「你不是本渠道有效会员」**
+         （服务端没绑手机号）。我在渠道路径上白绕了一圈，才回到「先把手机号绑上」。
     """
     activity = env.get("QM_ACTIVITY") or brand.get("qm_activity") or ""
     if not activity:
@@ -1290,6 +1307,14 @@ def do_sign_qm(brand, env):
         return False, "NOTOKEN", "企迈会话失效/未登录（%s）→ 需在小程序里过一次手机号授权" % sc
 
     sd = st.get("data") or {}
+    # ⚠️ 2026-09-26 实测更正：`userSignStatistics` 的返回字段**不是** todaySign/signToday，
+    #    而是 `signStatus`（**1 = 今天已签，2 = 未签**）+ `signDays`（连签天数）。
+    #    旧版判的是 todaySign/signToday/todaySigned，**一个都不存在** → 恒判「未签到」→
+    #    每天都会多打一次 takePartInSign。实测李先生那天：签到前 signStatus=2 signDays=0，
+    #    签到后 signStatus=1 signDays=1。
+    if str(sd.get("signStatus")) == "1":
+        return True, "415", "今天已经签到过了（连签 %s 天）" % (sd.get("signDays") or "?")
+    # 旧字段名留作兜底（万一别的商户活动类型用另一套）
     if sd.get("todaySign") or sd.get("signToday") or sd.get("todaySigned"):
         return True, "415", "今天已经签到过了（连签 %s 天）" % (
             sd.get("continueSignDays") or sd.get("continuousDays") or "?")
@@ -1304,7 +1329,12 @@ def do_sign_qm(brand, env):
     msg = str(r.get("message", ""))
     if r.get("status"):
         dd = r.get("data") or {}
+        # 奖励在 `rewardDetailList`（列表，每项有 `rewardName`），不是 `rewardName` 字段
         got = dd.get("rewardName") or dd.get("points") or dd.get("rewardValue")
+        if not got:
+            rl = dd.get("rewardDetailList") or []
+            names = [x.get("rewardName") for x in rl if isinstance(x, dict) and x.get("rewardName")]
+            got = "、".join(names)
         return True, "200", "签到成功%s" % (("：%s" % got) if got else "")
     if "已签到" in msg or "已经签到" in msg:
         return True, "415", msg[:120]

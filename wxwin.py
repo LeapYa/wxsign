@@ -34,6 +34,13 @@ DISPLAY = os.environ.get("DISPLAY", ":1")
 # 主窗口与「小程序面板」的标题都叫「微信」；小程序窗口标题是品牌名 → 用它区分
 WECHAT_TITLES = ("微信",)
 
+# 微信**内部**窗口的标题黑名单 —— 它们不是小程序，但标题也不是「微信」，
+# 所以光靠 WECHAT_TITLES 挡不住。实测踩到：打开了「图片和视频」（875x960，
+# 看图片/视频的内置窗口），`miniapp()` 按「面积最大」把它当成了小程序，
+# 结果 `raise_miniapp()` 去激活它、像素判据也拿它当页面 → 整条链路跑偏。
+#   · 「图片和视频」= 微信内置看图/看视频窗口（点聊天里的图片就会开，容器里极易误开）
+WECHAT_INNER_TITLES = ("图片和视频",)
+
 
 def run(cmd):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout
@@ -60,11 +67,27 @@ def windows():
 
 
 def miniapp():
-    """当前小程序窗口；没有则 None。多个时取面积最大的（正常流程只会有一个）。"""
-    cand = [w for w in windows() if w["title"] and w["title"] not in WECHAT_TITLES]
+    """当前小程序窗口；没有则 None。
+
+    判据（按可靠性排序，全结构性）：
+      ① 标题非空、且不在微信自身/内部窗口的标题黑名单里；
+      ② **不超过半个屏幕宽** —— 真正的小程序窗口是 410x776 的竖窗，而微信主窗口
+         是全屏（1276x1024）、内置看图窗口是 825x960。这一条把「尺寸像小程序的」
+         和「微信自己的大窗口」分开，比单看标题可靠（标题会随语言/版本变）。
+      ③ 多个候选时取**面积最小**的 —— 小程序窗口尺寸固定，而意外开的临时窗口
+         通常更大；旧版取「面积最大」正是选错的原因。
+    """
+    try:
+        sw = int(run("DISPLAY=%s xdotool getdisplaygeometry" % DISPLAY).split()[0])
+    except Exception:
+        sw = 1280
+    cand = [w for w in windows()
+            if w["title"] and w["title"] not in WECHAT_TITLES
+            and w["title"] not in WECHAT_INNER_TITLES
+            and w["w"] <= sw // 2]
     if not cand:
         return None
-    cand.sort(key=lambda w: -(w["w"] * w["h"]))
+    cand.sort(key=lambda w: (w["w"] * w["h"]))
     return cand[0]
 
 

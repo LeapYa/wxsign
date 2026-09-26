@@ -349,7 +349,7 @@ def text_bands(buf, W, H, y0, y1, x0, x1):
 
 
 def raise_miniapp():
-    """把小程序窗口激活并置顶（**每轮都做**）。
+    """把小程序窗口激活并置顶，**并把挡住它的微信主窗口挪走**（**每轮都做**）。
 
     ⚠️ 为什么必须做：小程序是从**全屏的小程序面板**里点开的，面板仍留在最前，于是
       (a) 抓屏抓到的是**面板** —— 像素判据会把面板里的搜索卡片当成「手机号弹窗」；
@@ -357,6 +357,16 @@ def raise_miniapp():
     实测绿茵阁西餐厅的注册就死在这：`reg_phone_popup.png` 里是**面板的搜索卡片列表**、
     根本不是小程序页面 → detect() 误判成手机号弹窗 → rc=3 放弃。
     （同一课在 wxagree.py 里已经吃过一次，那边补了这一步，wxreg.py 这里漏了。）
+
+    ⚠️⚠️ 2026-09-26 实测补丁：**`windowraise` 对微信主窗口无效**。
+    微信主窗口是个 **1276x1024 全屏顶层窗口**（`xwininfo` 里它叫 `"微信"`，class
+    `wechat`），小程序窗口（410x776）反而在它**下面**。无 WM 干预时 `XRaiseWindow`
+    会被微信自己立刻压回来 —— 实测 `windowraise` 前后 `xwininfo -root -children`
+    的子窗口顺序**一模一样**，而 `xdotool getmouselocation` 在**屏幕任意位置**都返回
+    同一个窗口 id（那个全屏主窗口）。
+    症状极具迷惑性：**点击全部无效 / 全落到别的窗口上，但截图和 DOM 都完全正常**。
+    有效解法 = **`windowmove` 把它挪出屏幕**（`windowmove` 实测生效，`windowraise` 不生效）。
+    挪到屏幕外而不是最小化：最小化会触发微信的重绘/重新置顶，挪走最稳。
     """
     try:
         m = wxwin.miniapp()
@@ -367,7 +377,36 @@ def raise_miniapp():
     wid = m["id"]
     run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
     run("DISPLAY=%s xdotool windowraise %s" % (DISPLAY, wid))
+    _move_wechat_away(m)
     return True
+
+
+def _move_wechat_away(mini):
+    """把**盖住小程序**的微信顶层窗口挪出屏幕。
+
+    判据（全结构性，不用标题硬匹配 —— 标题会随语言/版本变）：
+      「一个既不是小程序窗口、面积又**足以盖住小程序**的可见窗口」。
+    之所以能这么判：正常的微信主窗口是整屏尺寸，而小程序是 410x776 的小窗；
+    只要某个窗口的矩形**包含**小程序窗口的中心，它就是遮挡者。
+
+    挪到屏幕右侧外（`x = 屏宽+10`）。**不做最小化** —— 最小化会让微信重新布局并可能
+    把主窗口再顶回来。
+    """
+    try:
+        sw = int(run("DISPLAY=%s xdotool getdisplaygeometry" % DISPLAY).split()[0])
+    except Exception:
+        sw = 1280
+    mcx, mcy = mini["x"] + mini["w"] // 2, mini["y"] + mini["h"] // 2
+    for w in wxwin.windows():
+        if w["id"] == mini["id"]:
+            continue
+        # ① 矩形必须**真的盖住**小程序中心（空窗口/装饰窗口尺寸为 0，天然排除）
+        if not (w["x"] <= mcx <= w["x"] + w["w"] and w["y"] <= mcy <= w["y"] + w["h"]):
+            continue
+        # ② 比小程序大才可能是遮挡者（避免误挪同层级的兄弟小窗）
+        if w["w"] * w["h"] <= mini["w"] * mini["h"]:
+            continue
+        run("DISPLAY=%s xdotool windowmove %s %d 0" % (DISPLAY, w["id"], sw + 10))
 
 
 def _win_geom(wid):

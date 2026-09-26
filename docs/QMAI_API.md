@@ -177,6 +177,22 @@ wxdom.clickable(ws, 9, ".i-circle")            # → 勾选框 (35,740) 19x52
 >   `wx.createSelectorQuery()` 对 14 个选择器**全部返回空**；
 >   `Runtime.executionContextCreated` 事件这个代理**根本不发**。
 >   诊断工具：`survey/diagnostics_auth_ctx.py --tree`。
+>
+> ⚠️⚠️ **`visible=True` 不能只看命中节点自己的矩形**（2026-09-26 实测栽过）：
+> 授权层是「容器根塌陷、内容在子节点」的典型 ——
+>
+> ```
+> WX-STD-AUTHORIZATION#authorization   自身 w=0 h=0 x=0 y=1188   ← 视口才 410x779
+> 子树里 27 个可见节点，其中一个 WX-VIEW 410x779（铺满整屏）
+> ```
+>
+> 只判根节点 → **明明弹着的授权层被判成「没弹出」**，然后默默走错分支（我因此
+> 白跑了一轮）。判据必须放宽成「**命中节点自身或其任一子孙可见**」。
+>
+> ⚠️ 另一个**性能坑**：`find_ctx_with` 一次 = 盲撒 80 个 ctx + 等响应。早先写成
+> `for sel in AUTH_SELECTORS: find_ctx_with([sel])` 逐个查 → 4 个选择器 4 轮 ≈ 48 秒，
+> 真机上就是「脚本像卡死了」。**选择器一次全传**（同 ctx 内是**或**关系，语义一样）。
+> 收集窗口也不再干等满 12 秒（socket 超时压到 2.5s，响应到齐就断）→ 降到 ~2.5s。
 
 **实测（2026-09-26，云微容器）**：CDP 调 `popAuthorization()` → 弹出「欢迎加入呷哺呷哺」授权层
 → xdotool 点复选框（勾上）→ 点「手机号一键登录」→ 授权层随即关闭、登录态有效。

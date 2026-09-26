@@ -230,14 +230,18 @@ def find_auth_ctx(ws, limit=80, visible=False):
 
     ⚠️ `visible=True` 时只认**当前真的可见**的（`#authorization` 关闭后节点**永久留在
     DOM 里**，只按选择器找会误判成「授权层还开着」）。判断「有没有弹出」要用这个。
+
+    ⚠️ **选择器要一次全传进去**（2026-09-26 修正性能坑）：`find_ctx_with` 本来就收列表，
+    而每次调用都要**盲撒 80 个 ctx 再等 12 秒收响应** —— 早先写成 `for sel in ...` 逐个查，
+    4 个选择器就是 4 次全量广播 ≈ 48 秒，在真机上表现为「脚本像卡死了」。
+    同一个 ctx 内这些选择器是**或**的关系，合起来查语义完全一样、只花一次的钱。
     """
-    for sel in AUTH_SELECTORS:
-        hits = wxdom.find_ctx_with(ws, [sel], limit=limit, visible=visible)
-        if hits:
-            ctx = max(hits, key=hits.get)
-            print("[auth] 授权层 ctx=%d（选择器 %s 命中 %d 处%s）"
-                  % (ctx, sel, hits[ctx], "（可见）" if visible else ""))
-            return ctx
+    hits = wxdom.find_ctx_with(ws, AUTH_SELECTORS, limit=limit, visible=visible)
+    if hits:
+        ctx = max(hits, key=hits.get)
+        print("[auth] 授权层 ctx=%d（选择器命中 %d 处%s）"
+              % (ctx, hits[ctx], "（可见）" if visible else ""))
+        return ctx
     if visible:
         return 0
     # 兜底：谁能扫出授权层的标志文案，就是它
@@ -251,24 +255,27 @@ def find_auth_ctx(ws, limit=80, visible=False):
     return 0
 
 
-def auth_layer_visible(ws):
+def auth_layer_visible(ws, deep=False):
     """授权层**此刻**是不是真的可见。返回 (visible, ctx)。
 
     用来区分两种「找不到按钮」：
       · 授权层压根没弹出来 → 该报错
       · 授权层弹了但已在关闭动画里 → 说明流程其实已经走完（比如已授权），不该再点
+
+    ⚠️ **默认只走快路径**（一次选择器广播）。`deep=True` 才启兜底（按主按钮文案反推），
+    因为兜底要为每个候选 ctx 各跑一次 `rect_of`，很贵 —— 实测在真机上会把脚本拖到超时。
     """
-    for sel in AUTH_SELECTORS:
-        hits = wxdom.find_ctx_with(ws, [sel], visible=True)
-        if hits:
-            return True, max(hits, key=hits.get)
-    # 兜底：主按钮可见就算
-    for w in LOGIN_WORDS[:2]:
-        hits = wxdom.find_ctx_with(ws, ["wx-button", "wx-view"], visible=True)
-        for ctx in sorted(hits, key=hits.get, reverse=True)[:4]:
-            d = wxdom.rect_of(ws, ctx, (w,))
-            if d and d["items"]:
-                return True, ctx
+    hits = wxdom.find_ctx_with(ws, AUTH_SELECTORS, visible=True)
+    if hits:
+        return True, max(hits, key=hits.get)
+    if not deep:
+        return False, 0
+    # 兜底：主按钮可见就算（选择器广播只做一次，别放进循环里重复付 12 秒）
+    hits = wxdom.find_ctx_with(ws, ["wx-button", "wx-view"], visible=True)
+    for ctx in sorted(hits, key=hits.get, reverse=True)[:3]:
+        d = wxdom.rect_of(ws, ctx, LOGIN_WORDS, timeout=6.0)
+        if d and d["items"]:
+            return True, ctx
     return False, 0
 
 

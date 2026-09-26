@@ -427,9 +427,23 @@ docker exec -e DISPLAY=:1 $WX python3 /tmp/wxqm_auth.py --title 呷哺呷哺 --d
 > 所以「选择器还在不在」不能当「授权层有没有弹出」的判据，要用可见性判断
 > （脚本内部用 `find_ctx_with(..., visible=True)`）。
 >
+> ⚠️⚠️ 而 `visible=True` **不能只看命中节点自己的矩形**：授权层是「容器根塌陷、
+> 内容在子节点」—— `#authorization` 自身 `w=0 h=0`（y=1188，视口才 779），
+> 但子树里有 27 个可见节点、含一个 410x779 铺满整屏的。只判根节点会把它判成
+> 「没弹出」，然后默默走错分支。判据是「**自身或其任一子孙可见**」。
+>
+> ⚠️ 还有个性能坑：`find_ctx_with` 一次调用 = 盲撒 80 个 ctx + 等响应。
+> **选择器要一次全传进去**（早先按选择器循环查，4 个 ≈ 48 秒，真机上像卡死）；
+> 收集窗口也不再干等满 12 秒 → 正常 ~2.5s。
+>
 > ⚠️ 别照搬上面的文件名清单就以为万事大吉 —— 引擎平时跑签到时是**自动投递** helper 的
 > （`ensure_helpers()`），但 `wxqm_auth.py` 是**你手动跑**的，所以要自己 `docker cp`。
 > 更省事的做法：`docker cp wxsign/. $WX:/tmp/`（整目录拷过去）。
+>
+> ⚠️ 呷哺打开时常自动弹一个营销活动页（`pluginMarketing/lottery/index/index`），
+> 它会**盖住底部 tabbar 和返回按钮** —— 从外面点不回去。而企迈的登录态要在正式页面
+> 才发请求（抓不到 → 报 `NOIDENT`）。用 `survey/qm_back.py` 用逻辑层
+> `wx.navigateBack()` 退回去：`DISPLAY=:1 python3 /tmp/qm_back.py`。
 
 **没跑过的症状**：日常签到打印 `RESULT <slug> code=NOIDENT msg=企迈会话失效/未登录`。
 

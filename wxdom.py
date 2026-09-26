@@ -233,18 +233,30 @@ def find_ctx_with(ws, selectors, limit=80, timeout=12.0, visible=False):
     所以正确姿势不是「先挑一个 ctx 再在里面找」，而是**反过来：先说要找什么，再看哪个 ctx 有**。
     `selectors` 传 CSS 选择器列表（如 `["#authorization"]`）。
 
-    ⚠️ `visible=True` 时只数**当前真的可见**的（矩形非 0 且中心在视口内）——
-    很多组件 hide 之后**节点仍留在 DOM 里**，只按「选择器在不在」判断会误以为它还开着。
-    实测：呷哺授权层关闭后 `#authorization` 一直在树上，只有矩形会塌成 0。
+    ⚠️ `visible=True` 时只数**当前真的可见**的 —— 很多组件 hide 之后**节点仍留在 DOM 里**，
+    只按「选择器在不在」判断会误以为它还开着。实测：呷哺授权层关闭后 `#authorization`
+    一直在树上，只有矩形会塌成 0。
+
+    ⚠️⚠️ **但不能只看命中节点自己的矩形**（2026-09-26 实测踩到，这条很反直觉）：
+    很多组件是「**容器根塌陷、内容在子节点**」。授权层就是典型 ——
+        `WX-STD-AUTHORIZATION#authorization`  自身 w=0 h=0 x=0 y=1188（视口 410x779）
+        但它的子树里有 27 个可见节点，其中一个 410x779（铺满整屏）
+    如果只判根节点矩形，就会把**明明弹着的授权层判成不可见** → 后续整条链路全错。
+    所以这里的判据是「**命中节点自身或其任一子孙可见**」。
     """
     if visible:
+        # 自身可见 → 计 1；否则看它的子孙里有没有可见的（容器根塌陷的情况，见上面的 ⚠️⚠️）
         js = ("(function(){try{var n=0;var s=%s;"
-              "for(var i=0;i<s.length;i++){var ns=document.querySelectorAll(s[i]);"
-              "for(var j=0;j<ns.length;j++){var r=ns[j].getBoundingClientRect();"
-              "if(r.width<6||r.height<6)continue;"
+              "var ok=function(e){var r=e.getBoundingClientRect();"
+              "if(r.width<6||r.height<6)return false;"
               "var cx=r.x+r.width/2,cy=r.y+r.height/2;"
-              "if(cx<0||cx>window.innerWidth||cy<0||cy>window.innerHeight)continue;"
-              "n++;}}}return n}catch(e){return -1}})()"
+              "return cx>=0&&cx<=window.innerWidth&&cy>=0&&cy<=window.innerHeight};"
+              "for(var i=0;i<s.length;i++){var ns=document.querySelectorAll(s[i]);"
+              "for(var j=0;j<ns.length;j++){"
+              "if(ok(ns[j])){n++;continue}"
+              "var kids=ns[j].querySelectorAll('*');"
+              "for(var k=0;k<kids.length;k++){if(ok(kids[k])){n++;break}}"
+              "}}return n}catch(e){return -1}})()"
               % json.dumps(list(selectors), ensure_ascii=False))
     else:
         js = ("(function(){try{var n=0;var s=%s;"
@@ -271,23 +283,43 @@ def _broadcast(ws, js, limit, timeout, kind="int"):
     t0 = time.time()
     # 收集窗口 12 秒：这轮要一口气收 80 条响应，收不完的话**残留响应会拖慢后面每一次读取**
     # （evaluate 得先把它们读掉才能等到自己那条）—— 实测 6 秒不够，会连锁失败。
-    while time.time() - t0 < timeout:
-        try:
-            m = json.loads(ws.recv_msg())
-        except Exception:
-            break
-        mid = m.get("id")
-        if not (isinstance(mid, int) and base < mid <= base + limit):
-            continue
-        v = ((m.get("result") or {}).get("result") or {}).get("value")
-        if v is None:
-            continue
-        try:
-            n = int(v)
-        except (TypeError, ValueError):
-            continue
-        if n > 0:
-            out[mid - base] = n
+    #
+    # ⭐ 但**别干等满**（2026-09-26 修正）：CDP 对不存在的 ctx 是不回包的，而 `recv_msg`
+    #    会一直阻塞到 socket 超时（`WS()` 默认 8s）才抛 `socket.timeout`。真机上表现为
+    #    「每次定位先卡十来秒、像卡死了」。这里两处一起收紧：
+    #      · 用 socket 自身的超时把「静默」翻译成异常 —— 一断就 break，不等满 timeout；
+    #      · 顺手把 socket 超时临时压到 2.5s（调用方之后自己会重置）。
+    #    正常情况（响应 200~600ms 到齐、静默 2.5s 后断）整个函数从 12s 降到 ~3s。
+    old_to = None
+    try:
+        old_to = ws.s.gettimeout()
+        ws.s.settimeout(2.5)
+    except Exception:
+        pass
+    try:
+        while time.time() - t0 < timeout:
+            try:
+                m = json.loads(ws.recv_msg())
+            except Exception:
+                break
+            mid = m.get("id")
+            if not (isinstance(mid, int) and base < mid <= base + limit):
+                continue
+            v = ((m.get("result") or {}).get("result") or {}).get("value")
+            if v is None:
+                continue
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                out[mid - base] = n
+    finally:
+        if old_to is not None:
+            try:
+                ws.s.settimeout(old_to)
+            except Exception:
+                pass
     return out
 
 

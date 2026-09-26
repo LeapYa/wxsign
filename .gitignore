@@ -16,7 +16,8 @@ addresses.25665*.json
 shots/
 
 # survey/ 是一次性调查现场（截图、解包产物、临时探针），整体忽略；
-# 只留一个真正有长期价值的诊断工具 —— 见下面的反向规则。
+# 只留真正有长期价值的诊断/运维工具 —— 见下面的反向规则。
 survey/*
 !survey/diagnostics_auth_ctx.py
 !survey/dump_auth_tree.py
+!survey/qm_back.py

@@ -149,6 +149,26 @@ def sibling_button(buf, W, box):
     return None
 
 
+def find_anon_dialog():
+    """找出「小尺寸匿名顶层窗口」（= 微信原生对话框）的窗口 id，没有则 None。
+
+    判据：无名字 + 尺寸在 100~500 × 80~400 之间的顶层窗口 = 微信原生对话框
+    （主窗口/面板都是 1280x1024；辅助窗口是 1x1/10x10/200x200，都被尺寸过滤掉）。
+    """
+    try:
+        out = R.run("DISPLAY=%s xwininfo -root -children" % R.DISPLAY)
+    except Exception:
+        return None
+    for line in out.splitlines():
+        m = re.match(r"\s+(0x[0-9a-fA-F]+) \(has no name\):\s+\(\)\s+(\d+)x(\d+)\+", line)
+        if not m:
+            continue
+        w, h = int(m.group(2)), int(m.group(3))
+        if 100 <= w <= 500 and 80 <= h <= 400:
+            return m.group(1)
+    return None
+
+
 def _activate_popup():
     """把「小尺寸匿名顶层窗口」（= 微信原生对话框）激活到最前。
 
@@ -157,23 +177,12 @@ def _activate_popup():
     （日志显示"点兄弟按钮（拒绝/取消）"，但框纹丝不动）。
     而「先 `xdotool windowactivate --sync <框>` 再点同一个坐标」**一次就成**。
     实测 Esc、Tab+Return 也都无效 —— 只有「先激活、再点击」有效。
-
-    判据：无名字 + 尺寸在 100~500 × 80~400 之间的顶层窗口 = 微信原生对话框
-    （主窗口/面板都是 1280x1024；辅助窗口是 1x1/10x10/200x200，都被尺寸过滤掉）。
     """
-    try:
-        out = R.run("DISPLAY=%s xwininfo -root -children" % R.DISPLAY)
-    except Exception:
+    wid = find_anon_dialog()
+    if not wid:
         return False
-    for line in out.splitlines():
-        m = re.match(r"\s+(0x[0-9a-fA-F]+) \(has no name\):\s+\(\)\s+(\d+)x(\d+)\+", line)
-        if not m:
-            continue
-        w, h = int(m.group(2)), int(m.group(3))
-        if 100 <= w <= 500 and 80 <= h <= 400:
-            R.run("DISPLAY=%s xdotool windowactivate --sync %s" % (R.DISPLAY, m.group(1)))
-            return True
-    return False
+    R.run("DISPLAY=%s xdotool windowactivate --sync %s" % (R.DISPLAY, wid))
+    return True
 
 
 def dismiss_popups(wid, W, H):
@@ -181,7 +190,17 @@ def dismiss_popups(wid, W, H):
 
     做法：在内容区找微信绿药丸按钮，点它同一行上的**兄弟按钮** ——
     隐私弹窗那颗是「拒绝」、退出登录那颗是「取消」，都是「不授权 / 不执行」的安全选项。
+
+    ⚠️ **硬前置（2026-09-26 实测加的防线）**：只在一个「匿名原生对话框窗口」**确实存在**
+    时才做像素扫描 + 点击。理由：`green_button()` 在主窗口内容区（尤其聊天列表 / 任意小程序
+    背景）会把**普通绿元素**误判成「弹窗绿药丸」，于是 `sibling_button` 的点击落到侧边栏的
+    「退出登录」那一行 —— **本来没有弹窗，却被点出一个「退出登录？」模态框**，之后所有点击
+    全被它吞掉，整批品牌跑废（复现症状：`wxopen` 卡死、`miniapp=None`、日志停在 `[clean]`）。
+    加了这道前置后，「无框不点」——没有再自己造框的可能。
     """
+    if not find_anon_dialog():
+        print("[clean] 没有匿名对话框 → 不做像素扫描（避免误点侧边栏造出弹窗）")
+        return False
     R.raise_window(wid)
     time.sleep(0.6)
     buf = R.grab(W, H)

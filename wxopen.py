@@ -94,13 +94,19 @@ R_PANEL_MAGNIFIER = (0.974, 0.0625)  # 面板内容区右上角搜索（放大�
 R_TABSTRIP = (0.05, 0.45, 0.004, 0.038)      # x0f,x1f,y0f,y1f
 
 # 「关窗」：**先认身份，再按窗口自身的比例算按钮位置**，点前还要验那儿真有字形（见 close_point）。
-#   · 小程序窗口：自绘标题栏，最右的 ◎ 在 (0.978W, 0.0435H)
+#   · 小程序窗口：自绘标题栏，最右的 ◎ 在 (0.93W, 0.045H)
+#     ⚠️ 2026-09-26 修正：旧值 (0.978W, 0.0435H) 是按**更宽的窗口**实测的，
+#     小程序窗口实测只有 410x776（◎ 胶囊中心在 x≈0.929W），0.978×410=401
+#     会贴到窗口右缘 20px 开外 → 落在 ◎ 热区边缘甚至之外，
+#     这就是「close_window 经常点不中 → 退化到 force_close_miniapp 的
+#     xdotool windowclose → WeChatAppEx 状态机损坏 → 之后所有小程序打不开」
+#     这条断链的起点。锚点修正后胶囊一击即中（已手工验证两次）。
 #   · 面板这类微信自己的窗口：顶部 chrome 的 ✕ 在 (0.979W, 0.0205H)
 #   · 主窗口的 ✕ 在 (0.983W, 0.017H) —— 和面板几乎重合，这就是危险所在：
 #     所以主窗口绝不作为关闭目标，标题叫「微信」的窗口还必须先通过面板芯片校验。
 # 旧写法是「盲点 (0.978W,0.041H)，不行再盲点 (0.978W,0.020H)」—— 后面那个正好压在
 # 主窗口的红底白✕上，多试一次就是关掉整个微信，已废弃。
-R_CLOSE_MINIAPP = (0.978, 0.0435)
+R_CLOSE_MINIAPP = (0.93, 0.045)
 R_CLOSE_PANEL = (0.979, 0.0205)
 
 # 主窗口搜索框（**只有「微信」标签下这个框才是全局搜索**）
@@ -150,9 +156,55 @@ def png(W, H, name):
     return p
 
 
+def _frame_swallows_first_click(x, y):
+    """这个点上的窗口是不是「整屏尺寸的 openbox frame」（会吃掉第一次 click）。
+
+    判据：`win_under()` 拿到的窗口虽然**无名**，但它的尺寸 **= 整个屏幕**，
+    且它不是我们列表里的具名窗口（微信 client 有标题「微信」/小程序有标题）。
+    满足就是「frame 盖住了 client」的情形 —— 此时第一次 click 只用来把焦点交给 frame。
+
+    ⚠️ 为什么不无脑双击：某些位置的点击**不能重复** —— 实测踩过的
+      「退出登录？确定/取消」确认框就在侧边栏左下角附近，连点两下可能点到「确定」
+      直接掉登录。所以只在**确知**第一次会被吞时才补第二下。
+    """
+    uw = win_under(x, y)
+    if uw is None:
+        return False
+    try:
+        g = geo(uw)
+        Wd, Hd = int(g["WIDTH"]), int(g["HEIGHT"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    sw, sh = size()
+    # ⚠️ 2026-09-26 二轮定案：**保持严格判据 `Wd >= sw`**（= 恒 False、单击模式）。
+    # 曾放宽为 `>= sw-4`，结果主窗口 client（实测 1276~1279 宽）全部命中 →
+    # 每一次点击都变双击：搜索框被双击 = 下拉开了又关、条目被双击 = 开错窗口，
+    # 比「frame 偶发吞掉第一次 click」危害大得多。而单击模式正是
+    # 辣可可/过桥缘成功路径实测使用的行为（18:42、19:35 两次验证）。
+    # frame 真吞点击的场景（刚最大化后第一次交互）由 close_anon_modal /
+    # force_close_miniapp 里各自的「补第二下」就地处理，不做全局双击。
+    return Wd >= sw and Hd >= sh
+
+
 def click(x, y, wait=0.7):
-    run("DISPLAY=%s xdotool mousemove %d %d; sleep 0.35; DISPLAY=%s xdotool click 1"
-        % (DISPLAY, int(x), int(y), DISPLAY))
+    """在屏幕绝对坐标 (x,y) 点一下。
+
+    ⚠️ 2026-09-26 实测定案：微信窗口带 openbox frame，**frame 若是整屏尺寸**
+    （窗口被最大化成 1280x1024 时就是这样）会**吃掉第一次 click** ——
+    第一次只用于把焦点交给 frame，第二次才真正落到 client。
+    症状极具迷惑性：`mousemove` 的 hover 高亮**正常**（EnterNotify 走得到），
+    但 click 毫无反应（实测：点击前后面板 0 像素变化）；连点两次立刻生效。
+
+    窗口**非全屏**（如刚登录时的 880x640）时 frame 与 client 同尺寸同位置重合，
+    一次就够 —— 所以**按需补第二下**（`_frame_swallows_first_click` 判定），
+    不无脑双击，避免在「退出登录？」这类确认框上连点两下点到「确定」。
+    """
+    run("DISPLAY=%s xdotool mousemove %d %d; sleep 0.35" % (DISPLAY, int(x), int(y)))
+    xdotool_click = "DISPLAY=%s xdotool click 1" % DISPLAY
+    run(xdotool_click)
+    if _frame_swallows_first_click(x, y):
+        time.sleep(0.20)
+        run(xdotool_click)
     time.sleep(wait)
 
 
@@ -230,18 +282,22 @@ def find_target_window():
 
 
 def ensure_main_fullscreen(W, H):
-    """把主窗口拉成 (0,0)×(W,H) 全屏 —— **跑之前必须做**，否则侧边栏全找不着。
+    """⛔ **已弃用，别再调用**（2026-09-26 实测定案）—— 保留只为兼容旧调用点。
 
-    为什么非做不可（2026-09-26 换小号时实测踩到）：
-      `find_rail_buttons()` 里的 `R_RAIL_COL = (14, 52)` 是**屏幕绝对坐标**，
-      隐含假定「主窗口铺满屏幕、从 (0,0) 开始」。而**刚登录 / 微信刚重启**时窗口是
-      880x640 停在 (200,192) —— 此时屏幕 x=14..52 那块是**窗口左边的黑桌面**，
-      逐通道取中位数得到 `bg = [0,0,0]`（纯黑），于是"与底色差 >55"的行**一个都没有**，
-      返回 `[]` → 上层报「侧边栏按钮没找全：[]」→ 判不出面板 → 一路 rc=3。
-      现象极像「面板坏了 / 得重启微信」，其实**只是窗口没全屏**。
-    修完立刻恢复：实测同一画面下 `[]` → `[62,114,162,210,258,306,354,402,940]`。
+    它当初是为了绕开「侧边栏扫描用屏幕绝对坐标、窗口不全屏就全空」而写的补丁。
+    但**那是治错了**：
 
-    只动位置与尺寸，不做任何点击（安全）。已经全屏则原样返回。
+    ① 真相：`find_rail_buttons()` 的 `R_RAIL_COL=(14,52)` 是**屏幕绝对坐标**，
+       而微信主窗口**不一定全屏**（刚登录/刚重启时是 `880x640@(200,192)`）。
+       全屏补丁把窗口拉大，只是**碰巧**让 x=14..52 落回窗口内 —— 坐标算错才是病根。
+
+    ② 代价：实测把窗口拉成 1280x1024 之后，**openbox 给窗口套的 frame 变成整屏尺寸**，
+       `getmouselocation` 在屏幕任意位置都返回那个 frame，`xdotool click` 的
+       **首次点击会被 frame 吃掉**（要点两次才生效）——
+       等于把一个「侧边栏扫不到」的 bug 换成一个**更难查的「点不动」** bug。
+
+    正解 = `find_rail_buttons()` 按主窗口实际几何扫描（`_rail_scan_geom`），
+    窗口多大都不影响定位。本函数**保留定义但不再被调用**，留作这段历史的记录。
     """
     main = find_main_window()
     if not main:
@@ -256,8 +312,8 @@ def ensure_main_fullscreen(W, H):
     run("DISPLAY=%s xdotool windowmove %s 0 0" % (DISPLAY, main))
     run("DISPLAY=%s xdotool windowsize %s %d %d" % (DISPLAY, main, W, H))
     time.sleep(1.0)
-    print("[reopen] 主窗口原本 %dx%d@(%d,%d)（非全屏）→ 已拉成 %dx%d@(0,0)"
-          "（不然侧边栏是屏幕绝对坐标，会全找不着）" % (Wd, Hd, X, Y, W, H))
+    print("[reopen] ⚠️ ensure_main_fullscreen 已弃用却被调用：主窗口 %dx%d@(%d,%d) → 拉成 %dx%d@(0,0)"
+          % (Wd, Hd, X, Y, W, H))
     return True
 
 
@@ -556,17 +612,97 @@ def close_window(wid, W=None, H=None, kind=None):
     return False
 
 
+def force_close_miniapp(wid, title=""):
+    """硬关一个**小程序窗口** —— 点它自己的 ◎ 胶囊（正常关闭流程），**不用 windowclose**。
+
+    ⚠️ 2026-09-26 实测定案：`xdotool windowclose` 对 WeChatAppEx 是**累积性损坏** ——
+    X 窗口销毁了，但微信内部的小程序状态机不复位（运行时认为小程序「半开着」），
+    损坏一两次看不出来，连着签几个品牌后彻底僵死：之后**任何**小程序都打不开
+    （hook 日志 20 分钟没有任何 miniapp connect 尝试，微信不再拉起新实例），
+    只能 pkill WeChatAppEx 全家再重 attach hook —— 这就是「每个品牌前都要杀运行时」
+    的根因。而点 ◎ 胶囊走的是微信自己的退出流程，运行时保持健康空闲，
+    实测关完立刻能连贯打开下一个（已验证：过桥缘 → 辣可可 连续两次成功）。
+
+      · 小程序窗口是 WeChatAppEx 的**独立 X 顶层窗口**（标题=小程序名），
+        `windowactivate --sync` 后盲点 ◎（R_CLOSE_MINIAPP 锚点）两下即可
+        （第一下可能只把焦点交给 openbox frame，见 click() 的说明）。
+      · **绝不能**对主窗口或面板用 —— 那会破坏微信内部状态（详见 close_window 的告诫）。
+        所以这里再加一道守卫：标题为「微信」或等于主窗口 id 的，一律拒关。
+      · 只在小程序窗口保留「微信自己的关闭按钮点不中」之后作为兜底，正常路径仍优先
+        走 close_window。windowclose 已从本函数**移除**。
+    """
+    if not wid or not title:
+        return False
+    if title.strip() == "微信" or is_main_window(wid) or str(wid) == str(find_main_window()):
+        print("[reopen] ⛔ %s（%s）不是小程序窗口 → 不用硬关" % (wid, title))
+        return False
+    print("[reopen] 兜底关小程序窗口 %s（%s）：盲点 ◎ 胶囊" % (wid, title))
+    run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
+    time.sleep(0.5)
+    g = geo(wid)
+    try:
+        X, Y, Wd, Hd = int(g["X"]), int(g["Y"]), int(g["WIDTH"]), int(g["HEIGHT"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    cx, cy = X + int(Wd * R_CLOSE_MINIAPP[0]), Y + int(Hd * R_CLOSE_MINIAPP[1])
+    for i in (1, 2):                     # 第一下可能只交焦点给 frame，补第二下
+        run("DISPLAY=%s xdotool mousemove %d %d; sleep 0.3" % (DISPLAY, cx, cy))
+        run("DISPLAY=%s xdotool click 1" % DISPLAY)
+        time.sleep(1.2 if i == 1 else 0.8)
+        if str(wid) not in dict(windows()):
+            print("[reopen] 已正常关闭 %s（第 %d 下）" % (wid, i))
+            return True
+    print("[reopen] ⚠️ 点 ◎ 也没关掉 %s —— 不再用 windowclose（会损坏运行时）" % wid)
+    return False
+
+
 # ───────────────────── 侧边栏 / 小程序面板 ─────────────────────
+
+def _rail_scan_geom(W, H):
+    """侧边栏扫描区域 `(x0, x1, y0, y1)` —— **按主窗口实际几何算**，不用屏幕绝对坐标。
+
+    侧边栏是主窗口最左边一条（图标列大约在窗口内 x=14..52）。
+    主窗口可能不全屏（实测刚登录时是 `880x640@(200,192)`），所以必须：
+      ① 取主窗口的 `X/Y/WIDTH/HEIGHT`；
+      ② 扫 `X+14 .. X+52` 这段（即窗口内左起 14~52 像素）；
+      ③ y 限定在窗口内，避免扫到窗口外的桌面。
+    主窗口认不出来时退回旧的屏幕绝对坐标（`0,0` 全屏态下与旧行为完全一致）。
+    """
+    main = find_main_window()
+    g = geo(main) if main else None
+    try:
+        X, Y = int(g["X"]), int(g["Y"])
+        Wd, Hd = int(g["WIDTH"]), int(g["HEIGHT"])
+    except (TypeError, KeyError, ValueError):
+        return R_RAIL_COL[0], R_RAIL_COL[1], 0, H
+    return X + R_RAIL_COL[0], X + R_RAIL_COL[1], Y, Y + Hd
+
 
 def find_rail_buttons(W, H):
     """侧边栏按钮的 y 中心：图标列里"与底色不同"的行聚成带。
-    返回全部按钮中心（含顶部头像与底部固定图标），按 y 升序。"""
-    x0, x1 = R_RAIL_COL
+    返回全部按钮中心（含顶部头像与底部固定图标），按 y 升序。
+
+    ⚠️ 2026-09-26 实测定案：**不能用屏幕绝对坐标 `R_RAIL_COL=(14,52)` 扫**。
+    微信主窗口**不一定是全屏** —— 刚登录/刚重启时它是 `880x640@(200,192)`，
+    此时屏幕 x=14..52 落在**窗口左边的黑桌面**上，逐通道取中位数得到 `bg=[0,0,0]`，
+    于是"与底色差 >55"的行一个都没有 → 返回 `[]` → 上层报「侧边栏按钮没找全」→ rc=3。
+    现象极像「面板坏了 / 得重启微信」，其实只是**窗口没铺满屏幕**。
+
+    旧解法是 `ensure_main_fullscreen()` 把窗口强拉成 1280x1024 —— **那是错的**：
+    实测全屏后 openbox 给窗口套的 frame 会变成整屏尺寸，`xdotool click` 首次点击
+    被 frame 吃掉（要连点两次才生效），把一个「算错坐标」的 bug 换成了「点不动」的 bug。
+    正解 = **按主窗口实际几何扫描**（见 `_rail_scan_geom`），窗口多大就扫多大。
+    """
+    x0, x1, y_off, y_end = _rail_scan_geom(W, H)
     buf = grab(W, H)
+    x0 = max(0, min(x0, W - 1))
+    x1 = max(x0 + 1, min(x1, W))
+    y_off = max(0, min(y_off, H - 1))
+    y_end = max(y_off + 1, min(y_end, H))
 
     # 底色取该列的中位数（逐通道），采样即可
     samples = [[], [], []]
-    for y in range(0, H, 3):
+    for y in range(y_off, y_end, 3):
         base = y * W * 3
         for x in range(x0, x1, 3):
             i = base + x * 3
@@ -575,7 +711,7 @@ def find_rail_buttons(W, H):
     bg = [sorted(s)[len(s) // 2] for s in samples]
 
     rows = []
-    for y in range(0, H):
+    for y in range(y_off, y_end):
         base = y * W * 3
         n = 0
         for x in range(x0, x1):
@@ -666,6 +802,41 @@ def reload_panel(W, H):
     return None
 
 
+def close_stray_wechat_windows(main, W, H):
+    """关掉**误开的微信窗口**（搜一搜 / 视频号 / 公众号等）。
+
+    为什么需要：点侧边栏图标时若点错（图标列表是动态的，序号会变），会开出
+    「搜一搜」这类窗口 —— 它**标题也叫「微信」、全屏 1279x1023、无 WM_CLASS**，
+    会一直挡在最上层，导致后续所有点击都落到它身上、`top_window()` 永远返回它
+    → 面板永远判不出来（实测踩到：点错一次，之后试遍所有图标全无反应）。
+
+    判据（**只关确定是"误开窗口"的**，宁可不关也不错关）：
+      · 不是主窗口；
+      · 标题是「微信」（微信自己的浏览器式窗口都叫这个）；
+      · `has_miniapp_tab()` 为假（确认**不是**小程序面板 —— 真面板要留着）。
+    关法：优先用窗口右上角的关闭按钮（点 ×）；`close_window()` 因「标题=微信
+    且不是面板」会拒绝关它，所以这里走 `windowclose`（XTEST 发 WM_DELETE_WINDOW）。
+    ⚠️ 这类窗口不是小程序/面板，微信内部没有需要复位的特殊状态，
+       `windowclose`（发 WM_DELETE_WINDOW，由应用自己处理）是安全的。
+    """
+    killed = []
+    for wid, t in windows():
+        if str(wid) == str(main) or str(wid) == str(find_main_window()):
+            continue
+        if is_main_window(wid):
+            continue
+        if (t or "").strip() != "微信":
+            continue                     # 有别的标题的（小程序窗口）不碰
+        if has_miniapp_tab(wid, W, H):
+            continue                     # 这是真正的小程序面板，留着
+        run("DISPLAY=%s xdotool windowclose %s" % (DISPLAY, wid))
+        killed.append(wid)
+    if killed:
+        print("[reopen] 关掉误开的微信窗口：%s" % ", ".join(killed))
+        time.sleep(1.2)
+    return killed
+
+
 def open_panel(W, H):
     """打开（或置顶）小程序面板：点侧边栏顶部那组里的**最后一个**按钮（=「小程序」）。
 
@@ -681,9 +852,10 @@ def open_panel(W, H):
         print("[reopen] 找不到微信主窗口")
         return None
 
-    # ⭐ 先确保主窗口全屏 —— `find_rail_buttons` 用的是屏幕绝对坐标，
-    #    窗口不在 (0,0) 全屏时侧边栏检测会全空（见 ensure_main_fullscreen 的说明）。
-    ensure_main_fullscreen(W, H)
+    # ⚠️ 这里**不要**再把主窗口拉全屏了（旧代码调 `ensure_main_fullscreen`）。
+    #    侧边栏检测已经改成按主窗口实际几何扫描（见 `_rail_scan_geom`），
+    #    窗口多大都找得着；强行拉全屏反而会让 openbox frame 变成整屏尺寸、
+    #    首次点击被 frame 吃掉（要连点两次）。详见 `find_rail_buttons` 的说明。
 
     # ⭐ 面板**已经开着就直接复用，绝不点侧边栏**（2026-09-25 踩到，代价很重）。
     #    侧边栏那个「小程序」按钮是**切换**语义：面板开着时点它 = **把它关掉**；
@@ -709,6 +881,18 @@ def open_panel(W, H):
             print("[reopen] 面板已经开着（窗口 %s）→ 直接复用，不点侧边栏" % wid)
             return wid
 
+    # ⚠️ 2026-09-26 实测定案：**不能只点「顶部组最后一个」**（旧写法 `y = top[-1]`）。
+    #    那个写法的前提是「小程序图标恰好是顶部组最后一个」—— 实测**不成立**：
+    #    侧边栏图标是**动态列表**，会随使用习惯增减（实测多出过「搜一搜」）。
+    #    880x640 窗口下扫到 `[254,306,359,402,450,498,546,594,748]`，
+    #    第 7 个(546)=小程序、第 8 个(594)=搜一搜，`top[-1]=594` 点成了**搜一搜**
+    #    → 弹出的窗口标题也叫「微信」、全屏、无 WM_CLASS，`has_miniapp_tab()` 判否
+    #    → 日志表现成「面板打不开」，其实是**点错了图标**。
+    #    更坏的是：在侧边栏乱点可能点到左下角的「退出登录」区，弹出确认框（实测踩到过）。
+    #
+    #    所以改成：**从下往上逐个试顶部组按钮**，每点一个立刻验证「顶上是否出现
+    #    带小程序标签的面板」—— 认出来了就返回，认不出就试下一个。
+    #    这样不依赖图标序号/形状，图标列表怎么变都能找到小程序那一个。
     for attempt in (1, 2):
         # 点侧边栏前必须确认**主窗口真的在最前**，否则点击会落到别的窗口上乱点
         # （上面那个「退出登录」框就是这么点出来的）。
@@ -720,22 +904,30 @@ def open_panel(W, H):
         if len(top) < 2:
             print("[reopen] 侧边栏按钮没找全：%s" % buttons)
             return None
-        y = top[-1]
-        print("[reopen] 第%d次点侧边栏「小程序」按钮 y=%d" % (attempt, y))
-        if not click_in(main, R_RAIL_X, y / float(H), 3.0, "（侧边栏·小程序）"):
-            return None
-        for _ in range(6):
-            time.sleep(1.5)
-            wid = top_window(W, H)
-            if not wid or str(wid) == str(main):
-                continue
-            if win_class(wid) or title_of(wid) != "微信":
-                break                            # 顶上不是微信自己的窗口，另说
-            if has_miniapp_tab(wid, W, H):
-                print("[reopen] 面板就位（窗口 %s）" % wid)
-                return wid
-            print("[reopen] 顶上这个「微信」窗口的标签条里没有「小程序」（图标不对）")
-            break
+        # 从下往上试（小程序一般靠后，先试概率高的）；跳过第 1 个（那是账号头像，
+        # 点它会弹资料卡）
+        for n, y in enumerate(reversed(top[1:]), 1):
+            # ⚠️ **每轮开始前先关掉上一轮误开的窗口**（如搜一搜/视频号）—— 它们是
+            #    全屏顶层窗口，会一直挡在上面，导致后面所有点击都落到它身上、
+            #    `top_window` 永远返回它 → 全部尝试都判否（实测踩到：点错一次开成
+            #    搜一搜，之后试遍所有图标都没反应）。
+            close_stray_wechat_windows(main, W, H)
+            if not raise_window(main):
+                return None
+            print("[reopen] 第%d轮·试第%d个侧边栏按钮 y=%d" % (attempt, n, y))
+            if not click_in(main, R_RAIL_X, y / float(H), 2.5, "（侧边栏·试小程序）"):
+                return None
+            for _ in range(4):
+                time.sleep(1.2)
+                wid = top_window(W, H)
+                if not wid or str(wid) == str(main):
+                    continue
+                if win_class(wid) or title_of(wid) != "微信":
+                    break                        # 顶上不是微信自己的窗口，另说
+                if has_miniapp_tab(wid, W, H):
+                    print("[reopen] 面板就位（窗口 %s，侧边栏 y=%d）" % (wid, y))
+                    return wid
+                break                            # 这个图标开的不是小程序面板，换下一个
     # 点侧边栏判不出来 —— 先把**面板 webview 自己**救一次（Ctrl+R），最便宜且常有奇效。
     print("[reopen] 侧边栏判不出来 → 试 Ctrl+R 重载面板 webview")
     wid = reload_panel(W, H)
@@ -1196,6 +1388,7 @@ def open_via_search(W, H):
         # 没匹配到号）才退回搜一搜结果页 —— 两套坐标体系不同，别混用。
         rows = find_dropdown_miniapps(grab(W, H), W, H)
         click_x = int(W * 0.12)
+        is_dropdown = True               # 下拉是临时弹层：点开真实条目就收；搜一搜页不收
         print("[reopen] 第%d轮：下拉里找到 %d 个小程序条目：%s" % (round_no, len(rows), rows))
         if not rows:
             print("[reopen] 下拉里没有小程序条目 → 退回搜一搜结果页")
@@ -1203,16 +1396,33 @@ def open_via_search(W, H):
                 continue
             rows = find_rows(grab(W, H), W, H)
             click_x = int(W * 0.28)
+            is_dropdown = False
             print("[reopen] 第%d轮：结果页找到 %d 行：%s" % (round_no, len(rows), rows))
         if not rows:
             continue
         main = find_main_window()
         baseline = {wid for wid, _ in windows()}
-        for i, y in enumerate(rows[:6], 1):
+        # ⚠️ 2026-09-26：试点行数从固定 6 提到可配置（默认 10）。
+        #    为什么：keyword 一旦偏宽（如过桥缘用「过桥缘」而非全名「过桥缘游戏中心」），
+        #    下拉里会挤进一堆同品牌/近名条目，目标被顶到第 7 行之后 → 原来 rows[:6] 根本试不到，
+        #    症状是「两轮都扫完还没打开」却看不出原因（实测：过桥缘 4 项里目标掉在外面，
+        #    换成完整名 keyword 后落到第 2 行立刻命中）。
+        #    纯上限放宽，命中即返回，不会因为多试几行而变慢（没命中才多花时间）。
+        max_rows = int(os.environ.get("WXSIGN_TRY_ROWS", "10") or 10)
+        tried = []                               # 已试过的行 y（±10 容差判重，防重建后重复点开同一条）
+        while len(tried) < max_rows:
+            cand = None
+            for y in rows:
+                if all(abs(y - t) > 10 for t in tried):
+                    cand = y
+                    break
+            if cand is None:
+                break
+            tried.append(cand)
             close_anon_modal(W, H)             # 逐行点之前都清一次：框一冒出来后面全是白点
-            print("[reopen] 第%d轮 试第 %d 行 y=%d" % (round_no, i, y))
+            print("[reopen] 第%d轮 试第 %d 行 y=%d" % (round_no, len(tried), cand))
             TOUCHED[0] = True
-            click(click_x, y, 3.0)
+            click(click_x, cand, 3.0)
             wid, title = find_target_window()
             if wid:
                 print("[reopen] 打开成功：%s" % title)
@@ -1221,9 +1431,108 @@ def open_via_search(W, H):
             for wid_, title_ in windows():        # 开错了就关掉，别越堆越多
                 if wid_ not in baseline and TARGET not in title_ and title_.strip() != "微信":
                     print("[reopen] 开错了（%s），关掉" % title_)
-                    close_window(wid_, W, H, kind="miniapp")
+                    # ⚠️ 2026-09-26：先走「微信自己的关闭按钮」（close_window）。
+                    #    那个按钮在这台环境**经常点不中**（字形探测判否 → 直接放弃），
+                    #    于是错误的窗口一直堆着，把主窗口盖住、搜索框都点不着，
+                    #    整轮搜索就废了（实测：打开「辣可可现炒黄牛肉」≠目标「…i」，
+                    #    关不掉 → 第2轮下拉窜成 6 行 → 全 miss）。
+                    #    失败后再补一条**只针对小程序窗口**的硬关：`xdotool windowclose`。
+                    #    为什么这里可以用：小程序窗口是 WeChatAppEx 的独立 X 窗口，
+                    #    `windowactivate --sync` 后 `windowclose` 实测能干净关掉，
+                    #    且**不影响**再来一次搜索重开（已手工验证）。
+                    #    绝不对「面板 / 主窗口」用这条（那才会破坏微信内部状态）。
+                    if not close_window(wid_, W, H, kind="miniapp"):
+                        force_close_miniapp(wid_, title_)
             raise_window(main)                    # 页面可能被带走了，拉回主窗口
+            # ⚠️ 2026-09-26 治本：下拉是**临时弹层** —— 点开任何真实条目（不管对错）
+            #    它就收掉了。旧实现继续按旧 y 盲点下一行，点击全落在主窗口聊天列表上
+            #    （jiucun 实测：VIP 在 y=135 被点开收掉下拉，目标 YX 在 y=199 永远试不到，
+            #    两轮白跑直到外层超时被 SIGTERM，还连累 hook 被 restart_hook 杀死）。
+            #    正解：每行点完只要没开成，就探一次下拉是否还在（「搜索网络结果」行在 = 下拉在），
+            #    不在就 do_search 重建并重扫，再从未试过的行继续；搜一搜结果页是持久页面，不用重建。
+            if is_dropdown and not find_netsearch_row(grab(W, H), W, H):
+                print("[reopen] 下拉已收 → 重新展开再试下一行")
+                if not do_search(W, H, box):
+                    break
+                rows = find_dropdown_miniapps(grab(W, H), W, H)
+                print("[reopen] 重建下拉：%d 个条目 %s" % (len(rows), rows))
     print("[reopen] 两轮都扫完还没打开")
+    return False
+
+
+def open_via_souyisou(W, H):
+    """搜一搜结果页路径：主窗口搜索 → 点「搜索网络结果」进搜一搜 → 点第一行小程序结果。
+
+    **2026-09-26 新增为主力路径。** 为什么需要它：
+    搜索下拉的布局是**动态的** —— 搜索建议行数随历史/热词变化（实测同一关键词，
+    「最近使用过的小程序」条目一次在 y=133、一次被 5 行建议挤到 y=338），
+    任何「固定 y / 前 N 行试错」都会漂；`find_dropdown_miniapps` 的彩色-logo 扫描
+    也会被建议区/标题区干扰（实测返回 [60,243,337,377]，目标在 337 但前两行
+    都是误判，点错还可能误触退出登录框）。
+    而**搜一搜结果页布局固定**：第一个「小程序」结果恒在页面第一行
+    （2026-09-26 实测 2/2：过桥缘、辣可可均一击即中，窗口标题精确匹配）。
+
+    步骤：do_search(goto_net=True) 进搜一搜 → find_rows 扫行 → 逐行点 + 标题复核，
+    开错用 force_close_miniapp（◎ 胶囊正常关闭，不损坏运行时）关掉试下一行。
+    """
+    main = find_main_window()
+    for round_no in (1, 2):
+        close_anon_modal(W, H)
+        if not ensure_chat_tab(W, H):
+            return False
+        box = find_search_box(W, H)
+        if not box:
+            print("[reopen] 没找到全局搜索框 → 搜一搜路径退出")
+            return False
+        if box[3] > PLACEHOLDER_MAX:
+            print("[reopen] 搜索框占位文字跨度 %d（局部搜索）→ 不用" % box[3])
+            return False
+        baseline = {wid for wid, _ in windows()}
+        if not do_search(W, H, box, goto_net=True):      # 点「搜索网络结果」进搜一搜
+            continue
+        time.sleep(3)
+        # 搜一搜页 = 「标题=微信、无 WM_CLASS」的副窗口。优先用本轮新开的；
+        # 已有一个现成的（上次搜索留下的）就直接复用 —— 实测微信对
+        # 「搜索网络结果」是**复用**已有搜一搜窗口而非新开。
+        sousou = None
+        for wid, t in windows():
+            if wid in baseline or str(wid) == str(main):
+                continue
+            if (t or "").strip() == "微信" and not win_class(wid):
+                sousou = wid
+                break
+        if not sousou:
+            for wid, t in windows():
+                if str(wid) == str(main):
+                    continue
+                if (t or "").strip() == "微信" and not win_class(wid):
+                    sousou = wid
+                    break
+        if not sousou:
+            print("[reopen] 没等到搜一搜窗口 → 重试")
+            continue
+        print("[reopen] 搜一搜窗口 %s 就位，扫结果行" % sousou)
+        raise_window(sousou)
+        rows = find_rows(grab(W, H), W, H)
+        print("[reopen] 第%d轮：结果页 %d 行：%s" % (round_no, len(rows), rows))
+        for i, y in enumerate(rows[:6], 1):
+            close_anon_modal(W, H)
+            raise_window(sousou)
+            print("[reopen] 第%d轮 试结果页第 %d 行 y=%d" % (round_no, i, y))
+            TOUCHED[0] = True
+            click(int(W * 0.25), y, 5.0)
+            wid, title = find_target_window()
+            if wid:
+                print("[reopen] 打开成功：%s" % title)
+                png(W, H, "reopen_done.png")
+                return True
+            for wid_, title_ in windows():               # 开错了就正常关掉，别堆
+                if wid_ not in baseline and wid_ != sousou \
+                        and TARGET not in title_ and title_.strip() != "微信":
+                    print("[reopen] 开错了（%s），关掉" % title_)
+                    if not close_window(wid_, W, H, kind="miniapp"):
+                        force_close_miniapp(wid_, title_)
+        # 本轮没成：留着搜一搜窗口（下轮复用），别重复开窗口
     return False
 
 
@@ -1426,22 +1735,33 @@ def main():
         print("[reopen] 已经打开：%s" % t)
         return 0
 
-    print("[reopen] 主路径：小程序面板 → 搜索 → 点结果卡片")
-    if open_via_panel(W, H):
+    # ⚠️ 顺序在 2026-09-26 调整过：**先走主窗口搜索**，再轮面板。
+    #    为什么：实测本环境里「小程序面板」**根本开不出来**（WMPF 正常、侧边栏 7 个按钮
+    #    全试两遍、窗口树毫无变化，右侧始终只有微信水印），而面板路径的 7×2 次尝试
+    #    把 `timeout` 全烧光 —— 轮到本该能救场的搜索兜底时**已经被外部 timeout 杀掉了**
+    #    （症状：`wxopen` 无产出、exit 124，看起来像「整个挂死」）。
+    #    搜索路径**不依赖面板**，实测能直接搜到并打开小程序 —— 它是本环境的事实主路径。
+    #    面板路径保留在搜索失败之后，作为换环境的兼容兜底。
+    print("[reopen] 主路径：主窗口搜索（不依赖面板）")
+    if open_via_search(W, H):
         return 0
 
-    # 面板失败有两类原因，其中一类极阴：**匿名模态框把点击全吃了** —— 症状与「面板坏了」一模一样。
-    # 先清一次框再试一次面板：很便宜，能救回「其实只是被框挡着」的情况。
+    # 搜索失败可能是**匿名模态框把点击全吃了** —— 症状与「搜索坏了」一模一样。
+    # 先清一次框再试一次搜索：很便宜，能救回「其实只是被框挡着」的情况。
     if close_anon_modal(W, H):
-        print("[reopen] 清掉匿名模态框后重试面板")
-        if open_via_panel(W, H):
+        print("[reopen] 清掉匿名模态框后重试搜索")
+        if open_via_search(W, H):
             return 0
 
-    # 另一类是面板**真的开不出来**（2026-09-25 实测：WMPF 进程健康、无僵尸、点击也正常，
-    # 点侧边栏「小程序」图标时窗口树毫无变化）。别再纠缠面板 ——
-    # 主窗口顶部搜索**不依赖面板**，实测能直接搜到并打开小程序，且能用 appId 复核。
-    print("[reopen] 面板路径失败 → 改走主窗口搜索（不依赖面板）")
-    if open_via_search(W, H):
+    # ⚠️ 2026-09-26：下拉布局是动态的（建议行数变化会把小程序条目挤到任意 y），
+    #    下拉路径失败后**先走搜一搜结果页**（布局固定、第一行恒为目标小程序，
+    #    实测最稳），再退到面板。
+    print("[reopen] 下拉路径失败 → 改走搜一搜结果页")
+    if open_via_souyisou(W, H):
+        return 0
+
+    print("[reopen] 搜索路径失败 → 改走小程序面板")
+    if open_via_panel(W, H):
         return 0
 
     print("[reopen] 改走甄选兜底")

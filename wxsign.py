@@ -403,7 +403,7 @@ def clean_leftovers(hard=False):
     """
     if not INSTANCE:
         return False
-    args = ["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY, cpath(CTMP, "wxclean.py")]
+    args = ["docker", "exec", "-e", "DISPLAY=:1", "-e", "PYTHONUNBUFFERED=1", INSTANCE, CPY, cpath(CTMP, "wxclean.py")]
     if hard:
         args.append("--restart-runtime")
     try:
@@ -475,7 +475,7 @@ def leftover_count():
     if not INSTANCE:
         return 0
     try:
-        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", "-e", "PYTHONUNBUFFERED=1", INSTANCE, CPY,
                             cpath(CTMP, "wxclean.py"), "--count"],
                            capture_output=True, text=True, timeout=120)
     except Exception:
@@ -489,7 +489,7 @@ def leftover_count():
 
 def _wxopen(brand):
     """开一次小程序，返回 (rc, output)。"""
-    args = ["docker", "exec", "-e", "DISPLAY=:1",
+    args = ["docker", "exec", "-e", "DISPLAY=:1", "-e", "PYTHONUNBUFFERED=1",
             "-e", "WXSIGN_MINIAPP=" + brand["miniapp"],
             "-e", "WXSIGN_KEYWORD=" + brand["keyword"],
             INSTANCE, CPY, cpath(CTMP, "wxopen.py"), "--loose"]
@@ -566,7 +566,7 @@ def agree_privacy(rounds=4):
     if os.environ.get("WXSIGN_NO_AGREE", "") == "1":
         return 0
     try:
-        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", "-e", "PYTHONUNBUFFERED=1", INSTANCE, CPY,
                             cpath(CTMP, "wxagree.py"), str(rounds)],
                            capture_output=True, text=True, timeout=180)
     except Exception as e:
@@ -676,7 +676,7 @@ def discover_appid(kw, max_cards=6):
         log("[!] 需要 WOC_INSTANCE（要操作微信界面）")
         return None
     ensure_helpers()
-    args = ["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+    args = ["docker", "exec", "-e", "DISPLAY=:1", "-e", "PYTHONUNBUFFERED=1", INSTANCE, CPY,
             cpath(CTMP, "wxfind.py"), kw, str(max_cards)]
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=1800)
@@ -919,7 +919,7 @@ def yd_ident(brand, wait=15):
         return None, None
     ensure_helpers()
     try:
-        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", "-e", "PYTHONUNBUFFERED=1", INSTANCE, CPY,
                             cpath(CTMP, "wxyd.py"), brand.get("appid", ""), str(wait)],
                            capture_output=True, text=True, timeout=180)
     except Exception as e:
@@ -1052,7 +1052,7 @@ def wzl_ident(brand, wait=15):
         return None
     ensure_helpers()
     try:
-        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", "-e", "PYTHONUNBUFFERED=1", INSTANCE, CPY,
                             cpath(CTMP, "wxcode.py"), brand.get("appid", ""), str(wait)],
                            capture_output=True, text=True, timeout=180)
     except Exception as e:
@@ -1209,7 +1209,7 @@ def qm_ident(brand, wait=12):
         return None
     ensure_helpers()
     try:
-        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", "-e", "PYTHONUNBUFFERED=1", INSTANCE, CPY,
                             cpath(CTMP, "wxqm.py"), brand.get("appid", ""), str(wait)],
                            capture_output=True, text=True, timeout=180)
     except Exception as e:

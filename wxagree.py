@@ -67,16 +67,28 @@ def raise_miniapp(ox, oy):
                 continue
             if abs(int(m.group(1)) - ox) <= 2 and abs(int(m.group(2)) - oy) <= 2:
                 # ⚠️ 「位置对得上」还不够 —— 必须再排掉**尺寸不像小程序**的窗口
-                #    （2026-09-26 实测踩到）：小程序没开成时页面原点是 (0,0)，
-                #    而 xsettingsd 这类**1x1 的辅助窗口**、以及 10x10 的
-                #    `Chromium clipboard` / `WeChatAppEx` 恰好也在 (0,0) 附近，
-                #    于是被当成目标发 `windowactivate --sync` ——
-                #    **1x1 窗口不接受激活，--sync 会阻塞满 15s 超时**，
-                #    日志表现为 `置顶窗口异常：... timed out after 15 seconds` × N 轮，
-                #    白白拖慢整个流程，且真正的目标窗口从未被置顶。
-                #    小程序窗口实测 410x776 / 面板 1280x1024，所以「宽或高 < 200」一律排除。
+                #    （2026-09-26 实测踩到，两轮才修准）：
+                #    小程序没开成时页面原点是 (0,0)，而一堆**微信自己的辅助窗口**恰好也在 (0,0)：
+                #      · `xsettingsd`        1x1
+                #      · `Chromium clipboard` 10x10（在 -100,-100）
+                #      · `WeChatAppEx`（无名）10x10 @(10,10)
+                #      · `WeChatAppEx`（无名）**200x200 @(0,0)** ← 最难缠的一个
+                #    于是被当成目标发 `windowactivate --sync`：**这些窗口都不接受激活，
+                #    `--sync` 会阻塞满 15s 超时**（日志 `置顶窗口异常：... timed out after 15 seconds` ×N），
+                #    白白拖慢流程，且真正的目标窗口从未被置顶。
+                #    第一版阈值写的 `< 200` —— **200x200 那个正好卡在边界上漏了**，
+                #    所以这里取 **400**：小程序窗口实测 410x776（最窄的小程序也不低于 ~400），
+                #    400 能干净排掉所有辅助窗口，又不会误伤真小程序。
                 sm = re.search(r"Geometry:\s*(\d+)x(\d+)", g or "")
-                if sm and (int(sm.group(1)) < 200 or int(sm.group(2)) < 200):
+                if sm and (int(sm.group(1)) < 400 or int(sm.group(2)) < 400):
+                    continue
+                # 再排掉**微信主窗口**：它有 WM_CLASS=wechat，是唯一的"正牌"身份标记。
+                # 小程序没开成时它的页面原点也是 (0,0)，尺寸又够大（1280x1024），
+                # 不排掉就会被当成小程序置顶 —— 虽然无害（主窗口置顶是安全的），
+                # 但会误导：日志说「已置顶小程序窗口」其实置顶的是主窗口。
+                wc = subprocess.run("DISPLAY=%s xprop -id %s WM_CLASS 2>/dev/null" % (wxreg.DISPLAY, wid),
+                                    shell=True, capture_output=True, text=True, timeout=10).stdout or ""
+                if "wechat" in wc.lower():
                     continue
                 subprocess.run(
                     "DISPLAY=%s xdotool windowactivate --sync %s; "

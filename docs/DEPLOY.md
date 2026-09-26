@@ -629,6 +629,9 @@ docker exec woc-hook grep -m1 'script loaded' /tmp/wmpf.log
 | CDP 一个 context 都读不到（`ctx=0`） | hook 只在启动时 attach 一次：重启过 hook、或杀过 `WeChatAppEx` 之后没重开小程序 → `bash wmpf/restart_hook.sh`，**再把小程序重开一次** |
 | 一直「小程序没开成」 | 微信没登录，或 `brands.json` 里 appId / miniapp 名写错 |
 | 日志里「点侧边栏『小程序』按钮 y=…」点了两次都「没能确认小程序面板」，整批都这样 | **多半是微信弹着模态框**（最常见是「退出登录？确定/取消」）—— 模态框会吞掉之后所有点击，症状伪装成「面板打不开」。脚本现在每轮都会自动遣散（`clear_modals`），若仍复现就截个图看：`docker exec -e DISPLAY=:1 $WX ffmpeg -f x11grab -video_size 1280x1024 -i :1 -frames:v 1 /tmp/s.png` |
+| 「侧边栏按钮没找全：`[]`」（一个都没找到，且**没有官方弹窗**） | **微信主窗口没全屏**。`find_rail_buttons` 用的 `R_RAIL_COL=(14,52)` 是**屏幕绝对坐标**，主窗口停在 880x640@(200,192)（刚登录 / 刚重启就是这个尺寸）时，那块是窗口外的黑桌面 → 底色取到纯黑 → 一行都检不出。`open_panel` 现在会先 `ensure_main_fullscreen` 自动拉成全屏并打一行日志；若仍复现，手工 `docker exec -e DISPLAY=:1 $WX xdotool windowmove <主窗id> 0 0; xdotool windowsize <主窗id> 1280 1024` |
+| 日志出现 `[agree] 置顶窗口异常：... windowactivate --sync ... timed out after 15 seconds`（连着好几次） | 小程序**没开成**时页面原点是 (0,0)，而 `xsettingsd`(1x1)、`Chromium clipboard`(10x10) 这些辅助窗口也落在 (0,0) 附近 → 被 `raise_miniapp` 当成目标去激活，**1x1 窗口不接受激活、`--sync` 会阻塞满 15s**。已加「宽或高 < 200 一律排除」；若在旧版上遇到，看开头是不是就「小程序没开成」 |
+| 搜索下拉里明明有目标卡片，`find_dropdown_miniapps` 报的 y 却是另一组值、逐张点都点空 | **竞态**：输入关键词后下拉还没渲染完就抓屏。脚本每轮会重扫，通常下一轮就对上；连续两轮都错位才需要看 `shots/*/reopen_search_dropdown.png`（小号多一个「最近使用过的小程序」分组，卡片整体下移） |
 | 侧边栏堆着「华夏家博 / 永伟美发店 / 媚姐养生会所」这类窗口，关不掉 | 那是微信小程序面板里的**推广位**，常规关窗（点关闭按钮）对它无效，攒到五六个就把侧边栏堵死 → 硬清：`docker exec -e DISPLAY=:1 $WX python3 /tmp/wxclean.py --restart-runtime`，**然后必须** `bash wmpf/restart_hook.sh`（引擎现在也会自己这么做） |
 | `RESULT code=208/211` | token 失效 —— 重跑一次即可（脚本会自己刷） |
 | `RESULT code=401` | 该账号还不是这个品牌的会员 → 脚本会自动注册；若仍失败，看 `[ui]` 日志与 `shots/<slug>/` 截图 |

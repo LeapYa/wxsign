@@ -66,6 +66,18 @@ def raise_miniapp(ox, oy):
             if not m:
                 continue
             if abs(int(m.group(1)) - ox) <= 2 and abs(int(m.group(2)) - oy) <= 2:
+                # ⚠️ 「位置对得上」还不够 —— 必须再排掉**尺寸不像小程序**的窗口
+                #    （2026-09-26 实测踩到）：小程序没开成时页面原点是 (0,0)，
+                #    而 xsettingsd 这类**1x1 的辅助窗口**、以及 10x10 的
+                #    `Chromium clipboard` / `WeChatAppEx` 恰好也在 (0,0) 附近，
+                #    于是被当成目标发 `windowactivate --sync` ——
+                #    **1x1 窗口不接受激活，--sync 会阻塞满 15s 超时**，
+                #    日志表现为 `置顶窗口异常：... timed out after 15 seconds` × N 轮，
+                #    白白拖慢整个流程，且真正的目标窗口从未被置顶。
+                #    小程序窗口实测 410x776 / 面板 1280x1024，所以「宽或高 < 200」一律排除。
+                sm = re.search(r"Geometry:\s*(\d+)x(\d+)", g or "")
+                if sm and (int(sm.group(1)) < 200 or int(sm.group(2)) < 200):
+                    continue
                 subprocess.run(
                     "DISPLAY=%s xdotool windowactivate --sync %s; "
                     "DISPLAY=%s xdotool windowraise %s" % (wxreg.DISPLAY, wid, wxreg.DISPLAY, wid),

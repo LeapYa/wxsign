@@ -229,6 +229,38 @@ def find_target_window():
     return None, None
 
 
+def ensure_main_fullscreen(W, H):
+    """把主窗口拉成 (0,0)×(W,H) 全屏 —— **跑之前必须做**，否则侧边栏全找不着。
+
+    为什么非做不可（2026-09-26 换小号时实测踩到）：
+      `find_rail_buttons()` 里的 `R_RAIL_COL = (14, 52)` 是**屏幕绝对坐标**，
+      隐含假定「主窗口铺满屏幕、从 (0,0) 开始」。而**刚登录 / 微信刚重启**时窗口是
+      880x640 停在 (200,192) —— 此时屏幕 x=14..52 那块是**窗口左边的黑桌面**，
+      逐通道取中位数得到 `bg = [0,0,0]`（纯黑），于是"与底色差 >55"的行**一个都没有**，
+      返回 `[]` → 上层报「侧边栏按钮没找全：[]」→ 判不出面板 → 一路 rc=3。
+      现象极像「面板坏了 / 得重启微信」，其实**只是窗口没全屏**。
+    修完立刻恢复：实测同一画面下 `[]` → `[62,114,162,210,258,306,354,402,940]`。
+
+    只动位置与尺寸，不做任何点击（安全）。已经全屏则原样返回。
+    """
+    main = find_main_window()
+    if not main:
+        return False
+    g = geo(main)
+    try:
+        X, Y, Wd, Hd = int(g["X"]), int(g["Y"]), int(g["WIDTH"]), int(g["HEIGHT"])
+    except (KeyError, ValueError):
+        return False
+    if X == 0 and Y == 0 and Wd == W and Hd == H:
+        return True
+    run("DISPLAY=%s xdotool windowmove %s 0 0" % (DISPLAY, main))
+    run("DISPLAY=%s xdotool windowsize %s %d %d" % (DISPLAY, main, W, H))
+    time.sleep(1.0)
+    print("[reopen] 主窗口原本 %dx%d@(%d,%d)（非全屏）→ 已拉成 %dx%d@(0,0)"
+          "（不然侧边栏是屏幕绝对坐标，会全找不着）" % (Wd, Hd, X, Y, W, H))
+    return True
+
+
 def raise_window(wid):
     """把窗口提到最前。windowactivate 走 EWMH（要窗口管理器配合），windowraise 走
     XRaiseWindow，两个都发一遍最稳 —— 有别的窗口挡着时，点侧边栏/面板都会落到别人身上
@@ -648,6 +680,10 @@ def open_panel(W, H):
     if not main:
         print("[reopen] 找不到微信主窗口")
         return None
+
+    # ⭐ 先确保主窗口全屏 —— `find_rail_buttons` 用的是屏幕绝对坐标，
+    #    窗口不在 (0,0) 全屏时侧边栏检测会全空（见 ensure_main_fullscreen 的说明）。
+    ensure_main_fullscreen(W, H)
 
     # ⭐ 面板**已经开着就直接复用，绝不点侧边栏**（2026-09-25 踩到，代价很重）。
     #    侧边栏那个「小程序」按钮是**切换**语义：面板开着时点它 = **把它关掉**；

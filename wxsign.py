@@ -1346,6 +1346,178 @@ def do_sign_qm(brand, env):
     return False, rc, _say(r)
 
 
+# ── OPPO 商城（oppo）后端 ─────────────────────────────────────────────
+# 会话是 `NEWOPPOSID` + `openid` 两个请求头（s_channel=program_wx）。这两个值由小程序
+# 自己拿 wx.login 的 code 去 OPPO 服务端换 —— 我们拿不到也不需要 code，只读它发业务
+# 请求时带出来的头（wxoppo.py，容器内跑）。这正是 2026-07 那版 get_token.py 验证过的路。
+# 接口（2026-07 已验证）：
+#     GET  /users/web/member/info                              验会话
+#     GET  /cn/oapi/marketing/cumulativeSignIn/getSignInDetail 查签到档期/进度
+#     POST /cn/oapi/marketing/cumulativeSignIn/signIn          签到（body {activityId}）
+OPPO_BASE = "https://msec.opposhop.cn"
+_OPPO_HOST = OPPO_BASE.split("//", 1)[1]
+_OPPO_CONN = [None]
+# OPPO 网关认的固定头。s_version 随小程序版本变、Referer 随活动页变，都允许 brands.json 覆盖。
+OPPO_FIXED_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "s_channel": "program_wx",
+    "source_type": "503",
+    "Personalized": "1",
+    "xweb_xhr": "1",
+}
+
+
+def _oppo_once(path, data=None, sid="", openid="", method="GET", extra=None):
+    """单次请求。复用连接 —— 理由与 _api_post_once / _qm_once 相同（临时端口耗尽）。"""
+    headers = dict(OPPO_FIXED_HEADERS)
+    headers.update(extra or {})
+    if sid:
+        headers["NEWOPPOSID"] = sid
+    if openid:
+        headers["openid"] = openid
+    body = json.dumps(data).encode() if data is not None else None
+    try:
+        conn = _OPPO_CONN[0]
+        if conn is None:
+            conn = http.client.HTTPSConnection(_OPPO_HOST, timeout=20, context=_SSL)
+            _OPPO_CONN[0] = conn
+        conn.request(method, path, body=body, headers=headers)
+        r = conn.getresponse()
+        raw = r.read().decode(errors="replace")
+        # 业务码全在 body 的 code 里；被 WAF 拦时会回 HTML，按非 JSON 记传输失败
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {"_transport": 1, "msg": "HTTP %s 且非 JSON（前 160 字：%s）"
+                                            % (r.status, raw[:160])}
+    except Exception as e:
+        _OPPO_CONN[0] = None
+        return {"_transport": 1, "msg": "传输失败：%s" % e}
+
+
+def oppo_request(path, data=None, sid="", openid="", method="GET", extra=None, retries=3):
+    """带重试。判据用 `_transport`（OPPO 的业务字段是 code/message）。"""
+    r = None
+    for attempt in range(retries + 1):
+        r = _oppo_once(path, data, sid, openid, method, extra)
+        if not r.get("_transport"):
+            return r
+        if attempt < retries:
+            wait = 2.0 * (attempt + 1)
+            log("  [net] %s 第 %d 次失败（%s），%.1fs 后重试"
+                % (path, attempt + 1, str(r.get("msg"))[:60], wait))
+            time.sleep(wait)
+    return r
+
+
+def oppo_ident(brand, wait=12):
+    """在小程序里读 OPPO 的会话（NEWOPPOSID + openid），见 wxoppo.py。"""
+    if not INSTANCE:
+        log("  [oppo] 未设 WOC_INSTANCE → 取不到会话")
+        return None
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxoppo.py"), brand.get("appid", ""), str(wait)],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        log("  [oppo] 执行异常：%s" % e)
+        return None
+    out = (p.stdout or "") + (p.stderr or "")
+    got = None
+    for line in out.splitlines():
+        if line.startswith("OPPO_JSON="):
+            try:
+                got = json.loads(line[len("OPPO_JSON="):])
+            except ValueError:
+                pass
+        elif line.strip():
+            log("     " + line.strip()[:180])
+    if not got:
+        log("  [oppo] 没读到会话（wxoppo.py rc=%s）" % p.returncode)
+        return None
+    return got
+
+
+def do_sign_oppo(brand, env):
+    """OPPO 商城后端签到。返回 (是否成功, 业务码, 说明)。
+
+    链路：wxoppo.py 读 NEWOPPOSID+openid → 查签到档期 → POST signIn {activityId}。
+    返回码：200 成功 / 5008 今日已签 / 5005 活动不存在（activityId 换档期了）。
+    """
+    activity = env.get("OPPO_ACTIVITY") or brand.get("oppo_activity") or ""
+    if not activity:
+        return False, "NOACTID", "缺 oppo_activity（OPPO 签到活动 ID，换档期时要更新）"
+    extra = {
+        "s_version": str(env.get("OPPO_SVERSION") or brand.get("oppo_sversion") or "80457"),
+        "Referer": env.get("OPPO_REFERER") or brand.get("oppo_referer")
+                   or "https://hd.opposhop.cn/bp/b371ce270f7509f0",
+        "User-Agent": UA,
+    }
+
+    ident = oppo_ident(brand)
+    if not ident or not ident.get("sid"):
+        return False, "NOIDENT", "拿不到 OPPO 会话 NEWOPPOSID（小程序开着吗？hook 通吗？）"
+    sid, openid = ident.get("sid", ""), ident.get("openid", "")
+    # 小程序真实请求里除了 NEWOPPOSID/openid 还带 `constToken`（另一个值）。
+    # 实测它不是必需的（只留 NEWOPPOSID+openid 也能通），但既然抓到就原样带上，少一个变量。
+    if ident.get("const_token"):
+        extra["constToken"] = ident["const_token"]
+
+    # ① 「你是谁」——**只打印，不作门槛**。
+    #    ⚠️⚠️ 2026-09-27 两处纠正：
+    #    (a) 老版本拿这个接口的 code==200 当「会话有效」的硬门槛，而它现在**恒回 403**
+    #        （接口级拦截/WAF，不是会话问题）→ 把明明有效的会话判成 NOTOKEN、
+    #        在签到**之前**就中止了（实测踩到）。
+    #    (b) 路径也写错了：真实路径是 `/users/web/member/infoDetail`（带 Detail），
+    #        `/users/web/member/info` 不存在 → 403 有一部分就是这么来的。
+    #    现在：换成正确路径、且**成功与否都不拦**，会话有效性交给签到接口自己回答。
+    me = oppo_request("/users/web/member/infoDetail", sid=sid, openid=openid, extra=extra)
+    if str(me.get("code")) == "200" and me.get("data"):
+        d = me["data"] if isinstance(me["data"], dict) else {}
+        log("  [member] 会话对应账号：%s" % (d.get("userName") or d.get("nickName") or d.get("phone") or "?"))
+    else:
+        log("  [member] member/infoDetail 回 code=%s（不拦，继续签到）" % me.get("code"))
+
+    # ② 查档期/进度 —— **这一步是幂等判据的来源**（2026-09-27 新增）。
+    #    ⚠️ 为什么不再"先试签一次、靠错误码认已签"：活动换档期后 signIn 会回
+    #    `5007 活动已经结束`，与"今天签过了"**语义完全混淆**（实测踩到：拿 7 月的
+    #    activityId 去签，服务端回 5007，被误当作失败）。而 `todaySignIn` 是服务端
+    #    直接背书的「今天签过了」，判它干净、准，还省一次写请求。
+    det = oppo_request("/cn/oapi/marketing/cumulativeSignIn/getSignInDetail?activityId=%s" % activity,
+                       sid=sid, openid=openid, extra=extra)
+    if str(det.get("code")) == "200" and isinstance(det.get("data"), dict):
+        dd = det["data"]
+        awards = dd.get("baseAwards") or []
+        done = sum(1 for a in awards if isinstance(a, dict) and a.get("status") == 1)
+        log("  [info] 签到档期 OK：本轮 %d/%d 天，今日已签=%s"
+            % (done, len(awards), dd.get("todaySignIn")))
+        if dd.get("todaySignIn") is True:
+            return True, "415", "今日已签到（todaySignIn=true，本轮 %d/%d 天）" % (done, len(awards))
+    else:
+        log("  [info] 查档期回 code=%s msg=%s（继续尝试签到）"
+            % (det.get("code"), str(det.get("message") or det.get("msg") or "")[:80]))
+
+    # ③ 签到（5008/已签 视为幂等成功）
+    r = oppo_request("/cn/oapi/marketing/cumulativeSignIn/signIn",
+                     {"activityId": int(activity)}, sid=sid, openid=openid,
+                     method="POST", extra=extra)
+    if r.get("_transport"):
+        return False, "NETFAIL", "网络失败：%s" % str(r.get("msg"))[:120]
+    rc = str(r.get("code"))
+    msg = str(r.get("message") or r.get("msg") or "")
+    if rc == "200":
+        return True, "200", "签到成功%s" % (("：" + json.dumps(r.get("data"), ensure_ascii=False)[:120])
+                                          if r.get("data") else "")
+    if rc == "5008" or "已签" in msg or "签过" in msg:
+        return True, "415", msg[:120] or "今日已签到"
+    if rc in ("5005", "5007"):
+        # 5005 = 活动不存在；5007 = 活动已经结束（**换档期**的典型症状）
+        return False, "NOACT", "活动不存在/已结束（oppo_activity 换档期了，要更新）：%s" % msg[:120]
+    return False, rc, "%s（code=%s）" % (msg[:120], rc)
+
+
 # 后端 → 签到实现。往后加新后端只需要三步：写一个 `do_sign_xxx(brand, env)`
 # → 在这张表里注册一行 → brands.json 里给条目写 `engine`（不写 = 吾享）。
 # 主流程（main）也读这张表做分派，别再往 if 链里塞。
@@ -1353,6 +1525,7 @@ _SIGNERS = {
     "eingdong": do_sign_yd,
     "weizulin": do_sign_wzl,
     "qmai": do_sign_qm,
+    "oppo": do_sign_oppo,
 }
 
 

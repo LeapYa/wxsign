@@ -181,6 +181,16 @@ def find_allow_in(buf, W, H, box):
     return ((best[0] + best[-1]) // 2, (min(ys) + max(ys)) // 2)
 
 
+def dismiss_dialogs(ws, tries=4, tag=""):
+    """关掉弹在最上层的小对话框（转调 `wxdom.dismiss_dialogs`，**实现只留一份**）。
+
+    ⚠️ 我先写的是「连按 Escape + 画面差异验证」，实测**无效**：
+    Escape 关不掉 H5 自带的「订阅提示」框（画面变化 0.0%），
+    它只对微信原生框（getPhoneNumber 授权）有效。正确做法是按文案点按钮 —— 见 wxdom 里的说明。
+    """
+    return wxdom.dismiss_dialogs(ws, tries=tries, tag=tag)
+
+
 def wait_allow(ws, wait=20.0, before=None):
     """等微信**原生**「允许」框并点掉。
 
@@ -278,15 +288,8 @@ def probe_login(ws, ctx):
                   % (it["tag"], str(it.get("cls"))[:34], it["w"], it["h"], it["cx"], it["cy"]))
 
 
-def ensure_mine_page(ws, page_ctx):
-    """走到「我的」（个人中心）页，返回 mine_ctx（0 = 失败）。**幂等**。
-
-    导航实测（OPPO 商城）：
-        首页（页面 ctx 4，innerText 1159 字全是商品名）
-          → 点**底部导航「我的」** —— 注意底部导航是 `wx-cover-view`，
-            文字**不在 innerText 里**，只能用 `rect_of` 按文案点
-          → 「我的」页（未登录时有「个人中心」「登录账号」；已登录时有昵称/卡券/积分）
-    """
+def _goto_mine_once(ws, page_ctx):
+    """（内部）单次尝试切到「我的」页 → 返回 mine_ctx（0 = 失败）。"""
     mine_ctx = ctx_with_text(ws, MINE_KW)
     if mine_ctx:
         return mine_ctx
@@ -294,7 +297,7 @@ def ensure_mine_page(ws, page_ctx):
     if not nav_ctx:
         print("[oppo-auth] ✗ 定位不到页面 ctx —— 小程序开着吗？")
         return 0
-    print("[oppo-auth] 当前停在首页（页面 ctx=%d）→ 点底部「我的」" % nav_ctx)
+    print("[oppo-auth] 当前不在「我的」页（页面 ctx=%d）→ 点底部「我的」" % nav_ctx)
     wxreg.refresh_page(ws, nav_ctx)
     if not click_text(ws, nav_ctx, "我的", what="底部导航「我的」"):
         return 0
@@ -302,8 +305,23 @@ def ensure_mine_page(ws, page_ctx):
     mine_ctx = ctx_with_text(ws, MINE_KW)
     if not mine_ctx:
         print("[oppo-auth] ✗ 点了「我的」也没进个人中心")
-        return 0
     return mine_ctx
+
+
+def ensure_mine_page(ws, page_ctx):
+    """走到「我的」（个人中心）页，返回 mine_ctx（0 = 失败）。**幂等 + 自愈**。
+
+    ⚠️ 为什么要「自愈」（实测定案）：OPPO 商城**有时**一打开就弹一个 H5 的
+    「订阅提示」（我知道了 / 去设置），它盖在最上层**把点击全吃掉** ——
+    这时点底部导航「我的」**毫无反应**，现场表现就是「点了没反应」，
+    查起来很像坐标算错。所以：**第一次失败 → 清一遍弹窗 → 再试一次**。
+    """
+    mine_ctx = _goto_mine_once(ws, page_ctx)
+    if mine_ctx:
+        return mine_ctx
+    print("[oppo-auth] 第一次没切过去 → 先清一遍弹窗（可能是「订阅提示」挡着），再试")
+    wxdom.dismiss_dialogs(ws, tag="[nav]")
+    return _goto_mine_once(ws, page_ctx)
 
 
 def open_login_page(ws, mine_ctx):
@@ -360,7 +378,14 @@ def main():
 
     wxreg.raise_miniapp()
 
-    # ── ⓪ 先走到「我的」页 —— 它是判断「有没有登录态」的地方 ──
+    # ── ⓪ 先把**微信自己弹的小对话框**清掉 ──
+    #    实测会遇到的：`小程序申请发送以下消息`（订阅申请）、`订阅提示`（我知道了/去设置）、
+    #    以及各种确认框。它们**盖在最上层吞掉所有点击** —— 不清掉，
+    #    后面不管是点底部导航还是点登录按钮全都会落到它们身上（现场表现：点了没反应）。
+    #    用 Escape + 画面差异验证（见 `dismiss_dialogs`），零坐标、可确认。
+    dismiss_dialogs(ws, tag="[start]")
+
+    # ── ⓪.1 走到「我的」页 —— 它是判断「有没有登录态」的地方 ──
     mine_ctx = ensure_mine_page(ws, page_ctx)
     if not mine_ctx:
         return 3
@@ -399,10 +424,9 @@ def main():
     #    不在登录页就重走导航（`ensure_login_page` 是幂等的）。
     wxreg.raise_miniapp()
     time.sleep(0.4)
-    wxreg.run("DISPLAY=%s xdotool key Escape" % wxreg.DISPLAY)
-    time.sleep(1.2)
+    dismiss_dialogs(ws, tag="[pre-sign]")
     if not ctx_with_text(ws, LOGIN_KW):
-        print("[oppo-auth] Escape 之后不在登录页了 → 重新走一遍导航")
+        print("[oppo-auth] 清完弹窗后不在登录页了 → 重新走一遍导航")
         login_ctx = ensure_login_page(ws, page_ctx)
         if not login_ctx:
             return 3

@@ -1,6 +1,6 @@
 {
   "_comment": "小程序签到·活动合集 —— 品牌表。静态信息在此，凭证在 brands/<slug>.env。",
-  "_engines": "两个后端：缺省 = 吾享（wuuxiang / 天财商龙 CRM7，见 crm_base）｜eingdong = 易东（zhyx.eingdong.com，链路见 survey/YD_API.md）。条目用 engine 字段选，不写就是 wuuxiang。",
+  "_engines": "两个后端：缺省 = 吾享（wuuxiang / 天财商龙 CRM7，见 crm_base）｜eingdong = 易东（zhyx.eingdong.com，链路见 survey/YD_API.md）。条目用 engine 字段选，不写就是 wuuxiang。｜oppo = OPPO 商城（msec.opposhop.cn；会话是请求头 NEWOPPOSID+openid，读小程序自己发的头；见条目 note）。",
   "engine_version": 1,
   "crm_base": "https://scrm.wuuxiang.com/crm7game-api",
   "login_url": "https://wechat.wuuxiang.com/i5xforyou/auth/login",
@@ -252,6 +252,19 @@
       "enabled": true,
       "verified": true,
       "note": "**企迈系·已跑通真机签到**（2026-09-26）。商户号 storeId=214176，签到活动 `qm_activity`=1212715500988841985（商户级固定，随「我的 →每日签到」入口由服务端下发，包里没有，所以要配在这里）。\n\n链路（两个接口、参数只有 `{activityId, storeId}`）：`POST /web/mealmate-apiserver/cmk-center/sign/userSignStatistics` 查今天签没签 → `POST .../takePartInSign` 签到。\n\n⚠️ 与李先生的**关键差别**：呷哺**不把登录态持久化到 storage**（`loginData` 是空串），token 只活在内存里 —— 所以 wxqm.py 对它走**第二条路：抓真实请求头**（开 CDP Network domain → 重载页面 → 从它自己的请求头读 `Qm-User-Token` + `store-id`，顺带读到 `Qm-From-Type=mealmate`）。\n\n⚠️ **「绑手机号」是接入时的一次性动作，不是每天**：绑定关系在企迈**服务端**（绑 openid）**永久有效**，所以只有**接入该品牌的第一次**要过一遍授权；之后每次开小程序静默登录拿到的 token 就已经是「已绑」状态 —— 日常签到全自动（呷哺连着几天自动跑通即是实证）。首次那一步**技术上也能自动**，且不是新东西：与吾享系的**自动注册**（`wxreg.py`）是同一回事 —— 授权弹层是小程序自己的 DOM（CDP 直接调 `popAuthorization()` / 勾选方法），点「手机号一键登录」是派发点击 `open-type=getPhoneNumber` 的 button，只有最后一个微信**原生**「允许」框要系统级输入（容器里 xdotool 合成点击，已实测有效）。首次那一步**也已经自动了** —— `wxqm_auth.py`（容器内跑，`--title <窗口标题>` 指定品牌，每个品牌跑一次）。它**零硬编码坐标**：授权层的勾选 / 登录按钮走 `wxdom` 按文案定位，微信原生「允许」框走像素（白卡里的绿色横向主段），坐标系一律问页面自己（CDP 的 window.screenX/screenY）→ 窗口变侧边栏形态也成立。已用**李先生牛肉面大王**做过完整首测。\n\n⚠️ 别被 `integral/sign/*` 骗了：包里另有一套积分商城的签到，它对同一商户的 `detail` 回 `400042 商家未开启此功能` —— **那是误导性错误码**，我据此连着下了三次「商户没开活动」的错误结论。真正的是 `cmk-center/sign/*`。"
+    },
+    {
+      "slug": "oppo",
+      "name": "OPPO商城",
+      "appid": "wx9c825da1a7ba062e",
+      "keyword": "OPPO商城",
+      "miniapp": "OPPO商城",
+      "engine": "oppo",
+      "type": "sign",
+      "enabled": true,
+      "verified": true,
+      "oppo_activity": "2094340289534894080",
+      "note": "**第四个后端：OPPO 商城（opposhop.cn）** —— 不是餐饮会员积分，是 OPPO 官方商城的「每日签到得积分」。\n\n会话 = `NEWOPPOSID` + `openid` 两个**请求头**（`constToken` 实测非必需，抓到就一起带）。\n由小程序拿 wx.login 的 code 自己去 OPPO 服务端换；我们不碰 code，只读它发业务请求时带出来的头（`wxoppo.py`，容器内跑；从 storage 的 `logininfo` 里取 `encryptedSession`/`openId`）。\n⚠️ **别用键名启发式找 sid**：storage 里还有个 `constToken`，键名含 token 会被误当成 sid（2026-09-27 踩过这个坑 → 请求被服务端判「用户未登录」403）。认死 `logininfo.encryptedSession`。\n\n首次登录（要绑手机号）已全自动：`wxoppo_auth.py` 走「我的 → 登录 → 手机号快捷登录 →微信原生 getPhoneNumber 授权框 → 允许」；绑定由服务端按 openid 记，一辈子一次；**已有登录态时会自动识别并跳过**（判据是「我的」页渲染出的昵称/积分，不是 storage 有没有 sid）。\n\n接口（前缀用 `https://msec.opposhop.cn`，实测与 H5 的 `https://hd.opposhop.cn/api` 等价）：\n  · GET  /cn/oapi/marketing/cumulativeSignIn/getSignInDetail?activityId=… 查档期/进度；\n        返回 `todaySignIn`（服务端背书的「今天签过了」）与 `baseAwards`（7 天，status=1 已签）\n  · POST /cn/oapi/marketing/cumulativeSignIn/signIn  body `{activityId}` 签到\n返回码：200 成功 / 5005·5007 活动不存在或已结束（= **换档期了**，要更新 oppo_activity）。\n幂等：**先看 getSignInDetail.todaySignIn==true → 直接判 415**，不去试签（避免 5007 与「已签」语义混淆）。\n\n`oppo_activity` 是**公开的活动常量**（不是凭证），所以放这里而不是 env。\n**怎么在换档期后拿新 ID**（2026-09-27 实战得出，这是最省事的办法）：\n  1. 打开小程序 → 「我的」→ 点右上角**红色「签到」图片按钮** → 进入承载它的 **H5**「积分商城」\n     （URL 形如 `https://hd.opposhop.cn/bp/b371ce270f7509f0?...`）；\n  2. H5 是 **web-view，独立 CDP target**（type=webview）—— 主 page 的 ctx 列表里看不到它，\n     必须 `Target.attachToTarget(flatten)` 拿 sessionId 才能操作；\n  3. **关键**：初始请求发生在 attach 之前，抓不到。用     `Page.addScriptToEvaluateOnNewDocument` 注入 XHR/fetch hook，再在 H5 **内部**     `location.reload()`（⚠️ 别用 `Page.reload` —— 那会刷新整个 target、把 H5 关掉），\n     重载后 hook 生效，`window.__reqs` 里就有 `getSignInDetail?activityId=<新ID>`。\n  4. 也可以直接读 H5 的 Vue 实例 data（`document.querySelector('*').__vue__.$data.activityId`），\n     但那是**页面 DSL 的 ID（11510）**，不是签到活动 ID —— 别混淆。\n\n⚠️ 历史：2026-07 曾用 Qoder Work 做过**纯 HTTP 版**（github.com/LeapYa/oppo-sign），卡在「token 会过期、而刷新 token 必须要小程序」（那边的 get_token.py 依赖 WMPFDebugger 手工抓），于是搁置。现在容器里就有 hook，会话可随时自动刷新 → 整条打通，签到回到引擎里来。\n\n实测（2026-09-27）：档期 2026-09-24~09-30，`todaySignIn=true`（当天已签）、本轮 1/7 天。"
     }
   ]
 }

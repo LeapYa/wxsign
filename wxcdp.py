@@ -97,7 +97,17 @@ class WS(object):
         masked = bytes(payload[i] ^ mask[i % 4] for i in range(n))
         self.s.sendall(head + mask + masked)
 
-    def send(self, obj):
+    def send(self, obj, sessionId=None):
+        """发一条 CDP 命令。`sessionId` 非空时带上（= flatten 模式下的**子 target**会话）。
+
+        为什么需要它：小程序里的 **web-view（H5）是独立 target** ——
+        它的 JS 与网络请求都不在主 page 的会话里，必须
+        `Target.attachToTarget(flatten=True)` 拿到 sessionId，
+        再用该 sessionId 发 `Runtime.evaluate` / 收 `Network.requestWillBeSent`。
+        """
+        if sessionId:
+            obj = dict(obj)
+            obj["sessionId"] = sessionId
         self._send_frame(1, json.dumps(obj).encode())
 
     def close(self):

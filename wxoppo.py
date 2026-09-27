@@ -34,31 +34,55 @@ except ImportError:
     sys.path.insert(0, "/tmp")
     from wxcdp import WS
 
-# ── 路线 ①：storage 探针（同步）。键名不固定，整库扫一遍找会话字段。 ──
+# ── 路线 ①：storage 探针（同步）。**先按已知键名取**，泛扫只作兜底。 ──
+# ⚠️⚠️ 2026-09-27 治本：老实现是「整库扫一遍 + 键名含 sid/token 就当会话」——
+#    于是 `constToken` 这个键名里含 "token" → **被当成 sid 取走**，
+#    而**真正的 NEWOPPOSID 是 `logininfo.encryptedSession`**
+#    （一个 Base64 的 `{"iv":…,"value":…}` 加密信封，实测 328 字符）。
+#    后果：拿 constToken 当 NEWOPPOSID 发出去 → 签到接口回 **`403 用户未登录`**
+#    （会话其实完全有效，纯粹是值取错了 —— 排查了很久）。
+#    实测对照（同一次运行、逐字符比对）：
+#      · 真实请求头 NEWOPPOSID = `eyJpdiI6IkhWSG9iSTY1WHphZytJdG9JTE5pbEE9PSIsInZhbHVlIjoi…`
+#        ＝ storage 的 `logininfo.encryptedSession` ✓
+#      · `constToken` = `VH/NMaGPlolFJQEBVAeIUf0DzQD+EHS4@bj` —— 是另一个头，不是 NEWOPPOSID。
+#    所以改成：① 先读 `logininfo`（主路）② `constToken` 单独取（它要发给服务端）
+#    ③ 都没有才泛扫，且泛扫时**排除 constToken 这类键名**。
 PROBE = """
 (function () {
-  var out = { sid: '', openid: '', appid: '' };
+  var out = { sid: '', openid: '', constToken: '', appid: '', src: '' };
   try { out.appid = wx.getAccountInfoSync().miniProgram.appId; } catch (e) {}
+  try { out.constToken = wx.getStorageSync('constToken') || ''; } catch (e) {}
+  // ① 主路：logininfo 里就是会话本体
   try {
-    var info = wx.getStorageInfoSync();
-    var keys = info.keys || [];
-    for (var i = 0; i < keys.length; i++) {
-      var v = null;
-      try { v = wx.getStorageSync(keys[i]); } catch (e) { continue; }
-      if (v === null || v === undefined || v === '') continue;
-      var s = (typeof v === 'string') ? v : JSON.stringify(v);
-      // 会话字段可能是裸串，也可能埋在某个 JSON 里；两种都试
-      var m = s.match(/NEWOPPOSID["']?\\s*[:=]\\s*["']?([A-Za-z0-9_\\-\\.]{8,})/i);
-      if (m && !out.sid) out.sid = m[1];
-      var mo = s.match(/openid["']?\\s*[:=]\\s*["']?([A-Za-z0-9_\\-]{8,})/i);
-      if (mo && !out.openid) out.openid = mo[1];
-      // 键名直接叫 sid / newopposid / token 的也认
-      var k = keys[i].toLowerCase();
-      if (!out.sid && /sid|newopposid|token/.test(k) && typeof v === 'string' && v.length > 8) {
-        out.sid = v;
-      }
+    var li = wx.getStorageSync('logininfo');
+    if (li) {
+      var o = (typeof li === 'string') ? JSON.parse(li) : li;
+      out.openid = o.openId || '';
+      out.sid = o.encryptedSession || '';     // ← NEWOPPOSID 就是它
+      if (out.sid) out.src = 'logininfo';
     }
-  } catch (e) { out.err = '' + e; }
+  } catch (e) {}
+  // ② 兜底：整库泛扫（**跳过 constToken** —— 它键名含 token 但不是 NEWOPPOSID）
+  if (!out.sid) {
+    try {
+      var info = wx.getStorageInfoSync();
+      var keys = info.keys || [];
+      for (var i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        if (/consttoken|const_token/i.test(k)) continue;
+        var v = null;
+        try { v = wx.getStorageSync(k); } catch (e) { continue; }
+        if (v === null || v === undefined || v === '') continue;
+        var s = (typeof v === 'string') ? v : JSON.stringify(v);
+        var m = s.match(/encryptedSession["']?\\s*[:=]\\s*["']([A-Za-z0-9_\\-\\+\\/=]{20,})/i);
+        if (m && !out.sid) { out.sid = m[1]; out.src = 'scan'; }
+        if (!out.openid) {
+          var mo = s.match(/["']?openId["']?\\s*[:=]\\s*["']([A-Za-z0-9_\\-]{8,})/i);
+          if (mo) out.openid = mo[1];
+        }
+      }
+    } catch (e) {}
+  }
   return JSON.stringify(out);
 })()
 """
@@ -108,7 +132,6 @@ def collect_by_storage(want_appid="", wait=6.0):
             d["from"] = "storage"
             return d
     return None
-
 
 def collect_by_network(want_appid="", wait=20.0):
     """路线 ②：抓发往 opposhop.cn 的请求头里的 NEWOPPOSID + openid。
@@ -170,9 +193,12 @@ def main():
         return 1
 
     out = {"appid": d.get("appid", ""), "sid": d.get("sid", ""),
-           "openid": d.get("openid", ""), "from": d.get("from", "")}
-    print("[oppo] appid=%s openid=%s sid=%s… source=%s"
-          % (out["appid"], out["openid"] or "(空)", out["sid"][:10], out["from"]))
+           "openid": d.get("openid", ""), "const_token": d.get("constToken", ""),
+           "from": d.get("from", "")}
+    print("[oppo] appid=%s openid=%s sid=%.10s…（%s，%d 字符）constToken=%s source=%s"
+          % (out["appid"], out["openid"] or "(空)", out["sid"], d.get("src") or d.get("from"),
+             len(out["sid"]), (out["const_token"][:10] + "…") if out["const_token"] else "(空)",
+             out["from"]))
     print("OPPO_JSON=" + json.dumps(out, ensure_ascii=False))
     return 0
 

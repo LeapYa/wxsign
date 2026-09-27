@@ -295,6 +295,87 @@ def find_ctx_by_text(ws, kws, limit=40, timeout=8.0, prefer=None):
     return 0
 
 
+# 关弹窗时**按顺序**试的安全按钮文案。
+# ⚠️ 「允许」「去设置」故意不收：「允许」会给用户订阅上消息推送（有副作用），
+#    「去设置」会把用户带去系统设置页。
+# ⚠️ 「确定」也故意不收：太常见，可能是页面表单的提交键 —— 宁可漏清一个，也不误点。
+DIALOG_BUTTONS = ("我知道了", "拒绝", "取消")
+
+
+def dismiss_dialogs(ws, tries=4, tag="", quiet=False):
+    """关掉**弹在最上层的小对话框**。返回关掉的按钮文案列表。
+
+    实测要清的两类（2026-09-27）：
+      · **H5 / 小程序自带的**「订阅提示」：文案「我知道了 / 去设置」——
+        OPPO 商城**一打开就弹**，盖在最上层，之后点底部导航/按钮**全部落空**
+        （现场表现：「点了没反应」，查起来极像坐标算错）；
+      · **微信原生的**订阅消息申请：文案「拒绝 / 允许」。
+
+    ⚠️⚠️ 做法是踩过两次才定下来的：
+      1. **Escape 关不掉 H5 自带的那个框**（实测画面变化 **0.0%**）——
+         Escape 只对**微信原生**框有效（getPhoneNumber 授权框就是这么清的）；
+      2. 但**按文案点**能关：实测「我知道了」在 ctx 1，点 (137,483) → 画面变化 **24.8%**、框消失 ✓。
+    所以用「按文案找 → 点 → **画面差异验证**」的循环：有框就继续清，
+    没框一次都不多点（防止点到页面正文里的同名文字）。
+
+    ⚠️ 点之前必须 `wxreg.refresh_page(ws, ctx)` —— **用框所在的 ctx 刷新页面原点**。
+    实测对话框报的位置与小程序页面的原点不在同一个空间（ctx 1 的视口差 2px，
+    对话框本身还差 ~80px），不换原点必点空。
+    """
+    import wxreg                                  # 局部导入：wxdom 不依赖 wxreg，避免倒置
+    pre = ("%s " % tag) if tag else ""
+    done = []
+
+    def _grab():
+        try:
+            wxreg.refresh_page()
+            return wxreg.grab(win=True)
+        except Exception:
+            return None
+
+    for _ in range(max(1, tries)):
+        prev = _grab()
+        hit = None
+        for word in DIALOG_BUTTONS:
+            ctx = find_ctx_by_text(ws, word)
+            if not ctx:
+                continue
+            r = rect_of(ws, ctx, (word,))
+            # 只认**小按钮**：对话框按钮都小；正文里的同名文字盒子大，别点
+            items = [it for it in ((r or {}).get("items") or [])
+                     if it["w"] <= 260 and it["h"] <= 90]
+            if not items:
+                continue
+            it = items[0]
+            if not quiet:
+                print("%s[dlg] 找到「%s」（ctx %s，%s %dx%d @%d,%d）→ 点它"
+                      % (pre, word, ctx, it["tag"], it["w"], it["h"], it["cx"], it["cy"]))
+            wxreg.refresh_page(ws, ctx)           # ← 关键：用**框所在 ctx** 对齐坐标
+            wxreg.click(it["cx"], it["cy"])
+            time.sleep(1.3)
+            hit = word
+            break
+        if not hit:
+            break
+        cur = _grab()
+        if prev and cur and len(prev) == len(cur):
+            n = d = 0
+            for i in range(0, len(prev) - 3, 21):
+                n += 1
+                if (abs(prev[i] - cur[i]) + abs(prev[i + 1] - cur[i + 1])
+                        + abs(prev[i + 2] - cur[i + 2])) > 24:
+                    d += 1
+            if n and d * 1.0 / n < 0.02:
+                if not quiet:
+                    print("%s[dlg] 点了「%s」但画面没变化 → 停下（不重复点）" % (pre, hit))
+                break
+        done.append(hit)
+    if not quiet:
+        print("%s[dlg] %s" % (pre, ("共关掉 %d 个弹窗：%s" % (len(done), "、".join(done)))
+                              if done else "没有待关的弹窗"))
+    return done
+
+
 def _broadcast(ws, js, limit, timeout, kind="int"):
     """把一段 JS 盲撒给 ctx 1..limit，返回 {ctx: 值}。
 

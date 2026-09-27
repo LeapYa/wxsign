@@ -278,41 +278,36 @@ def probe_login(ws, ctx):
                   % (it["tag"], str(it.get("cls"))[:34], it["w"], it["h"], it["cx"], it["cy"]))
 
 
-def ensure_login_page(ws, page_ctx):
-    """走到「手机号快捷登录」页，返回 login_ctx（0 = 失败）。**幂等**，已在登录页就直接返回。
-
-    为什么抽成函数：流程中间要按 Escape 清微信原生层，那一下**有可能把半屏登录页
-    也一起关掉**，于是得重走一遍导航。抽出来免得写两份 —— 这项目已经因为
-    「同一逻辑两处实现」栽过好几次（面板清理、匿名框判据、投递清单）。
+def ensure_mine_page(ws, page_ctx):
+    """走到「我的」（个人中心）页，返回 mine_ctx（0 = 失败）。**幂等**。
 
     导航实测（OPPO 商城）：
-        首页（ctx 4，innerText 1159 字全是商品名）
-          → 点**底部导航「我的」**（注意：底部导航是 `wx-cover-view`，
-             **不在 innerText 里**，只能用 `rect_of` 按文案点）
-          → 「我的」页（有「个人中心」「登录账号」）
-          → 点「登录」→ 登录页（有「手机号快捷登录」，**半屏页**）
+        首页（页面 ctx 4，innerText 1159 字全是商品名）
+          → 点**底部导航「我的」** —— 注意底部导航是 `wx-cover-view`，
+            文字**不在 innerText 里**，只能用 `rect_of` 按文案点
+          → 「我的」页（未登录时有「个人中心」「登录账号」；已登录时有昵称/卡券/积分）
     """
-    login_ctx = ctx_with_text(ws, LOGIN_KW)
-    if login_ctx:
-        print("[oppo-auth] 已在登录页：ctx=%d" % login_ctx)
-        return login_ctx
-
+    mine_ctx = ctx_with_text(ws, MINE_KW)
+    if mine_ctx:
+        return mine_ctx
+    nav_ctx = page_ctx or ctx_with_text(ws, "为你推荐")
+    if not nav_ctx:
+        print("[oppo-auth] ✗ 定位不到页面 ctx —— 小程序开着吗？")
+        return 0
+    print("[oppo-auth] 当前停在首页（页面 ctx=%d）→ 点底部「我的」" % nav_ctx)
+    wxreg.refresh_page(ws, nav_ctx)
+    if not click_text(ws, nav_ctx, "我的", what="底部导航「我的」"):
+        return 0
+    time.sleep(3.5)
     mine_ctx = ctx_with_text(ws, MINE_KW)
     if not mine_ctx:
-        nav_ctx = page_ctx or ctx_with_text(ws, "为你推荐")
-        if not nav_ctx:
-            print("[oppo-auth] ✗ 定位不到页面 ctx —— 小程序开着吗？")
-            return 0
-        print("[oppo-auth] 当前停在首页（页面 ctx=%d）→ 点底部「我的」" % nav_ctx)
-        wxreg.refresh_page(ws, nav_ctx)
-        if not click_text(ws, nav_ctx, "我的", what="底部导航「我的」"):
-            return 0
-        time.sleep(3.5)
-        mine_ctx = ctx_with_text(ws, MINE_KW)
-        if not mine_ctx:
-            print("[oppo-auth] ✗ 点了「我的」也没进个人中心")
-            return 0
+        print("[oppo-auth] ✗ 点了「我的」也没进个人中心")
+        return 0
+    return mine_ctx
 
+
+def open_login_page(ws, mine_ctx):
+    """从「我的」页点「登录」，返回登录页 ctx（0 = 失败）。"""
     print("[oppo-auth] 在「我的」页（ctx=%d）→ 点「登录」" % mine_ctx)
     wxreg.refresh_page(ws, mine_ctx)
     if not click_text(ws, mine_ctx, "登录", what="「登录」"):
@@ -324,6 +319,27 @@ def ensure_login_page(ws, page_ctx):
         return 0
     print("[oppo-auth] 登录页已打开：ctx=%d" % login_ctx)
     return login_ctx
+
+
+def ensure_login_page(ws, page_ctx):
+    """确保停在登录页（幂等）。
+
+    ⚠️ **已经登录的情况下这里一定会失败** —— 因为「我的」页根本没有「登录」按钮
+    （显示的是昵称/卡券/积分）。所以调用方**必须先判登录态**（见 main 的 ⓪.5），
+    否则会把「已登录」误判成 rc=3 失败。
+
+    为什么抽成函数：流程中间要按 Escape 清微信原生层，那一下**有可能把半屏登录页
+    也一起关掉**，于是得重走一遍导航。抽出来免得写两份 —— 这项目已经因为
+    「同一逻辑两处实现」栽过好几次（面板清理、匿名框判据、投递清单）。
+    """
+    login_ctx = ctx_with_text(ws, LOGIN_KW)
+    if login_ctx:
+        print("[oppo-auth] 已在登录页：ctx=%d" % login_ctx)
+        return login_ctx
+    mine_ctx = ensure_mine_page(ws, page_ctx)
+    if not mine_ctx:
+        return 0
+    return open_login_page(ws, mine_ctx)
 
 
 def main():
@@ -340,15 +356,36 @@ def main():
         print("[oppo-auth] ✗ 连不上 CDP（hook 挂上了吗？小程序开着吗？）")
         return 2
     print("[oppo-auth] 小程序页面 ctx=%d" % page_ctx)
+    probe_only = "--probe" in sys.argv[1:]
 
     wxreg.raise_miniapp()
+
+    # ── ⓪ 先走到「我的」页 —— 它是判断「有没有登录态」的地方 ──
+    mine_ctx = ensure_mine_page(ws, page_ctx)
+    if not mine_ctx:
+        return 3
+
+    # ── ⓪.5 已经是登录态？ → **整段跳过登录流程** ──
+    #    判据用**页面自己渲染出来的状态**（「我的」页显示昵称/卡券/积分 = 已登录；
+    #    显示「登录账号」= 未登录），而**不是**「storage 里有没有 sid」——
+    #    sid 过期后仍可能留在 storage 里，而过期后页面会自动回到「登录账号」；
+    #    页面状态才是被服务端背书的那个。
+    #    ⚠️ 这一层必须有：不带它，已登录时「我的」页**根本没有「登录」按钮**，
+    #    `click_text("登录")` 找不到 → `open_login_page` 失败 → rc=3，
+    #    等于把「本来就登录好了」当成失败，还白跑一遍。
+    if not probe_only and logged_in(ws):
+        print("[oppo-auth] ✓ 已经是登录态（「我的」页显示昵称/积分，不是「登录账号」）"
+              "→ **跳过登录流程**，不需要重复授权")
+        # 顺手清掉可能遗留的微信原生层（上一轮失败时留下的那种），别留给下一个流程
+        wxreg.run("DISPLAY=%s xdotool key Escape" % wxreg.DISPLAY)
+        return 0
 
     login_ctx = ensure_login_page(ws, page_ctx)
     if not login_ctx:
         return 3
 
     # ── 探测模式：到登录页就停，把真实 DOM 打出来（只读，不点击）──
-    if "--probe" in sys.argv[1:]:
+    if probe_only:
         probe_login(ws, login_ctx)
         return 0
 

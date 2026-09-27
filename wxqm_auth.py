@@ -334,8 +334,14 @@ def click_auth_layer(ws, ctx=0, dry_run=False):
     return True
 
 
-def _check_agree(ws, ctx, dry_run=False):
+def _check_agree(ws, ctx, dry_run=False, agree_words=None):
     """勾选同意协议。**优先按选择器直接找那个圆圈**，选择器都没有才退回猜偏移量。
+
+    `agree_words`：兜底路径用来定位「同意说明那行小字」的关键词。
+    默认 `AGREE_WORDS` 是企迈的措辞；**别的商户要传自己的**（OPPO 是「已同意…用户协议」），
+    否则兜底会找不到那行字、直接返回 False（静默不勾选）。
+    ⚠️ 选择器（`CHECK_SELECTORS`）是**跨商户通用**的（`[class*=checkbox]` 等），
+    只有这句文案是商户相关的 —— 所以这里只开放文案，不开放选择器。
 
     为什么优先选择器：勾选框是个**没有文案的圆圈**，之前只能「拿旁边那行说明文字的
     左边界，往左推 22 像素」—— 那 22 是个魔数，换个字号/内边距就偏。
@@ -372,7 +378,7 @@ def _check_agree(ws, ctx, dry_run=False):
     # ⚠️ 兜底**必须先确认那行说明文字本身是可见的** —— 否则会拿离场动画里的假坐标乱点。
     #    实测踩过：授权层在播 `std-bottom-leave-to` 时说明文字还在树上、矩形塌成 0，
     #    反推出的坐标是 (6,590)，点下去完全是误操作。
-    d = wxdom.rect_of(ws, ctx, AGREE_WORDS)
+    d = wxdom.rect_of(ws, ctx, agree_words or AGREE_WORDS)
     if d and d["items"]:
         a = max(d["items"], key=lambda x: x["w"])
         # 说明文字在底部（视口下 2/3），这是授权层的固有形态；不满足就认为不是它

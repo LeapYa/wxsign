@@ -378,35 +378,90 @@ def raise_miniapp():
     run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
     run("DISPLAY=%s xdotool windowraise %s" % (DISPLAY, wid))
     _move_wechat_away(m)
+    # ⚠️ 必须**验证**结果：置顶失败的症状极具迷惑性 —— 截图和 DOM 都完全正常，
+    #    但所有点击都落到别的窗口上（就是上面那段实测记录里的事）。不报出来的话，
+    #    后面所有失败看起来都像「坐标算错」，会白查很久。
+    try:
+        import wxopen
+        under = wxopen.win_under(m["x"] + m["w"] // 2, m["y"] + m["h"] // 2)
+        if under and str(under) != str(wid):
+            print("[wxreg] ⚠️ 小程序置顶失败：小程序中心最上面是 %s（小程序是 %s）→ "
+                  "后续点击/截图可能落到它身上" % (under, wid))
+    except Exception:
+        pass
     return True
 
 
 def _move_wechat_away(mini):
-    """把**盖住小程序**的微信顶层窗口挪出屏幕。
+    """把**盖住小程序**的微信**主窗口**挪出屏幕。
 
-    判据（全结构性，不用标题硬匹配 —— 标题会随语言/版本变）：
-      「一个既不是小程序窗口、面积又**足以盖住小程序**的可见窗口」。
-    之所以能这么判：正常的微信主窗口是整屏尺寸，而小程序是 410x776 的小窗；
-    只要某个窗口的矩形**包含**小程序窗口的中心，它就是遮挡者。
+    ⚠️⚠️ 2026-09-27 治本改造 —— 这个函数原本是个**地雷**，实测踩到（现场表现：
+    微信主窗口在屏幕上「消失」，只剩右边一条 98px 的边，看着像微信被关掉了）：
 
-    挪到屏幕右侧外（`x = 屏宽+10`）。**不做最小化** —— 最小化会让微信重新布局并可能
-    把主窗口再顶回来。
+      ① 原判据是「盖住小程序中心的窗口」—— 而**小程序面板**正好满足，
+         于是面板也被一起挪走，面板的 ✕ 跑到屏幕外，之后**对面板的任何操作都落空**
+         （点卡片、点 ✕ 全没反应）。
+      ② 本环境的窗口管理器（openbox）会**夹住**窗口不让完全移出屏幕
+         （EWMH 规定要留一部分可见）→ 主窗口最后停在 `X=1182`，
+         而不是代码里写的 `sw+10 = 1290`。于是既没挪干净、又让主窗口"半在场"。
+      ③ 挪完没有任何验证/复原，主窗口就**永久歪在右边**，用户再也看不到微信。
+
+    改法（三条缺一不可）：
+      ① **先确认真被遮挡**再动手 —— 小程序中心最上面已经是小程序就直接返回
+         （实测本环境的小程序窗口本来就在主窗口之上，压根不需要挪）。
+      ② **只挪主窗口** —— 用 `wxopen.is_main_window()`（WM_CLASS + 标题双判据）认人。
+         面板/搜一搜/视频号**都没有 WM_CLASS**，天然被排除；不再做「谁盖住挪谁」。
+      ③ **挪完必须验证** —— 没挪到屏幕外（被 WM 夹住）就**搬回原位**并报警，
+         绝不留下「半在屏幕里」的中间态。
     """
+    import wxopen                     # 局部导入：避免模块级循环依赖（wxopen 不 import wxreg）
+
+    mcx, mcy = mini["x"] + mini["w"] // 2, mini["y"] + mini["h"] // 2
+
+    # ① 小程序中心最上面已经是小程序 → 没人挡着，什么都不用做
     try:
-        sw = int(run("DISPLAY=%s xdotool getdisplaygeometry" % DISPLAY).split()[0])
+        under = wxopen.win_under(mcx, mcy)
+    except Exception:
+        under = None
+    if under and str(under) == str(mini["id"]):
+        return False
+
+    try:
+        parts = run("DISPLAY=%s xdotool getdisplaygeometry" % DISPLAY).split()
+        sw = int(parts[0])
     except Exception:
         sw = 1280
-    mcx, mcy = mini["x"] + mini["w"] // 2, mini["y"] + mini["h"] // 2
+
+    moved, failed = [], []
     for w in wxwin.windows():
         if w["id"] == mini["id"]:
             continue
-        # ① 矩形必须**真的盖住**小程序中心（空窗口/装饰窗口尺寸为 0，天然排除）
+        # ② 只认微信**主窗口**（面板没有 WM_CLASS，会被这一步挡掉）
+        try:
+            if not wxopen.is_main_window(w["id"]):
+                continue
+        except Exception:
+            continue
+        # 还必须是**真的盖住**小程序中心的那个（空窗口/装饰窗口尺寸为 0，天然排除）
         if not (w["x"] <= mcx <= w["x"] + w["w"] and w["y"] <= mcy <= w["y"] + w["h"]):
             continue
-        # ② 比小程序大才可能是遮挡者（避免误挪同层级的兄弟小窗）
-        if w["w"] * w["h"] <= mini["w"] * mini["h"]:
-            continue
+        ox, oy = w["x"], w["y"]
         run("DISPLAY=%s xdotool windowmove %s %d 0" % (DISPLAY, w["id"], sw + 10))
+        time.sleep(0.4)
+        g = _win_geom(w["id"]) or {}
+        if g.get("X", 0) >= sw:
+            moved.append(w["id"])
+        else:
+            # ③ 被窗口管理器夹住了 → 搬回原位，绝不留下「半在屏幕里」的状态
+            run("DISPLAY=%s xdotool windowmove %s %d %d" % (DISPLAY, w["id"], ox, oy))
+            print("[wxreg] ⚠️ 主窗口 %s 挪不出屏幕（被 WM 夹在 X=%s，原本 (%d,%d)）"
+                  "→ 已搬回原位。挪不动是环境限制，别再重试这条路。"
+                  % (w["id"], g.get("X"), ox, oy))
+            failed.append(str(w["id"]))
+    if moved:
+        print("[wxreg] 把盖住小程序的微信主窗口挪到了屏幕外：%s（用完记得归位）"
+              % ", ".join(moved))
+    return bool(moved)
 
 
 def _win_geom(wid):

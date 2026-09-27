@@ -644,10 +644,15 @@ def ensure_helpers():
     """
     if not INSTANCE:
         return False
-    srcs = [(os.path.join(HERE, f), cpath(CTMP, f)) for f in
-            ("wxfind.py", "wxcdp.py", "wxdom.py", "wxwin.py", "pkgprobe.py",
-             "wxclean.py", "wxopen.py", "wxreg.py", "wxagree.py", "wxnet.py",
-             "wxyd.py", "wxcode.py", "wxqm.py")]
+    # ⚠️ 2026-09-27 改为**按目录全投**（与 run_all.sh 的 `deploy_scripts` 用同一条规则），
+    #    不再手工维护文件名清单。原来清单有两份（这里 + run_all.sh），已经漂移过一次：
+    #    wxqm_auth.py / wxoppo*.py 只加在了一份里 → 「跑批时能用、单跑时报
+    #    ModuleNotFoundError」。规则统一后，以后加脚本不用改任何地方。
+    #    排除 wxsign.py 自己：它是**宿主机**上的引擎入口，容器里不跑，
+    #    而且它要读 brands.json / brands/*.env，容器里没有这些文件。
+    names = sorted(n for n in os.listdir(HERE)
+                   if n.endswith(".py") and n != "wxsign.py")
+    srcs = [(os.path.join(HERE, n), cpath(CTMP, n)) for n in names]
     extra = os.environ.get("WXSIGN_MINIAPP_PY", "")
     if extra and os.path.exists(extra):
         srcs.append((extra, cpath(CTMP, "wxopen.py")))    # 可选：用外部版本覆盖

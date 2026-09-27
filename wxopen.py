@@ -282,6 +282,46 @@ def find_main_window():
     return None
 
 
+def bring_on_screen(W, H):
+    """把**跑到屏幕外**的窗口搬回 (0,0)，返回被搬过的窗口描述列表。
+
+    判据：**可见面积不足自身一半**就算跑到屏幕外了。
+    ⚠️ 只搬位置，**不做 resize**（尺寸不归这里管 —— 见 `ensure_main_fullscreen` 的历史教训）。
+
+    为什么必须有这一步（2026-09-27 实测，两个看似无关的症状同一个根因）：
+    `wxreg._move_wechat_away()` 会用 `windowmove` 把「盖住小程序的窗口」推到 `x = 屏宽+10`。
+    而本环境的 WM（openbox）会**夹住**它（EWMH 要求留一部分可见）→ 窗口停在 `X≈1153~1182`：
+      · 主窗口只剩右边一条 98px 的边 → **现场表现是「微信被关掉了」**；
+      · 面板被推走后，`top_window()`（取**屏幕中心**最上层窗口）再也认不出它 →
+        `open_panel` 判「面板打不开」→ 转去试别的侧边栏图标（可能试到朋友圈）→ `rc=3`。
+        而 WeChat 自己认为面板**已经开着**，所以再点侧边栏「小程序」按钮**毫无反应** ——
+        这就是「**面板进不去**」的真身（欺骗性极强：**重启微信就好了**，因为重启把面板全清掉）。
+    """
+    fixed = []
+    for wid, title in windows():
+        t = (title or "").strip()
+        if not t:                                     # 无名窗口（辅助/装饰层）不碰
+            continue
+        g = geo(wid)
+        try:
+            X, Y = int(g["X"]), int(g["Y"])
+            Wd, Hd = int(g["WIDTH"]), int(g["HEIGHT"])
+        except (KeyError, ValueError):
+            continue
+        if Wd <= 0 or Hd <= 0:
+            continue
+        vw = max(0, min(W, X + Wd) - max(0, X))
+        vh = max(0, min(H, Y + Hd) - max(0, Y))
+        if vw * vh * 2 >= Wd * Hd:
+            continue                                  # 至少一半可见 → 不动它
+        run("DISPLAY=%s xdotool windowmove %s 0 0" % (DISPLAY, wid))
+        fixed.append("%s（%s，原 %d,%d）" % (wid, t, X, Y))
+    if fixed:
+        print("[reopen] 有窗口跑到屏幕外 → 搬回 (0,0)：%s" % "、".join(fixed))
+        time.sleep(0.8)
+    return fixed
+
+
 def find_target_window():
     """目标小程序已经开着？（窗口标题就是小程序名，按**精确相等**匹配 ——
     同名号里 `辣可可现炒黄牛肉` 和 `辣可可现炒黄牛肉i` 是两个不同的小程序）"""
@@ -914,6 +954,11 @@ def open_panel(W, H):
     if not main:
         print("[reopen] 找不到微信主窗口")
         return None
+
+    # ⭐ 先把跑到屏幕外的窗口（主窗口/面板）搬回来。面板一旦被 `windowmove` 推到屏幕外，
+    #    `top_window()`（取**屏幕中心**最上层窗口）就再也认不出它 → 会把「面板其实开着」
+    #    误判成「面板打不开」；再点侧边栏又因为微信认为「面板已开」而**毫无反应**。
+    bring_on_screen(W, H)
 
     # ⚠️ 这里**不要**再把主窗口拉全屏了（旧代码调 `ensure_main_fullscreen`）。
     #    侧边栏检测已经改成按主窗口实际几何扫描（见 `_rail_scan_geom`），

@@ -294,6 +294,24 @@ def count_leftovers():
     return n
 
 
+def restore_on_screen(W, H):
+    """把**跑到屏幕外**的窗口搬回屏幕内。返回是否搬过。
+
+    ⚠️ 实现**只有一份，在 `wxopen.bring_on_screen`** —— 这里只转发，不再自己写一遍。
+    这项目已经因为「同一判据两处实现」栽过两次（先漏面板、后漏朋友圈），
+    清场相关的东西尤其容易各写一份。
+
+    ⚠️ 为什么必须做（2026-09-27 实测，两个症状同一个根因）：
+    `wxreg._move_wechat_away()` 会把「盖住小程序的窗口」`windowmove` 到屏幕右侧外，
+    而本环境的 WM（openbox）会**夹住**它 → 窗口停在 `X≈1153~1182`：
+      · 主窗口只剩右边一条 98px 的边 → **现场表现是「微信被关掉了」**；
+      · 面板的 ✕ 也跟着跑到屏幕外 → 后面所有关闭动作全部点空 → **面板永远关不掉**
+        （= 「面板进不去」的另一条来路）。
+    所以**必须在取残留窗口之前**先归位。
+    """
+    return bool(R.bring_on_screen(W, H))
+
+
 def main():
     if "--count" in sys.argv:
         count_leftovers()
@@ -304,6 +322,10 @@ def main():
         R.run("DISPLAY=%s xrandr -s %dx%d" % (R.DISPLAY, R.WANT_W, R.WANT_H))
         time.sleep(2)
         W, H = R.size()
+
+    # ⚠️ 必须在取残留窗口**之前**先把跑到屏幕外的搬回来 —— 否则它们的 ✕ 在屏幕外，
+    #    后面的关闭动作全部点空（面板尤其容易中招）。
+    restore_on_screen(W, H)
 
     if clear_modals(W, H):
         print("[clean] 上面遣散了模态弹窗（它会吞掉之后所有点击）")

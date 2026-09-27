@@ -35,10 +35,25 @@ except ImportError:
 
 
 def leftover(wid, title):
-    t = title.strip()
-    if not t or t == "微信":
+    """这个窗口需要清理吗？（2026-09-27 修订：把**小程序面板**也纳入）
+
+    ⚠️ 旧实现是 `if t == "微信": return False` —— 而**小程序面板的标题正好也叫「微信」**
+    （搜一搜、视频号这些副窗口同理），于是它**永远不在清理目标里**：
+    单跑 `wxsign.py` 时面板一直攒着，攒到它挡住主窗口侧边栏，
+    就表现为「侧边栏的小程序 / 搜一搜按钮点了无响应、面板进不去」。
+    （批跑 `run_all.sh` 没暴露，是因为它另有一份 `clean_env` 会关面板 ——
+     **两处判据不一致**，正是同一天在 `find_anon_dialog` 上踩过的同一个坑。）
+
+    现在按**身份**区分，而不是按标题：
+      · 主窗口（id = find_main_window()，WM_CLASS 含 wechat）→ 不碰（关它就是关整个微信）
+      · 其余有标题的顶层窗口（面板 / 搜一搜 / 视频号 / 小程序窗口）→ 都要清
+    """
+    t = (title or "").strip()
+    if not t:
         return False
-    if R.is_main_window(wid):        # WM_CLASS 含 wechat
+    if R.is_main_window(wid):                                   # WM_CLASS 含 wechat
+        return False
+    if str(wid) == str(R.find_main_window()):
         return False
     return True
 
@@ -295,20 +310,29 @@ def main():
 
     targets = [(w, t) for w, t in R.windows() if leftover(w, t)]
     if not targets:
-        print("[clean] 没有残留的小程序窗口")
+        print("[clean] 没有残留窗口")
         return 0
-    print("[clean] 发现 %d 个残留小程序窗口" % len(targets))
+    print("[clean] 发现 %d 个残留窗口" % len(targets))
     bad = 0
     for wid, title in targets:
+        t = (title or "").strip()
         print("[clean] 处理 %s（%s）" % (title, wid))
         dismiss_popups(wid, W, H)            # 第一遍：也可能是悬浮提示，先试关
-        if R.close_window(wid, W, H, kind="miniapp"):
+        # ⚠️ 2026-09-27：**按身份选关闭方式**（旧实现一律 kind="miniapp"）。
+        #    标题叫「微信」的是**面板 / 搜一搜 / 视频号**这类微信自己的窗口，必须走
+        #    kind="panel" —— `close_window` 有防线：标题「微信」的窗口只有 panel 才许关
+        #    （否则它可能是主窗口）。一律用 miniapp 的老写法会**静默拒关面板**。
+        kind = "panel" if t == "微信" else "miniapp"
+        if R.close_window(wid, W, H, kind=kind):
             time.sleep(1)
             continue
         print("[clean] 首次没关掉，换一种遣散方式再试一次")
         dismiss_popups(wid, W, H)
-        R.click(int(W * 0.5), int(H * 0.5), 0.8)   # 点一下内容区空白，收掉悬浮层
-        if not R.close_window(wid, W, H, kind="miniapp"):
+        if kind == "miniapp":
+            # 点一下内容区空白，收掉悬浮层 —— **只对小程序窗口做**：
+            # 面板中心是推荐卡片/推广位，点下去可能又开出一个无关的小程序。
+            R.click(int(W * 0.5), int(H * 0.5), 0.8)
+        if not R.close_window(wid, W, H, kind=kind):
             print("[clean] ⚠️ 还是没关掉 %s（不硬杀、不补点，避免误伤）" % title)
             bad += 1
         time.sleep(1)

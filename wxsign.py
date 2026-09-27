@@ -1440,22 +1440,180 @@ def oppo_ident(brand, wait=12):
     return got
 
 
+# ── OPPO：**自动发现**「当前档期」的签到 activityId（纯 HTTP，一次 GET）────────────
+# 承载「积分商城（签到）」的活动页 ID —— **固定不变**（换档期只换它里面的 activityId，
+# 这个页面 ID 是活动页框架的入口）。实测 2026-09-27。
+OPPO_H5_HOST = "hd.opposhop.cn"
+OPPO_H5_PAGE = "b371ce270f7509f0"
+
+
+def oppo_discover_activity(openid, appid, sid="", sver="80457"):
+    """拉活动页 H5 的 HTML，提取**当前档期**的签到 activityId；失败返回 ""。
+
+    这是「不想每月人工拿一次 ID」的解法（2026-09-27 实测）。
+
+    原理：承载签到页的 H5 是 **SSR** —— HTML 里内联了整份活动 DSL，
+    DSL 的 `cmps` 里有 `SignIn_<hash>` 组件，配置里直接写着签到 activityId：
+        "SignIn_82c7796e" → {"type":"SignIn","attr":{…,"activityId":2094340289534894080,…}}
+
+    ⚠️ 三个要点：
+      · **不需要 hook / 不需要驱动 UI / 不需要打开 H5** —— 一次普通 GET 就有。
+        （DSL 是内联的，所以此前「抓不到获取 DSL 的请求」是正常的、不是漏抓。
+          同理，用 CDP 抓包也能拿到，但那要驱动 H5，属于杀鸡用牛刀。）
+      · HTML 里另有 16 个别的 activityId（任务/抽奖/券/积分商品…），
+        **只有 SignIn 组件里那个是签到的** → 必须先按 `SignIn_` 名字
+        （或 `"type":"SignIn"`）**定位到组件**再取值，不能全局瞎抓。
+      · 探测要花钱：这一 GET 约 137KB。实测 ~1 秒。
+    """
+    sver = str(sver or "80457")
+    path = ("/bp/%s?appId=%s&brand=microsoft&model=microsoft&nightModelEnable=true"
+            "&openId=%s&Personalized=1&s_version=%s&um=qiandaobanner&us=wode"
+            "&utm_source=OPPOshopminigramme_jifen"
+            % (OPPO_H5_PAGE, appid or "", openid or "",
+               sver if len(sver) >= 6 else "0" + sver))
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        # 真机 H5 的 Referer 是**小程序页面**（不是 H5 自身）—— 实测抓到
+        "Referer": "https://servicewechat.com/%s/598/page-frame.html" % (appid or ""),
+        "User-Agent": UA,
+        "s_channel": "program_wx",
+        "source_type": "503",
+        "s_version": sver,
+        "Personalized": "1",
+    }
+    if sid:
+        headers["NEWOPPOSID"] = sid
+    if openid:
+        headers["openid"] = openid
+    conn = None
+    try:
+        conn = http.client.HTTPSConnection(OPPO_H5_HOST, timeout=25, context=_SSL)
+        conn.request("GET", path, headers=headers)
+        r = conn.getresponse()
+        status, html = r.status, r.read().decode(errors="replace")
+    except Exception as e:
+        log("  [act] 拉活动页 H5 失败：%s" % e)
+        return ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if status != 200:
+        log("  [act] 活动页 H5 回 HTTP %s" % status)
+        return ""
+    for pat in (r'"SignIn_[0-9a-fA-F]+"', r'"type"\s*:\s*"SignIn"'):
+        for m in re.finditer(pat, html):
+            a = re.search(r'"activityId"\s*:\s*"?(\d{15,20})"?',
+                          html[m.start():m.start() + 2500])
+            if a:
+                return a.group(1)
+    log("  [act] HTML 里定位不到 SignIn 组件的 activityId（页面结构可能变了；%d 字）" % len(html))
+    return ""
+
+
+def save_brand_field(slug, key, value):
+    """把发现的常量回写 brands.json —— 换档期时自动更新配置，省掉人工一步。"""
+    if not slug:
+        return False
+    try:
+        with open(BRANDS_JSON, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception as e:
+        log("  [cfg] 读 brands.json 失败：%s" % e)
+        return False
+    changed = False
+    for b in d.get("brands", []):
+        if b.get("slug") != slug:
+            continue
+        if b.get(key) == value:
+            return True
+        b[key] = value
+        changed = True
+    if not changed:
+        return False
+    try:
+        with open(BRANDS_JSON, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        log("  [cfg] 已回写配置：%s.%s = %s" % (slug, key, value))
+        return True
+    except Exception as e:
+        log("  [cfg] 写 brands.json 失败：%s" % e)
+        return False
+
+
+def oppo_discover_activity_hook(brand, wait=120):
+    """**备选**发现方式：驱动 H5 + CDP hook 抓包（实现在容器内 `wxoppo_act.py`）。
+
+    为什么要有这条：纯 HTTP 那条（`oppo_discover_activity`）依赖 OPPO 前端保持
+    「SSR 把 DSL 内联进 HTML」。万一它改成非 SSR（DSL 走 XHR）、或字段结构变了，
+    正则就失效 —— 这时用这条**物理兜底**：真把 H5 打开、注入 hook 抓它实际发的请求，
+    从 `getSignInDetail?activityId=<id>` 里取。代价是要**驱动 UI**（慢、依赖
+    「我的」页那个图片按钮 / 弹窗清理 / CDP 正常），所以只作兜底、不作首选。
+    """
+    if not INSTANCE:
+        log("  [act] 未设 WOC_INSTANCE → 备选发现不可用")
+        return ""
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxoppo_act.py"), str(wait)],
+                           capture_output=True, text=True, timeout=wait + 90)
+    except Exception as e:                                    # noqa: BLE001
+        log("  [act] 备选发现执行异常：%s" % e)
+        return ""
+    out = (p.stdout or "") + (p.stderr or "")
+    got = ""
+    for line in out.splitlines():
+        if line.startswith("OPPO_ACT="):
+            got = line[len("OPPO_ACT="):].strip()
+        elif line.strip():
+            log("     " + line.strip()[:180])
+    if not got:
+        log("  [act] 备选发现也没拿到 ID（wxoppo_act.py rc=%s）" % p.returncode)
+    return got
+
+
+def oppo_resolve_activity(brand, sid, openid, sver, why=""):
+    """解析「当前档期」的 activityId：**先纯 HTTP，失败退到 CDP hook**；都失败返回 ""。
+
+    成功时顺手回写 brands.json（`oppo_activity`）—— 于是换档期是**零人工**的。
+    `OPPO_NO_DISCOVER=1` 可整体关掉（省请求，直接用配置里的值）。
+    """
+    tag = ("（%s）" % why) if why else ""
+    got = oppo_discover_activity(openid, brand.get("appid", ""), sid=sid, sver=sver)
+    if got:
+        log("  [act]%s 纯 HTTP 发现 activityId=%s" % (tag, got))
+    else:
+        log("  [act]%s 纯 HTTP 发现失败 → 备选：驱动 H5 + CDP hook" % tag)
+        got = oppo_discover_activity_hook(brand)
+        if got:
+            log("  [act]%s 备选（hook）发现 activityId=%s" % (tag, got))
+        else:
+            log("  [act]%s 两种发现都失败" % tag)
+    if got:
+        save_brand_field(brand.get("slug"), "oppo_activity", got)
+    return got
+
+
 def do_sign_oppo(brand, env):
     """OPPO 商城后端签到。返回 (是否成功, 业务码, 说明)。
 
-    链路：wxoppo.py 读 NEWOPPOSID+openid → 查签到档期 → POST signIn {activityId}。
-    返回码：200 成功 / 5008 今日已签 / 5005 活动不存在（activityId 换档期了）。
+    链路：wxoppo.py 读 NEWOPPOSID+openid → **自动发现/校验 activityId** → 查档期
+          （todaySignIn 做幂等）→ POST signIn {activityId}。
+    返回码：200 成功 / 415 今日已签 / NOACT 换档期且自动发现也失败 /
+            RISK 疑似风控（**不重试**，免得加重）。
     """
-    activity = env.get("OPPO_ACTIVITY") or brand.get("oppo_activity") or ""
-    if not activity:
-        return False, "NOACTID", "缺 oppo_activity（OPPO 签到活动 ID，换档期时要更新）"
+    sver = str(env.get("OPPO_SVERSION") or brand.get("oppo_sversion") or "80457")
     extra = {
-        "s_version": str(env.get("OPPO_SVERSION") or brand.get("oppo_sversion") or "80457"),
+        "s_version": sver,
         "Referer": env.get("OPPO_REFERER") or brand.get("oppo_referer")
                    or "https://hd.opposhop.cn/bp/b371ce270f7509f0",
         "User-Agent": UA,
     }
 
+    # ① 会话。**提到最前** —— 自动发现 activityId 需要 openid。
     ident = oppo_ident(brand)
     if not ident or not ident.get("sid"):
         return False, "NOIDENT", "拿不到 OPPO 会话 NEWOPPOSID（小程序开着吗？hook 通吗？）"
@@ -1464,6 +1622,19 @@ def do_sign_oppo(brand, env):
     # 实测它不是必需的（只留 NEWOPPOSID+openid 也能通），但既然抓到就原样带上，少一个变量。
     if ident.get("const_token"):
         extra["constToken"] = ident["const_token"]
+
+    # ② activityId：**每次自动发现**（1 次 GET、约 1 秒），失败才退回配置值。
+    #    这样换档期是**零人工**的 —— 不用每月手动拿一次 ID。
+    #    `OPPO_NO_DISCOVER=1` 可关掉（省这一次请求）。
+    activity = ""
+    if not os.environ.get("OPPO_NO_DISCOVER"):
+        activity = oppo_resolve_activity(brand, sid, openid, sver)
+    if not activity:
+        activity = env.get("OPPO_ACTIVITY") or brand.get("oppo_activity") or ""
+        if activity:
+            log("  [act] 改用配置里的 activityId=%s" % activity)
+    if not activity:
+        return False, "NOACTID", "拿不到签到 activityId（自动发现与配置都为空）"
 
     # ① 「你是谁」——**只打印，不作门槛**。
     #    ⚠️⚠️ 2026-09-27 两处纠正：
@@ -1499,23 +1670,60 @@ def do_sign_oppo(brand, env):
         log("  [info] 查档期回 code=%s msg=%s（继续尝试签到）"
             % (det.get("code"), str(det.get("message") or det.get("msg") or "")[:80]))
 
-    # ③ 签到（5008/已签 视为幂等成功）
-    r = oppo_request("/cn/oapi/marketing/cumulativeSignIn/signIn",
-                     {"activityId": int(activity)}, sid=sid, openid=openid,
-                     method="POST", extra=extra)
-    if r.get("_transport"):
-        return False, "NETFAIL", "网络失败：%s" % str(r.get("msg"))[:120]
-    rc = str(r.get("code"))
-    msg = str(r.get("message") or r.get("msg") or "")
-    if rc == "200":
-        return True, "200", "签到成功%s" % (("：" + json.dumps(r.get("data"), ensure_ascii=False)[:120])
-                                          if r.get("data") else "")
-    if rc == "5008" or "已签" in msg or "签过" in msg:
-        return True, "415", msg[:120] or "今日已签到"
+    # ③ 签到。把「签一次并解释结果」抽成闭包，好让「换档期 → 重新发现 → 重试」复用。
+    #
+    #    关于**行为验证码 / 风控**（这是必须防的）：纯 HTTP 路径遇到风控时，服务端会回
+    #    某个错误码或要求人工验证 —— 我们**不可能自动过验证码**。这里的处理原则是：
+    #      · 从 message 里认出"验证/风控/频繁"这类语义 → 明确报 `RISK`；
+    #      · **绝不重试**（`oppo_request` 的重试只对**传输层**失败生效，业务码不会重发，
+    #        这点正好帮了我们 —— 见下面 `_transport` 与业务码的分流）；
+    #      · 换句话说：**这一步不会卡住、也不会因为重试加重风控**，只会干净地失败并报明原因。
+    #        真要过验证码，只能退化到 UI 路径（驱动 H5，让人/界面自己处理）。
+    def _do_sign(act):
+        rr = oppo_request("/cn/oapi/marketing/cumulativeSignIn/signIn",
+                          {"activityId": int(act)}, sid=sid, openid=openid,
+                          method="POST", extra=extra)
+        if rr.get("_transport"):
+            return None, "NETFAIL", "网络失败：%s" % str(rr.get("msg"))[:120]
+        c = str(rr.get("code"))
+        mm = str(rr.get("message") or rr.get("msg") or "")
+        if c == "200":
+            return True, "200", "签到成功%s" % (
+                ("：" + json.dumps(rr.get("data"), ensure_ascii=False)[:120]) if rr.get("data") else "")
+        if c == "5008" or "已签" in mm or "签过" in mm:
+            return True, "415", mm[:120] or "今日已签到"
+        # 会话失效 —— 与"风控"分开：这类要重开小程序抓新会话，不是被拦
+        if c == "403" and ("登录" in mm or "login" in mm.lower()):
+            return None, "NOTOKEN", "会话失效（%s）→ 重开小程序让 wxoppo 重抓" % mm[:80]
+        # 疑似风控/需要人工验证
+        if c in ("429",) or any(w in mm for w in ("验证", "风控", "频繁", "拦截", "异常操作")):
+            return None, "RISK", ("疑似风控或需要人工验证（code=%s msg=%s）→ 不重试，"
+                                  "请人工打开小程序确认" % (c, mm[:90]))
+        return None, c, "%s（code=%s）" % (mm[:120], c)
+
+    ok, rc, desc = _do_sign(activity)
+    if ok is not None:
+        return ok, rc, desc
+
+    # ④ 换档期（5005 活动不存在 / 5007 活动已结束）：**自动重新发现 + 用新 ID 重试一次**。
+    #    第二道保险 —— 万一 ② 那次发现拿到的 HTML 还是旧档期的缓存（或有 `OPPO_NO_DISCOVER=1`），
+    #    这里再试一次，仍然失败才认输（并提示"可能真停办了"）。
     if rc in ("5005", "5007"):
-        # 5005 = 活动不存在；5007 = 活动已经结束（**换档期**的典型症状）
-        return False, "NOACT", "活动不存在/已结束（oppo_activity 换档期了，要更新）：%s" % msg[:120]
-    return False, rc, "%s（code=%s）" % (msg[:120], rc)
+        log("  [act] 活动 %s 报 %s（不存在/已结束）→ 自动重新发现当前档期" % (activity, rc))
+        new = oppo_resolve_activity(brand, sid, openid, sver, why="换档期重发现")
+        if not new:
+            return False, "NOACT", "活动已结束，且自动发现也没拿到新 ID（%s）" % desc[:100]
+        if new == str(activity):
+            return False, "NOACT", ("发现到的仍是同一个 activityId=%s，但它报 %s —— "
+                                    "可能活动真停办了，或页面结构已变" % (new, rc))
+        log("  [act] 发现新档期 activityId=%s → 用新 ID 重试签到" % new)
+        save_brand_field(brand.get("slug"), "oppo_activity", new)
+        ok2, rc2, desc2 = _do_sign(new)
+        if ok2 is not None:
+            return ok2, rc2, desc2
+        return False, rc2, "%s（换档期重试后仍失败；新 ID=%s）" % (desc2[:100], new)
+
+    return False, rc, desc
 
 
 # 后端 → 签到实现。往后加新后端只需要三步：写一个 `do_sign_xxx(brand, env)`

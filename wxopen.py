@@ -258,9 +258,19 @@ def geo(wid):
 
 
 def is_main_window(wid):
-    """微信主窗口（WM_CLASS 含 wechat）。
-    ⚠️ 它的标题栏最右是**整个微信**的关闭键，任何情况下都不许点。"""
-    return "wechat" in win_class(wid).lower()
+    """微信**主窗口** —— WM_CLASS 含 wechat **且标题是「微信」**。
+    它的标题栏最右是**整个微信**的关闭键，任何情况下都不许点。
+
+    ⚠️ 2026-09-27 治本：旧实现只看 `WM_CLASS 含 wechat`，而**朋友圈窗口的 WM_CLASS 同样是
+    wechat**（实测 `WM_CLASS(STRING) = "wechat", "wechat"`）→ 朋友圈被当成主窗口**保护**起来：
+      · `wxclean.leftover()` 认为它是主窗口 → 永不清理；
+      · `close_window()` 的防线 ① 认为它是主窗口 → 拒绝关闭。
+    结果朋友圈窗口一旦被误开就只能人工关（实测：批跑中途冒出朋友圈窗口，
+    接着 liuyishou 的面板打不开、`[ensure] rc=3` 直接放弃）。
+    真主窗口的标题恒为「微信」；朋友圈/视频号/搜一搜的标题是它们自己的名字，
+    所以「WM_CLASS + 标题」两条一起看才能把它们区分开。
+    """
+    return "wechat" in win_class(wid).lower() and title_of(wid).strip() == "微信"
 
 
 def find_main_window():
@@ -825,38 +835,69 @@ def reload_panel(W, H):
 
 
 def close_stray_wechat_windows(main, W, H):
-    """关掉**误开的微信窗口**（搜一搜 / 视频号 / 公众号等）。
+    """关掉**误开的微信窗口**（搜一搜 / 视频号 / **朋友圈** / 误开的小程序等）。
 
-    为什么需要：点侧边栏图标时若点错（图标列表是动态的，序号会变），会开出
-    「搜一搜」这类窗口 —— 它**标题也叫「微信」、全屏 1279x1023、无 WM_CLASS**，
-    会一直挡在最上层，导致后续所有点击都落到它身上、`top_window()` 永远返回它
+    为什么需要：点侧边栏图标时若点错（图标列表是动态的，序号会变），会开出这类窗口，
+    它们会一直挡在最上层，导致后续所有点击都落到它们身上、`top_window()` 永远返回它
     → 面板永远判不出来（实测踩到：点错一次，之后试遍所有图标全无反应）。
 
-    判据（**只关确定是"误开窗口"的**，宁可不关也不错关）：
-      · 不是主窗口；
-      · 标题是「微信」（微信自己的浏览器式窗口都叫这个）；
-      · `has_miniapp_tab()` 为假（确认**不是**小程序面板 —— 真面板要留着）。
-    关法：优先用窗口右上角的关闭按钮（点 ×）；`close_window()` 因「标题=微信
-    且不是面板」会拒绝关它，所以这里走 `windowclose`（XTEST 发 WM_DELETE_WINDOW）。
-    ⚠️ 这类窗口不是小程序/面板，微信内部没有需要复位的特殊状态，
-       `windowclose`（发 WM_DELETE_WINDOW，由应用自己处理）是安全的。
+    判据（2026-09-27 修订：**非主窗口 + 不是小程序面板** → 就算误开）：
+    ⚠️ 旧判据多了一条「标题必须是『微信』」，于是**朋友圈窗口被整条漏掉**
+    （它的标题就是「朋友圈」、WM_CLASS 也是 wechat）—— 实测批跑中途开出朋友圈后
+    没人清理它，紧接着 liuyushou 的面板打不开、`[ensure] rc=3` 直接放弃这个号。
+    在本函数的语境里要保的只有一个（那块带小程序 tab 的面板），其余顶层窗口都是误开。
+
+    关法：`close_window`（微信自己的 ✕），按标题选锚点 ——
+      标题「微信」（搜一搜/视频号这类全屏浏览器式窗口）→ `kind="panel"`；
+      其他标题（朋友圈 / 误开的小程序）→ `kind="miniapp"`。
+    ⚠️ **不再用 `xdotool windowclose`**：微信自绘窗口对 WM_DELETE_WINDOW 不可靠
+    （实测朋友圈靠它关不掉、只能人工关；而 `close_window` 一击即中：
+     `探测到关闭字形 (826,256) → 已关闭`）。也**不再用 windowclose 的另一个理由**：
+    它对小程序窗口会损坏 WeChatAppEx 状态机（见 force_close_miniapp 的说明）。
     """
     killed = []
     for wid, t in windows():
+        t = (t or "").strip()
         if str(wid) == str(main) or str(wid) == str(find_main_window()):
             continue
         if is_main_window(wid):
             continue
-        if (t or "").strip() != "微信":
-            continue                     # 有别的标题的（小程序窗口）不碰
+        if not t:
+            continue                     # 无名的辅助窗口不碰
         if has_miniapp_tab(wid, W, H):
             continue                     # 这是真正的小程序面板，留着
-        run("DISPLAY=%s xdotool windowclose %s" % (DISPLAY, wid))
-        killed.append(wid)
-    if killed:
-        print("[reopen] 关掉误开的微信窗口：%s" % ", ".join(killed))
-        time.sleep(1.2)
+        kind = "panel" if t == "微信" else "miniapp"
+        print("[reopen] 关掉误开的窗口 %s（%s）" % (wid, t))
+        if close_window(wid, W, H, kind=kind):
+            killed.append(wid)
+            time.sleep(0.8)
     return killed
+
+
+def _rail_top_group(buttons):
+    """从侧边栏按钮列表里切出**顶部那组**（图标等距排列的那一段）。
+
+    ⚠️ 2026-09-27 治本：**不要再用 `y < H * 0.6`** —— 那个 H 是**屏幕**高（1024），
+    而侧边栏按钮的 y 是**窗口内**坐标。窗口不全屏时两者差很远：
+    实测窗口高 674、按钮 = `[62,114,162,210,258,306,354,402,590]`，
+    按屏幕高算阈值 614 → 底部的 **590 也被算进「顶部组」**，而试错循环是
+    `reversed(top[1:])`（从下往上试）→ **590 被第一个点** →
+    实测一点就开出**「朋友圈」窗口**；它挡在最上层后，后续品牌的面板打不开、
+    `[ensure] rc=3` 直接放弃（这就是「莫名冒出朋友圈窗口」的根因）。
+
+    判据改成**结构性**的（与窗口多大无关）：顶部图标等距排列（实测间距 ≈48px），
+    底部图标与它们之间会出现**间距突变**（实测 402→590 = 188 ≈ 3.9 倍）。
+    以「间距 > 1.8 × 中位间距」为分界，取前面那一段 —— 中位数而不是均值，
+    这样个别间隔偏大也不会把分界整体带偏。
+    """
+    if len(buttons) < 2:
+        return list(buttons)
+    gaps = [b - a for a, b in zip(buttons, buttons[1:])]
+    mid = sorted(gaps)[len(gaps) // 2]          # 中位间距（实测 48）
+    for i, g in enumerate(gaps):
+        if mid > 0 and g > mid * 1.8:           # 间距突变 = 换了一组（实测 188 > 86）
+            return list(buttons[:i + 1])
+    return list(buttons)
 
 
 def open_panel(W, H):
@@ -922,13 +963,25 @@ def open_panel(W, H):
             print("[reopen] 主窗口抬不到最前（顶上不是它）→ 不点侧边栏，免得误点")
             return None
         buttons = find_rail_buttons(W, H)
-        top = [y for y in buttons if y < H * 0.6]     # 顶部那组（排除底部固定图标）
+        # ⚠️ 2026-09-27：切顶部组改走 `_rail_top_group()`（按**间距突变**判，
+        #    与窗口多大无关）。旧写法 `y < H * 0.6` 用的是**屏幕**高，
+        #    会把底部的「朋友圈」图标当成顶部组、还被第一个试 → 实测开出朋友圈窗口。
+        top = _rail_top_group(buttons)
         if len(top) < 2:
             print("[reopen] 侧边栏按钮没找全：%s" % buttons)
             return None
-        # 从下往上试（小程序一般靠后，先试概率高的）；跳过第 1 个（那是账号头像，
-        # 点它会弹资料卡）
-        for n, y in enumerate(reversed(top[1:]), 1):
+        # ⚠️ 2026-09-27 治本：**只试顶部组里最靠后的 3 个**，不要逐个试全部。
+        #    实测顶部组 = [头像, 微信, 通讯录, 收藏, **朋友圈**, …, 小程序面板]，
+        #    里面**混着朋友圈**！一旦小程序面板按钮打不开（微信状态不好时就是这样），
+        #    「逐个试」就会试到朋友圈 → 开出朋友圈窗口 → 它挡在最上层，
+        #    后续品牌全部 `rc=3` 放弃（实测：402 打不开之后，试到 258 = 朋友圈）。
+        #    为什么只试最后 3 个：面板按钮实测总在靠后位置 ——
+        #      窗口高 674 时顶部组 8 个、面板 = 402（最后一个）；
+        #      窗口高 640 时 8 个、面板 = 546（倒数第二）、搜一搜 = 594（最后一个）。
+        #    宁可试不到（放弃这个号）也**不要乱点**：点朋友圈/收藏这类按钮毫无收益、
+        #    只会污染窗口栈。试完这 3 个还不行 → 交给下面的 Ctrl+R / 放弃。
+        cands = list(reversed(top[1:]))[:3]
+        for n, y in enumerate(cands, 1):
             # ⚠️ **每轮开始前先关掉上一轮误开的窗口**（如搜一搜/视频号）—— 它们是
             #    全屏顶层窗口，会一直挡在上面，导致后面所有点击都落到它身上、
             #    `top_window` 永远返回它 → 全部尝试都判否（实测踩到：点错一次开成

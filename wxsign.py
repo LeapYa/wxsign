@@ -1892,6 +1892,29 @@ def do_sign_naixue(brand, env):
     return False, code, "%s（code=%s）" % (msg[:120], code)
 
 
+# ── 蜜雪冰城（duiba）后端 ─────────────────────────────────────────────
+# 「雪王币抽奖」—— 兑吧（duiba）大转盘，承载页是**第三方 H5**，不在小程序包里：
+#   https://76177-activity.dexfu.cn/galaxy/app/project/2924/index.html
+# 链路与其它后端的前两步一样（读小程序会话 → 换第三方登录），但**写接口要多一个
+# JS-challenge token**（服务端下发两段每次不同的混淆 JS，前端 eval 出来才得到 token），
+# 因此实现搬到了 `mx_lottery.py`，用 Node 沙箱跑那两段 JS。这里只做转发。
+#
+# ⚠️⚠️ **安全前提（很重要）**：免费次数用完后 `luck/draw.do` 会**扣 20 雪王币**继续抽，
+#   所以**必须先查 remainFreeTimes，>0 才调 draw**。这条保护实现在 `mx_lottery.run()` 里，
+#   不要在别处绕过它去直接调 draw。
+def do_sign_mx(brand, env):
+    """蜜雪冰城「雪王币抽奖」（兑吧 duiba）。返回 (是否成功, 业务码, 说明)。"""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    try:
+        import mx_lottery
+    except ImportError as e:
+        return False, "NOMOD", "缺少 mx_lottery.py：%s" % e
+    mode = env.get("MX_MODE") or brand.get("mx_mode") or "draw"
+    node = env.get("WXSIGN_NODE") or brand.get("mx_node") or "node"
+    return mx_lottery.run(mode=mode, instance=INSTANCE, ctmp=CTMP, node=node, log=log)
+
+
 # 后端 → 签到实现。往后加新后端只需要三步：写一个 `do_sign_xxx(brand, env)`
 # → 在这张表里注册一行 → brands.json 里给条目写 `engine`（不写 = 吾享）。
 # 主流程（main）也读这张表做分派，别再往 if 链里塞。
@@ -1901,6 +1924,7 @@ _SIGNERS = {
     "qmai": do_sign_qm,
     "oppo": do_sign_oppo,
     "pindao": do_sign_naixue,
+    "duiba": do_sign_mx,
 }
 
 

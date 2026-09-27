@@ -277,6 +277,19 @@
       "enabled": true,
       "verified": true,
       "note": "**第五个后端：奈雪点单（pin-dao.cn，品道自研）** —— 「奈雪币」每日签到。\n\n⚠️ 先纠一个误判：包里确实出现 `qmai.cn/naixue-login`、`qmai.cn/bvrada-user`、`qmai.cn/bvrada-promote`（企迈只承担登录/会员的一部分），但**签到走的是自研** `https://tm-api.pin-dao.cn`，**不是企迈、也不在 H5**。\n\n签到**不是**靠 UI 点按钮，而是原生页 `pkgBasics/pages/signInReminder/signInReminder`：它的 `onShow` 里 `getApp().silentLogin()` 之后直接调 `postSignSave()` —— **一进这个页面就自动签到**，再把返回的 info 渲染成「签到成功」页。所以只要接口能调通，整条链路就成立（实测 2026-09-27）。\n\n接口（全部来自解包，非猜测）：\n  · 登录：`POST /passport/authenticate/wxapp/verify/grc`，`params={type:3, wxappCode:<wx.login 的 code>}` → `data.accessToken`\n  · 签到：`POST /user/sign/save`，`params={signDate:\"YYYY-M-D\"}`\n\n⚠️ 三个坑（踩过/实测确认）：\n  1. **日期不补零**：原码是 `getFullYear()+\"-\"+(getMonth()+1)+\"-\"+getDate()` → `2026-9-27`，不是 `2026-09-27`。\n  2. **body 是两层**：`{common:{…}, params:{…}}`，业务入参一律进 `params`。且网关**强校验 common.nonce** —— 漏了它直接回 `{\"error_msg\":\"invalid request body, no nonce\"}`。\n  3. `common.openId` 在原码里是**硬编码常量** `QL6ZOftGzbziPlZwfiXM`（不是真 openId），签名 = `Base64(HmacSHA1(\"nonce=…&openId=…&timestamp=…\", salt))`，salt 见 `NX_SIGN_SALT`。照抄即可。\n\n会话 = `getApp().globalData.accessToken`（JWT，iss=`pd-passport`，**有效期 120 天**），由小程序 `silentLogin()` 用 wx.login 的 code 换得 —— 我们不碰 code，只读结果（`wxnaixue.py`，容器内跑，与 OPPO 读 NEWOPPOSID 同一思路）。无 token 调业务接口会回 `code=1500000 \"用户未登录，请登录！\"`。\n\n幂等：同一天连调两次 `/user/sign/save` 都回 `code=0`（不会重复发币），所以不需要「先查后签」。签到成果用 `/user/memberCenter/userAsset` 的 `coin` 佐证（实测签到后余额 1，正是「每天签到可获得 1 奈雪币」）。\n\n⚠️ 环境注意：**web-view 页面栈**（`pages/user/index > pages/webView/webView > …signInReminder`）说明小程序是「我的」页里嵌 web-view 再跳原生签到页 —— 但签到接口不在 H5 里，无需驱动浏览器。"
+    },
+    {
+      "slug": "mixue",
+      "name": "蜜雪冰城",
+      "appid": "wx7696c66d2245d107",
+      "keyword": "蜜雪冰城",
+      "miniapp": "蜜雪冰城",
+      "engine": "duiba",
+      "type": "sign",
+      "enabled": true,
+      "verified": true,
+      "mx_mode": "draw",
+      "note": "**第六个后端：蜜雪冰城「雪王币抽奖」（兑吧 duiba 大转盘）** —— 注意这**不是签到**，是「每日免费抽奖 1 次」。\n\n入口：「我的 → 会员权益」第 3 条**「雪王币抽奖」**（`activityType:1013`，由 `/v2/memberRights/mainPage/levels` 下发 `jumpUrl`）。承载页是**第三方 H5**、**不在小程序包里**：`https://76177-activity.dexfu.cn/galaxy/app/project/2924/index.html`（兑吧 spark，活动「抽10000份雪王周边」，档期 2026-09-01~09-30）。\n\n链路：蜜雪 accessToken → `GET /v1/duiba/getLoginUrl?dbredirect=<活动URL>` 换**免密登录 URL** → 访问它拿 dexfu 会话 cookie → `luck/index.do` 查状态 → `luck/draw.do` 抽奖。\n\n⚠️ **两处与其它后端不同，都很关键**：\n1. **写接口要 JS-challenge token**：`getTokenKey.query` / `getToken.query` 返回的**不是 token 值**，而是**每次不同的混淆 JS**（≈2.8KB + 17KB）；前端把它注入 `<script>` 执行后再调 `window.<新函数>()` 取 token（那个函数名由 `eval(String.fromCharCode(…))` 拼出，在 JS 文件里 grep 不到）。实现在 `mx_lottery.py`，用 **Node 沙箱**执行 —— 需要 `WXSIGN_NODE` 指向 node 可执行文件。\n2. **免费次数为 0 时绝不能调 draw**：服务端会**扣 20 雪王币**继续抽。`mx_lottery.run()` 一律先查 `remainFreeTimes`，>0 才抽；等于 0 直接回 `415 今日免费次数已用完`。**别绕过这条保护**。\n\n实测（2026-09-27）：`remainFreeTimes 1→0`、`hadPlayTime 0→1`、当天结果「谢谢参与」。\n\n⚠️ 活动规则明文禁止机器人/爬虫参与（一经发现取消领奖资格并收回奖励），是否每天自动跑需自行权衡。完整记录见 `docs/MXBC_LOTTERY.md`。"
     }
   ]
 }

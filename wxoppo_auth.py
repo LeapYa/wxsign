@@ -50,33 +50,19 @@ EXPR_TEXT = ("(function(){try{return ((document.body&&document.body.innerText)||
              ".replace(/\\s+/g,' ')}catch(e){return 'ERR'}})()")
 
 
-def ctx_with_text(ws, kw, limit=24, prefer=None):
-    """遍历渲染上下文，返回**第一个**页面文字含 `kw` 的 ctx id；没有返回 0。
+def ctx_with_text(ws, kw, prefer=None):
+    """找页面文字含 `kw` 的 ctx（`kw` = 字符串，或「全部都要含」的元组）。返回 0 = 没有。
 
-    `kw` 可以是字符串（含即命中）或**元组**（全部都要含）——
-    后者用于「底部导航那一页」这种要多个词才敢确认的情况（实测：
-    首页文字里有『附近门店』，光看『门店』会误判，必须「首页 + 我的 + 权益」一起看）。
+    ⚠️ 实现**只有一份，在 `wxdom.find_ctx_by_text`** —— 那里用**广播**：一口气全发、统一收，
+    不管有多少 ctx 都只要一轮（~3 秒）。
 
-    为什么不写死 ctx 号：微信每次打开小程序、每次弹层的 ctx 号都会变
-    （实测同一功能这次是 7、上次是 9）；而且弹层常渲染在**另一个渲染面**上，
-    `find_dom_ctx()`（谁节点多选谁）必然选到底层页面 —— 见模块 docstring 坑 1。
-
-    ⚠️ 为什么 `prefer` + `timeout=3`：上下文可能有几十个，每个 `evaluate` 都要走一次
-    CDP 往返。**首版用 `timeout=6.0` 且从头遍历，最坏 40×6 = 240 秒** ——
-    实测就是卡在这里（跑了 4 分钟还没到第 ② 步）。
-    现在：先试上次命中的 ctx，单个超时压到 3 秒；
-    而且**只要拿到第一个含关键词的就返回**，正常路径 1~2 次往返就够。
+    这里曾经自己写过一份「逐个 ctx `evaluate` + 3 秒超时」的版本，**是个性能陷阱**：
+    不存在的 ctx CDP **根本不回包**，每次都要干等到 socket 超时。
+    24 个 ctx 搜一次 ≈ 70 秒，脚本连续搜三次 → **250 秒都没打出第一行**，
+    被外层 `timeout` 杀掉（rc=124）时**日志一片空白** ——
+    现场看起来像「连不上 CDP」，其实只是慢死，极难判断。
     """
-    kws = (kw,) if isinstance(kw, str) else tuple(kw)
-    order = ([prefer] if prefer else []) + [c for c in range(1, limit + 1) if c != prefer]
-    for c in order:
-        v = wxdom.evaluate(ws, EXPR_TEXT, ctx=c, timeout=3.0)
-        s = str(v or "")
-        if not s or s.startswith("ERR"):
-            continue
-        if all(k in s for k in kws):
-            return c
-    return 0
+    return wxdom.find_ctx_by_text(ws, kw, prefer=prefer)
 
 
 def click_text(ws, ctx, want, what="", pick_last=False):
@@ -98,10 +84,119 @@ def click_text(ws, ctx, want, what="", pick_last=False):
     return True
 
 
-def wait_allow(ws, wait=20.0):
-    """等微信**原生**「允许」框并点掉（复用 wxqm_auth 的像素判据）。
+def _diff_ratio(a, b):
+    """两张 RGB bytes 的画面差异比例（0~1）。每 7 个像素采一次 —— 够用且快。"""
+    if not a or not b or len(a) != len(b):
+        return 1.0
+    step = 3 * 7
+    n = d = 0
+    for i in range(0, len(a) - 3, step):
+        n += 1
+        if (abs(a[i] - b[i]) + abs(a[i + 1] - b[i + 1]) + abs(a[i + 2] - b[i + 2])) > 24:
+            d += 1
+    return d / float(n or 1)
 
-    只有这一步允许用颜色：它的配色由**微信客户端**决定，不随品牌/活动变。
+
+def snapshot():
+    """抓一帧小程序窗口。给「原生层是否出现」的画面差异判据用。失败返回 None。"""
+    try:
+        W, H = wxreg.win_size()
+        return wxreg.grab(W, H, win=True)
+    except Exception:
+        return None
+
+
+def _diff_box(a, b, W, H, thr=24):
+    """求两帧差异的**包围盒**（= 新出现的原生弹窗）。返回 (x0,y0,x1,y1) 或 None。
+
+    这是**结构性**判据：弹窗是画面上唯一新出现的东西，不需要任何颜色/品牌假设。
+    """
+    x0, x1, y0, y1 = W, -1, H, -1
+    for y in range(0, H, 2):
+        base = y * W * 3
+        left = right = None
+        n = 0
+        for x in range(0, W, 2):
+            i = base + x * 3
+            if (abs(a[i] - b[i]) + abs(a[i + 1] - b[i + 1]) + abs(a[i + 2] - b[i + 2])) > thr:
+                n += 1
+                if left is None:
+                    left = x
+                right = x
+        if left is None or n * 2 < W * 0.05:      # 该行变化太少 → 当噪声跳过
+            continue
+        y0 = min(y0, y)
+        y1 = max(y1, y)
+        x0 = min(x0, left)
+        x1 = max(x1, right)
+    if x1 < 0 or y1 < 0 or (y1 - y0) < 10:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def find_allow_in(buf, W, H, box):
+    """在 `box` 内找**绿色横向主段**（微信原生「允许」按钮），返回页面坐标或 None。
+
+    ⚠️ 为什么必须把范围锁在 `box` 内：`wxqm_auth.find_allow_btn` 的判据是
+    「白卡里的绿色横段」，而 **OPPO 登录页的绿色圆 logo 也满足它**
+    （页面背景是白的，穿过 logo 的行白度正好落在 `white_card` 的 30%~95% 区间，
+    logo 自身就是绿色横段）→ 两次实测它都返回**logo 中心**，脚本去点 logo
+    （现场表现：「他点了上面的 OPPO 图标，按道理不应该要点的」）。
+    `box` 是「两帧差异」求出来的**新出现区域**，logo 在 box 之外，天然被排除。
+    """
+    if not box:
+        return None
+    bx0, by0, bx1, by1 = box
+    col = {}
+    for x in range(bx0, bx1 + 1):
+        n = 0
+        for y in range(by0, by1 + 1, 2):
+            i = (y * W + x) * 3
+            if wxreg.is_green((buf[i], buf[i + 1], buf[i + 2])):
+                n += 1
+        if n >= 2:
+            col[x] = n
+    if not col:
+        return None
+    xs = sorted(col)
+    runs, cur = [], [xs[0]]
+    for x in xs[1:]:
+        if x - cur[-1] <= 30:                     # 按钮上的白字会把绿段切断，合并回来
+            cur.append(x)
+        else:
+            runs.append(cur)
+            cur = [x]
+    runs.append(cur)
+    best = max(runs, key=len)                     # 最宽的绿段 = 「允许」（「取消」在右、是灰的）
+    if (best[-1] - best[0]) < (bx1 - bx0) * 0.20:
+        return None
+    ys = []
+    for x in best:
+        for y in range(by0, by1 + 1, 2):
+            i = (y * W + x) * 3
+            if wxreg.is_green((buf[i], buf[i + 1], buf[i + 2])):
+                ys.append(y)
+    if not ys:
+        return None
+    return ((best[0] + best[-1]) // 2, (min(ys) + max(ys)) // 2)
+
+
+def wait_allow(ws, wait=20.0, before=None):
+    """等微信**原生**「允许」框并点掉。
+
+    ⚠️⚠️ 2026-09-27 治本：**不能一上来就拿像素找「允许」** —— 实测在 OPPO 登录页上
+    `wxqm_auth.find_allow_btn` 会**误判**：OPPO 的**绿色圆形 logo** 正好构成
+    「白卡里的绿色横段」（页面背景是白的 → 穿过 logo 的那些行，白度落在
+    `white_card` 的 30%~95% 宽度区间 → 被当成白卡；logo 自身就是绿色横段，
+    宽度也过得了 0.25×卡宽 的阈值）→ 于是它返回 **logo 中心**，脚本去点 logo
+    （现场表现：「他点了上面的 OPPO 图标，按道理不应该要点的」）。
+    颜色判据跨品牌必然失效 —— 2026-09-26 已经栽过一次，这是第二次。
+
+    改法：**先用画面差异确认原生层真的出现了，再去找按钮**。
+    原生弹窗会大面积盖住页面（实测约占窗口 18% 面积），画面差异是**结构性信号**，
+    不依赖任何颜色/品牌的假设；没有差异就说明原生层还没出现 → 什么都不点。
+
+    `before`：点「手机号快捷登录」**之前**抓的那一帧；不给就跳过这层保护。
     """
     t0 = time.time()
     while time.time() - t0 < wait:
@@ -111,7 +206,19 @@ def wait_allow(ws, wait=20.0):
         except Exception as e:
             print("[oppo-auth] 截屏失败：%s" % e)
             return False
-        hit = wxqm_auth.find_allow_btn(buf, W, H)
+        box = None
+        if before is not None:
+            r = _diff_ratio(before, buf)
+            if r < 0.05:
+                time.sleep(1.0)          # 画面几乎没变 → 原生层还没出现，不猜
+                continue
+            box = _diff_box(before, buf, W, H)
+            if not box:
+                time.sleep(1.0)
+                continue
+            print("[oppo-auth] 画面变化 %.0f%% → 原生层包围盒 x%d..%d y%d..%d"
+                  % (r * 100, box[0], box[2], box[1], box[3]))
+        hit = find_allow_in(buf, W, H, box) if box else wxqm_auth.find_allow_btn(buf, W, H)
         if hit:
             print("[oppo-auth] 点微信原生「允许」(%d,%d)" % hit)
             wxreg.click(hit[0], hit[1])
@@ -122,79 +229,184 @@ def wait_allow(ws, wait=20.0):
     return False
 
 
+def logged_in(ws):
+    """是否已登录。True=已登录 / False=仍显示「登录账号」/ None=判不了（找不到「我的」页）。
+
+    ⚠️ 判据用「我的」页的**文字**（未登录时页面上有「登录账号」四个字，登录后会变成
+    昵称/手机号）—— **结构性判据**，不依赖颜色，也不依赖坐标。
+    """
+    ctx = ctx_with_text(ws, MINE_KW)
+    if not ctx:
+        return None
+    t = str(wxdom.evaluate(ws, EXPR_TEXT, ctx=ctx, timeout=6.0) or "")
+    if not t or t.startswith("ERR"):
+        return None
+    return "登录账号" not in t
+
+
+def probe_login(ws, ctx):
+    """把登录页的真实 DOM 结构打出来（**只读，不点击**）。
+
+    用途：定「协议勾选框」和「登录按钮」的定位方式时**先看实际结构**，
+    别回到「拿旁边小字的左边界往左推 22 像素」那种猜偏移量的做法 ——
+    2026-09-26 已明确否决（换个字号/内边距就偏）。
+    """
+    t = str(wxdom.evaluate(ws, EXPR_TEXT, ctx=ctx, timeout=6.0) or "")
+    print("[probe] === 登录页 ctx=%d ===" % ctx)
+    print("[probe] 页面文字：%s" % t[:260])
+    print("[probe] --- 按文案取几何 ---")
+    for kw in (LOGIN_KW,) + OPPO_AGREE_WORDS:
+        r = wxdom.rect_of(ws, ctx, (kw,))
+        items = (r or {}).get("items") or []
+        print("[probe]   「%s」命中 %d 个（视口 %sx%s）"
+              % (kw, len(items), (r or {}).get("vw"), (r or {}).get("vh")))
+        for it in items[:5]:
+            print("[probe]      %-14s cls=%-34s %dx%d @%d,%d"
+                  % (it["tag"], str(it.get("cls"))[:34], it["w"], it["h"], it["cx"], it["cy"]))
+    print("[probe] --- 勾选框候选选择器（wxqm_auth._check_agree 用的就是这批）---")
+    for sel in ("[class*=checkbox]", "[class*=circle]", "[class*=agree]",
+                "[class*=check]", "[class*=xuanze]", "input[type=checkbox]"):
+        try:
+            c = wxdom.clickable(ws, ctx, sel, timeout=8.0)
+        except Exception as e:
+            print("[probe]   %-24s 异常 %s" % (sel, e))
+            continue
+        items = (c or {}).get("items") or []
+        print("[probe]   %-24s 命中 %d" % (sel, len(items)))
+        for it in items[:5]:
+            print("[probe]      %-14s cls=%-34s %dx%d @%d,%d"
+                  % (it["tag"], str(it.get("cls"))[:34], it["w"], it["h"], it["cx"], it["cy"]))
+
+
+def ensure_login_page(ws, page_ctx):
+    """走到「手机号快捷登录」页，返回 login_ctx（0 = 失败）。**幂等**，已在登录页就直接返回。
+
+    为什么抽成函数：流程中间要按 Escape 清微信原生层，那一下**有可能把半屏登录页
+    也一起关掉**，于是得重走一遍导航。抽出来免得写两份 —— 这项目已经因为
+    「同一逻辑两处实现」栽过好几次（面板清理、匿名框判据、投递清单）。
+
+    导航实测（OPPO 商城）：
+        首页（ctx 4，innerText 1159 字全是商品名）
+          → 点**底部导航「我的」**（注意：底部导航是 `wx-cover-view`，
+             **不在 innerText 里**，只能用 `rect_of` 按文案点）
+          → 「我的」页（有「个人中心」「登录账号」）
+          → 点「登录」→ 登录页（有「手机号快捷登录」，**半屏页**）
+    """
+    login_ctx = ctx_with_text(ws, LOGIN_KW)
+    if login_ctx:
+        print("[oppo-auth] 已在登录页：ctx=%d" % login_ctx)
+        return login_ctx
+
+    mine_ctx = ctx_with_text(ws, MINE_KW)
+    if not mine_ctx:
+        nav_ctx = page_ctx or ctx_with_text(ws, "为你推荐")
+        if not nav_ctx:
+            print("[oppo-auth] ✗ 定位不到页面 ctx —— 小程序开着吗？")
+            return 0
+        print("[oppo-auth] 当前停在首页（页面 ctx=%d）→ 点底部「我的」" % nav_ctx)
+        wxreg.refresh_page(ws, nav_ctx)
+        if not click_text(ws, nav_ctx, "我的", what="底部导航「我的」"):
+            return 0
+        time.sleep(3.5)
+        mine_ctx = ctx_with_text(ws, MINE_KW)
+        if not mine_ctx:
+            print("[oppo-auth] ✗ 点了「我的」也没进个人中心")
+            return 0
+
+    print("[oppo-auth] 在「我的」页（ctx=%d）→ 点「登录」" % mine_ctx)
+    wxreg.refresh_page(ws, mine_ctx)
+    if not click_text(ws, mine_ctx, "登录", what="「登录」"):
+        return 0
+    time.sleep(3.0)
+    login_ctx = ctx_with_text(ws, LOGIN_KW)
+    if not login_ctx:
+        print("[oppo-auth] ✗ 点「登录」后没等到登录页")
+        return 0
+    print("[oppo-auth] 登录页已打开：ctx=%d" % login_ctx)
+    return login_ctx
+
+
 def main():
-    ws, _ = wxdom.open_dom(limit=80)
+    # ⚠️ `open_dom` 的第二个返回值就是**小程序页面**的渲染 ctx（`find_dom_ctx` 选的）。
+    #    点底部导航必须用它，**不能靠 innerText 找底部导航** —— 实测底部导航是
+    #    `wx-cover-view`，文字**根本不在 `document.body.innerText` 里**：
+    #    首页 innerText 1159 字全是商品名，一个「首页/分类/门店/权益/我的」都没有；
+    #    但 `rect_of()` 那套「遍历元素读 textContent」能读到（实测能定位到 20x14 的文字节点）。
+    #    所以规矩是：
+    #      · 判断「我现在在哪一页」 → 用 innerText（`find_ctx_by_text`）
+    #      · 点底部导航这类 cover-view → 在页面 ctx 上用 `rect_of`（`click_text`）
+    ws, page_ctx = wxdom.open_dom(limit=80)
     if not ws:
         print("[oppo-auth] ✗ 连不上 CDP（hook 挂上了吗？小程序开着吗？）")
         return 2
+    print("[oppo-auth] 小程序页面 ctx=%d" % page_ctx)
 
     wxreg.raise_miniapp()
 
-    mine_ctx = ctx_with_text(ws, MINE_KW)
-    login_ctx = ctx_with_text(ws, LOGIN_KW)
-    print("[oppo-auth] 我的页 ctx=%s，登录页 ctx=%s" % (mine_ctx, login_ctx))
-
-    # ── ⓪ 既不在「我的」页也不在登录页 → 先在**首页**点底部导航「我的」 ──
-    #    小程序打开时默认停在首页（实测 ctx 4、页面文字 1159 字，全是商品名），
-    #    底部导航是「首页 分类 门店 权益 我的」—— 点「我的」才进个人中心。
-    #    ⚠️ 关键词要「首页+权益+我的」一起看：首页正文里有「附近门店」，
-    #       只看「门店」会误判成已完成。
-    if not mine_ctx and not login_ctx:
-        home_ctx = ctx_with_text(ws, ("首页", "权益", "我的"))
-        if not home_ctx:
-            print("[oppo-auth] ✗ 找不到底部导航（首页/权益/我的）—— 小程序开着吗？")
-            return 3
-        print("[oppo-auth] 当前停在首页（ctx=%d）→ 点底部「我的」" % home_ctx)
-        wxreg.refresh_page(ws, home_ctx)
-        if not click_text(ws, home_ctx, "我的", what="底部导航「我的」"):
-            return 3
-        time.sleep(3.5)
-        mine_ctx = ctx_with_text(ws, MINE_KW)
-        login_ctx = ctx_with_text(ws, LOGIN_KW)
-        print("[oppo-auth] 切页后：我的页 ctx=%s，登录页 ctx=%s" % (mine_ctx, login_ctx))
-
-    # ── ① 没有登录页就先从「我的」页点「登录」 ──
+    login_ctx = ensure_login_page(ws, page_ctx)
     if not login_ctx:
-        if not mine_ctx:
-            print("[oppo-auth] ✗ 既没有登录页、也没有「个人中心」—— 小程序开着吗？")
-            return 3
-        wxreg.refresh_page(ws, mine_ctx)
-        if not click_text(ws, mine_ctx, "登录", what="「登录」"):
-            return 3
-        time.sleep(3.0)
-        login_ctx = ctx_with_text(ws, LOGIN_KW)
-        if not login_ctx:
-            print("[oppo-auth] ✗ 点「登录」后没等到登录页")
-            return 3
-        print("[oppo-auth] 登录页已打开：ctx=%d" % login_ctx)
-
-    # ── ② 勾选协议 + 点「手机号快捷登录」 ──
-    wxreg.refresh_page(ws, login_ctx)
-    # 勾选框逻辑**复用 wxqm_auth._check_agree**（它含「先看已勾态」那一步 ——
-    # 少那一步会把本来就勾着的又点一遍、变成取消）。本文件只传商户自己的文案。
-    wxqm_auth._check_agree(ws, login_ctx, agree_words=OPPO_AGREE_WORDS)
-    time.sleep(0.6)
-    # 勾选后 DOM 会重排，坐标必须重新取
-    login_ctx = ctx_with_text(ws, LOGIN_KW) or login_ctx
-    if not click_text(ws, login_ctx, LOGIN_KW, what="「手机号快捷登录」"):
         return 3
 
-    # ── ③ 微信原生「允许」框 ──
-    wait_allow(ws, wait=20.0)
+    # ── 探测模式：到登录页就停，把真实 DOM 打出来（只读，不点击）──
+    if "--probe" in sys.argv[1:]:
+        probe_login(ws, login_ctx)
+        return 0
 
-    # ── ④ 验证：回到「我的」页应能看到账号信息 ──
+    # ── ⓪.5 清掉可能遗留的微信原生层，拿到**干净的参照帧** ──
+    #    ⚠️ 为什么必须做：微信原生弹窗是**画在小程序窗口里面**的（实测不是独立 X 窗口，
+    #    `xwininfo -children` 看不到），而且它是**模态**的 ——
+    #    上一轮失败时若把它留着，`wait_allow` 的「两帧差异」判据就**整体失效**
+    #    （参照帧里已经有弹窗 → 之后怎么等都被判成「没变化」）。实测就卡死在这一步。
+    #    实测 **Escape 就能关掉它**（弹窗消失、登录页保留）。
+    #    Escape 有极小概率把**半屏登录页**也一起关掉，所以之后重新确认一次；
+    #    不在登录页就重走导航（`ensure_login_page` 是幂等的）。
+    wxreg.raise_miniapp()
+    time.sleep(0.4)
+    wxreg.run("DISPLAY=%s xdotool key Escape" % wxreg.DISPLAY)
+    time.sleep(1.2)
+    if not ctx_with_text(ws, LOGIN_KW):
+        print("[oppo-auth] Escape 之后不在登录页了 → 重新走一遍导航")
+        login_ctx = ensure_login_page(ws, page_ctx)
+        if not login_ctx:
+            return 3
+    else:
+        login_ctx = ctx_with_text(ws, LOGIN_KW)
+
+    # ── ② 点「手机号快捷登录」—— **先不勾协议，先试一次** ──
+    #    为什么要「先试再勾」：那个协议勾选框是**两态**的（未勾/已勾是两个类名，而且
+    #    圆圈里**没有文案**），我们**无法可靠地知道它当前是哪一态** ——
+    #    所以「无条件先点一下勾选框」这种写法迟早会把「本来就勾着」的点成取消。
+    #    改成：先点登录 → 没成功才去勾 → 再点一次。这样对两态**完全免疫**。
+    wxreg.refresh_page(ws, login_ctx)
+    before = snapshot()
+    if not click_text(ws, login_ctx, LOGIN_KW, what="「手机号快捷登录」"):
+        return 3
+    wait_allow(ws, wait=8.0, before=before)
+
+    if not logged_in(ws):
+        print("[oppo-auth] 第 1 次点登录没成功 → 多半是协议没勾，补勾后重试")
+        # 勾选框逻辑**复用 wxqm_auth._check_agree**（它含「先看已勾态」那一步）。
+        # 本文件只提供商户自己的协议文案，选择器跨商户通用。
+        wxqm_auth._check_agree(ws, login_ctx, agree_words=OPPO_AGREE_WORDS)
+        time.sleep(0.8)
+        login_ctx = ctx_with_text(ws, LOGIN_KW) or login_ctx   # 勾选后 DOM 重排 → 坐标重取
+        before = snapshot()
+        if not click_text(ws, login_ctx, LOGIN_KW, what="「手机号快捷登录」（第 2 次）"):
+            return 3
+        wait_allow(ws, wait=15.0, before=before)
+
+    # ── ④ 验证 ──
     time.sleep(3.0)
-    mine_ctx = ctx_with_text(ws, MINE_KW)
-    txt = ""
-    if mine_ctx:
-        v = wxdom.evaluate(ws, EXPR_TEXT, ctx=mine_ctx, timeout=8.0)
-        txt = str(v or "")
-    if mine_ctx and "登录账号" not in txt:
+    ok = logged_in(ws)
+    if ok:
         print("[oppo-auth] ✓ 登录成功（「我的」页已不是「登录账号」状态）")
         return 0
-    if mine_ctx:
+    if ok is False:
         print("[oppo-auth] ✗ 「我的」页仍显示「登录账号」→ 未登录")
-        print("[oppo-auth]   页面文字前 160 字：%s" % txt[:160])
+        mctx = ctx_with_text(ws, MINE_KW)
+        if mctx:
+            t = str(wxdom.evaluate(ws, EXPR_TEXT, ctx=mctx, timeout=8.0) or "")
+            print("[oppo-auth]   页面文字前 160 字：%s" % t[:160])
         return 1
     print("[oppo-auth] ? 找不到「我的」页，无法判断（授权框可能已点，去跑 wxoppo.py 验证会话）")
     return 4

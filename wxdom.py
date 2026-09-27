@@ -266,8 +266,42 @@ def find_ctx_with(ws, selectors, limit=80, timeout=12.0, visible=False):
     return _broadcast(ws, js, limit, timeout, kind="int")
 
 
+TEXT_JS = ("(function(){try{return ((document.body&&document.body.innerText)||'')"
+           ".replace(/\\s+/g,' ')}catch(e){return 'ERR'}})()")
+
+
+def find_ctx_by_text(ws, kws, limit=40, timeout=8.0, prefer=None):
+    """找**页面文字里同时包含全部关键词**的 ctx。`kws` 传字符串或元组。返回 ctx id，没有返回 0。
+
+    ⭐ 为什么必须用**广播**、不能逐个 ctx `evaluate`（2026-09-27 血泪实测）：
+    逐个问的话，**不存在的 ctx 根本不回包**，每次都要干等到 socket 超时。
+    实测「24 个 ctx × 3s 超时」→ 一次搜索就要 70 秒；脚本连着搜三次 →
+    **250 秒都没打出第一行**，被外层 `timeout` 杀掉（rc=124）时**日志一片空白** ——
+    现场看起来像「连不上 CDP」，其实只是慢死，极难判断。
+    `_broadcast` 是「一口气全发、统一收」，**不管有多少 ctx 都只要一轮（~3 秒）**。
+
+    多关键词（元组）用于「要多个词才敢确认是哪一页」的情况 —— 实测 OPPO 首页正文里
+    有「附近门店」，光看「门店」会误判，必须「首页 + 权益 + 我的」一起看。
+    """
+    kws = (kws,) if isinstance(kws, str) else tuple(kws)
+    if not kws:
+        return 0
+    got = _broadcast(ws, TEXT_JS, limit, timeout, kind="str")
+    if prefer and all(k in got.get(prefer, "") for k in kws):
+        return prefer
+    for c in sorted(got):
+        if all(k in got[c] for k in kws):
+            return c
+    return 0
+
+
 def _broadcast(ws, js, limit, timeout, kind="int"):
-    """把一段 JS 盲撒给 ctx 1..limit，返回 {ctx: 值}（值非空/非 -1 才有）。
+    """把一段 JS 盲撒给 ctx 1..limit，返回 {ctx: 值}。
+
+    `kind`：
+      · `"int"` —— 值当**正整数**看，>0 才收（`find_ctx_with` 用）；
+      · `"str"` —— 值当**字符串**看，非空且不以 `ERR` 开头就收（`find_ctx_by_text` 用，
+        典型是页面文字 innerText）。
 
     ⚠️ **必须「批量发、统一收」**（2026-09-26 修正）：原实现是「逐个 ctx 发一条、立刻等 2 秒」，
     在手机竖版窗口形态下**一条都收不到**（响应比 2 秒慢），于是整模块报「DOM=不可用」——
@@ -307,6 +341,11 @@ def _broadcast(ws, js, limit, timeout, kind="int"):
                 continue
             v = ((m.get("result") or {}).get("result") or {}).get("value")
             if v is None:
+                continue
+            if kind == "str":
+                s = str(v).strip()
+                if s and not s.startswith("ERR"):
+                    out[mid - base] = s
                 continue
             try:
                 n = int(v)

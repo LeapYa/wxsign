@@ -79,14 +79,18 @@ def display_size():
 # 改成只最大化「微信」（主窗口 + 面板）之后，小程序窗口恢复成手机竖版
 # （实测 410x776 @ 435,124），位置也不再固定在 (0,0)。
 #
-# 换算为什么是简单的平移、不需要补标题栏高度：实测用 CDP 问页面自己，
-# window.screenX/screenY = (435,124) 与窗口原点**完全一致**，
-# 且 innerHeight(779) > outerHeight(776) —— 顶部那条「⌂ 首页 ●●● ─ ⊙」
-# 是**覆盖层**，不占视口。所以：屏幕 = 窗口原点 + 页面坐标（DPR=1）。
+# 换算是「平移 + 补视口外的 chrome」，**不是**纯平移 —— 参见 `refresh_page` 里的 ⚠️⚠️：
+#   · **小程序的根页面**：页面自报 window.screenX/screenY = (435,124) 与窗口原点完全一致，
+#     且 innerHeight(779) > outerHeight(776) —— 顶部那条「⌂ 首页 ●●● ─ ⊙」是
+#     **覆盖层**，不占视口 → 补 0 ✓（当初就是只看了这一种形态，才写出「简单平移」的结论）。
+#   · **半屏页**（如 OPPO 商城的「登录」页）：窗口被撑开、页面外多出一条标题栏，
+#     `sy` **仍然是窗口原点**、innerHeight 却比 outerHeight 小 61 → 必须补 61，
+#     否则所有点击整体偏上 61px（实测勾选框/登录按钮全点空）。
+#   两种形态统一由 `dy = max(0, outerHeight - innerHeight)` 覆盖（DPR=1）。
 _PAGE = {"x": 0, "y": 0, "w": 0, "h": 0, "dpr": 1.0, "src": "none"}
 
 _PAGE_JS = ("(function(){try{return JSON.stringify({sx:screenX,sy:screenY,"
-            "w:innerWidth,h:innerHeight,dpr:devicePixelRatio});}"
+            "w:innerWidth,h:innerHeight,oh:outerHeight,dpr:devicePixelRatio});}"
             "catch(e){return 'ERR:'+(e.message||e)}})()")
 
 
@@ -111,7 +115,27 @@ def refresh_page(ws=None, ctx=0):
             if raw and not str(raw).startswith("ERR"):
                 g = json.loads(raw)
                 if g.get("w") and g.get("h"):
-                    _PAGE.update(x=int(g["sx"]), y=int(g["sy"]),
+                    # ⚠️⚠️ 2026-09-27 治本：**页面自报的 `sy` 只是「窗口原点」，不含页面外的 chrome**。
+                    #    实测 OPPO 商城的**半屏登录页**：窗口 410x776 @ (435,124)，
+                    #    页面自报 sx=435 sy=124、innerHeight=715、outerHeight=776 ——
+                    #    中间那 61px 是微信给半屏页加的**「登录」标题栏**，它不在视口里，
+                    #    而 `sy` 不会把它算进去。于是按 `(sy + 页面y)` 点击会**整体偏上 61px**：
+                    #    实测勾选框（页面 y=630，真实屏幕 y=815）点空、登录按钮
+                    #    （页面 y=345，真实 y=531）也点空，还误点到了 OPPO logo ——
+                    #    三个现象都对得上「少加了 61」。
+                    #    判据直接用页面自己报的两个数：`dy = outerHeight - innerHeight`。
+                    #    · 半屏登录页：776-715 = **61** ✓
+                    #    · 主页面（OPPO 首页/我的页）：776-779 = **-3** → 取 0 ✓
+                    #      —— 正好对应老注释里那条观察「innerHeight(779) > outerHeight(776)，
+                    #        顶部那条 ⌂ ●●● － ⊙ 是**覆盖层**、不占视口」。
+                    dy = int(g.get("oh") or 0) - int(g["h"])
+                    if dy < 0 or dy > 200:      # 不合理就当没有：宁可不加，也别乱加
+                        dy = 0
+                    if dy:
+                        print("[wxreg] 页面视口比窗口矮 %dpx（半屏页的标题栏）→ "
+                              "页面原点 y 由 %d 修正为 %d"
+                              % (dy, int(g["sy"]), int(g["sy"]) + dy))
+                    _PAGE.update(x=int(g["sx"]), y=int(g["sy"]) + dy,
                                  w=int(g["w"]), h=int(g["h"]),
                                  dpr=float(g.get("dpr") or 1), src="cdp")
                     return True

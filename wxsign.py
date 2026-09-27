@@ -45,9 +45,13 @@
 退出码：0 = 全部成功（含「今日已签到」）；1 = 有失败。
 每个品牌收尾打印一行便于 grep：  RESULT <slug> code=<业务码> msg=<说明>
 """
+import base64
+import hashlib
+import hmac
 import http.client
 import json
 import os
+import random
 import re
 import ssl
 import subprocess
@@ -1726,6 +1730,168 @@ def do_sign_oppo(brand, env):
     return False, rc, desc
 
 
+# ── 奈雪点单（pindao）后端 ───────────────────────────────────────────
+# 品道自研（pin-dao.cn），**不是企迈、签到也不在 H5**。解包 wxab7430e6e8b9a4ab 得到
+# 的全部事实（照抄原码，不是猜）：
+#   · api 根：`https://tm-api.pin-dao.cn`（env 配置 `prod:{api:"…"}`）
+#   · 签到页：`pkgBasics/pages/signInReminder/signInReminder`
+#     —— `onShow` 里 `getApp().silentLogin()` 之后就调 `postSignSave()`，
+#        即**一进这个页面就自动签到**，然后把返回的 info 渲染成「签到成功」。
+#   · 签到：`POST /user/sign/save`，body.params = {signDate:"YYYY-M-D"}
+#     ⚠️ 日期拼法是 `getFullYear()+"-"+(getMonth()+1)+"-"+getDate()` —— **不补零**（`2026-9-27`）。
+#   · 登录：`POST /passport/authenticate/wxapp/verify/grc`
+#     body.params = {type:3, wxappCode:<wx.login() 的 code>} → data.accessToken
+#   · 请求结构是**两层** `{common:{…}, params:{…}}`，业务入参进 params。
+#   · 头：`Authorization: Bearer <accessToken>` + `storeId` + `iv`。
+#   · 网关**强校验 common.nonce**：漏了它直接回
+#     `{"error_msg":"invalid request body, no nonce"}`（实测）。
+#   · 无 token 调业务接口 → `code=1500000 "用户未登录，请登录！"`（按 token 认人）。
+#
+# 会话：`getApp().globalData.accessToken`（JWT，iss=pd-passport，**有效期 120 天**），
+# 由小程序 `silentLogin()` 用 wx.login 的 code 换来 —— 我们不需要 code，读结果即可
+# （与 OPPO 读 NEWOPPOSID 同一思路，见 wxnaixue.py）。
+NX_BASE = "https://tm-api.pin-dao.cn"
+_NX_HOST = NX_BASE.split("//", 1)[1]
+_NX_CONN = [None]
+NX_APPID = "wxab7430e6e8b9a4ab"
+NX_BRAND = 26000252
+NX_BUSINESS_TYPE = 1
+NX_VERSION = "6.0.84"                       # 原码配置里的 version
+NX_IV = "bEZd3soOfZvFptks"
+NX_SIGN_SALT = "sArMTldQ9tqU19XIRDMWz7BO5WaeBnrezA"   # common.signature 的 HmacSHA1 密钥
+NX_FAKE_OPENID = "QL6ZOftGzbziPlZwfiXM"    # 原码里就是硬编码常量（不是真 openId），照抄
+
+
+def _nx_day(ts=None):
+    """原码的日期拼法：年-M-D，**不补零**。"""
+    t = time.localtime(ts) if ts else time.localtime()
+    return "%d-%d-%d" % (t.tm_year, t.tm_mon, t.tm_mday)
+
+
+def _nx_common():
+    """common 块。签名 = Base64(HmacSHA1("nonce=…&openId=…&timestamp=…", salt))。"""
+    nonce = random.randint(1, 1000000)
+    ts = int(time.time())
+    raw = "nonce=%d&openId=%s&timestamp=%d" % (nonce, NX_FAKE_OPENID, ts)
+    sig = base64.b64encode(
+        hmac.new(NX_SIGN_SALT.encode(), raw.encode(), hashlib.sha1).digest()).decode()
+    return {"platform": "wxapp", "version": NX_VERSION, "imei": "", "osn": "", "sv": "",
+            "lat": "", "lng": "", "lang": "zh_CN", "currency": "CNY", "timeZone": "",
+            "nonce": nonce, "openId": NX_FAKE_OPENID, "timestamp": ts, "signature": sig}
+
+
+def _nx_params(appid, extra=None):
+    p = {"businessType": NX_BUSINESS_TYPE, "brand": NX_BRAND, "tenantId": 1, "channel": 2,
+         "stallType": None, "storeId": "", "storeType": "", "cityId": "",
+         "districtId": "", "appId": appid or NX_APPID, "dAId": ""}
+    p.update(extra or {})
+    return p
+
+
+def _nx_once(path, params=None, token="", appid=NX_APPID):
+    """单次请求（复用连接 —— 理由与 _oppo_once / _api_post_once 相同：防临时端口耗尽）。"""
+    body = json.dumps({"common": _nx_common(), "params": _nx_params(appid, params)}).encode()
+    headers = {"Content-Type": "application/json", "iv": NX_IV, "storeId": "",
+               "Authorization": "Bearer " + (token or "")}
+    try:
+        conn = _NX_CONN[0]
+        if conn is None:
+            conn = http.client.HTTPSConnection(_NX_HOST, timeout=20, context=_SSL)
+            _NX_CONN[0] = conn
+        conn.request("POST", path, body=body, headers=headers)
+        r = conn.getresponse()
+        raw = r.read().decode(errors="replace")
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {"_transport": 1, "msg": "HTTP %s 且非 JSON（前 160 字：%s）"
+                                            % (r.status, raw[:160])}
+    except Exception as e:
+        _NX_CONN[0] = None
+        return {"_transport": 1, "msg": "传输失败：%s" % e}
+
+
+def nx_request(path, params=None, token="", appid=NX_APPID, retries=3):
+    """带重试。只对**传输层**失败重试；业务码（含风控类）不重发，免得加重。"""
+    r = None
+    for attempt in range(retries + 1):
+        r = _nx_once(path, params, token, appid)
+        if not r.get("_transport"):
+            return r
+        if attempt < retries:
+            wait = 2.0 * (attempt + 1)
+            log("  [net] %s 第 %d 次失败（%s），%.1fs 后重试"
+                % (path, attempt + 1, str(r.get("msg"))[:60], wait))
+            time.sleep(wait)
+    return r
+
+
+def nx_ident(brand, wait=12):
+    """在小程序里读奈雪的 accessToken，见 wxnaixue.py。"""
+    if not INSTANCE:
+        log("  [naixue] 未设 WOC_INSTANCE → 取不到会话")
+        return None
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxnaixue.py"), brand.get("appid", ""), str(wait)],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        log("  [naixue] 执行异常：%s" % e)
+        return None
+    out = (p.stdout or "") + (p.stderr or "")
+    got = None
+    for line in out.splitlines():
+        if line.startswith("NX_JSON="):
+            try:
+                got = json.loads(line[len("NX_JSON="):])
+            except ValueError:
+                pass
+        elif line.strip():
+            log("     " + line.strip()[:180])
+    if not got:
+        log("  [naixue] 没读到会话（wxnaixue.py rc=%s）" % p.returncode)
+        return None
+    return got
+
+
+def do_sign_naixue(brand, env):
+    """奈雪点单（品道自研）签到。返回 (是否成功, 业务码, 说明)。
+
+    链路：wxnaixue.py 读 accessToken → POST /user/sign/save {signDate}。
+    该接口**幂等**（实测同一天连调两次都回 code=0，不会重复发币），所以「今天签没签」
+    由服务端自己兜底，不必先查后签。返回码：200 成功 / NOTOKEN token 失效 / 其它原样透出。
+    """
+    ident = nx_ident(brand)
+    if not ident or not ident.get("token"):
+        return False, "NOIDENT", "拿不到奈雪 accessToken（小程序开着吗？hook 通吗？）"
+    token = ident.get("token", "")
+    appid = ident.get("appid") or brand.get("appid") or NX_APPID
+    day = _nx_day()
+
+    r = nx_request("/user/sign/save", {"signDate": day}, token=token, appid=appid)
+    if r.get("_transport"):
+        return False, "NETFAIL", "网络失败：%s" % str(r.get("msg"))[:120]
+    code = str(r.get("code"))
+    msg = str(r.get("message") or r.get("msg") or "")
+
+    if code == "0":
+        # 顺带查奈雪币余额做佐证（签到 +1 币）。查失败不影响结论。
+        coin = None
+        a = nx_request("/user/memberCenter/userAsset", {}, token=token, appid=appid)
+        if not a.get("_transport") and isinstance(a.get("data"), dict):
+            coin = a["data"].get("coin")
+        return True, "200", "签到成功（signDate=%s）%s" % (
+            day, ("，奈雪币余额 %s" % coin) if coin is not None else "")
+    if code == "1500000" or "未登录" in msg or "登录" in msg:
+        return False, "NOTOKEN", ("accessToken 失效（code=%s %s）→ 重开小程序让它 "
+                                  "silentLogin 刷新 token 后再跑" % (code, msg[:80]))
+    if any(w in msg for w in ("验证", "风控", "频繁", "拦截", "异常")):
+        return False, "RISK", ("疑似风控/需人工验证（code=%s msg=%s）→ 不重试，"
+                               "请人工打开小程序确认" % (code, msg[:90]))
+    return False, code, "%s（code=%s）" % (msg[:120], code)
+
+
 # 后端 → 签到实现。往后加新后端只需要三步：写一个 `do_sign_xxx(brand, env)`
 # → 在这张表里注册一行 → brands.json 里给条目写 `engine`（不写 = 吾享）。
 # 主流程（main）也读这张表做分派，别再往 if 链里塞。
@@ -1734,6 +1900,7 @@ _SIGNERS = {
     "weizulin": do_sign_wzl,
     "qmai": do_sign_qm,
     "oppo": do_sign_oppo,
+    "pindao": do_sign_naixue,
 }
 
 

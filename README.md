@@ -4,7 +4,7 @@
 
 目前覆盖 **吾享（wuuxiang）** 系 —— 天财商龙旗下的餐饮 SaaS。
 辣可可、来菜、九村烤脑花、酒煮江湖用的是它，所以**一套脚本就能全签**。
-另有 **4 个非吾享后端**（易东 / 微租林 / 企迈 / **OPPO 商城**）接口各不相同，
+另有 **5 个非吾享后端**（易东 / 微租林 / 企迈 / **OPPO 商城** / **品道自研**）接口各不相同，
 由 `brands.json` 的 `engine` 字段分派 —— 加品牌只改配置，不动代码。
 
 > **上手就三步**：把 `wxsign/` 放进青龙脚本目录 → 配几个环境变量 → 加一条定时任务
@@ -18,7 +18,7 @@
 
 ---
 
-## 一、能签到的小程序（12 个）
+## 一、能签到的小程序（13 个）
 
 | 品牌 | 小程序 | appId | 签到活动 | 后端 | 状态 |
 |---|---|---|---|---|---|
@@ -34,12 +34,13 @@
 | 呷哺呷哺 | 呷哺呷哺 | `wx6822e696198e2763` | 签到得好礼（送哺币） | **企迈** | ✅ 已跑通 |
 | 李先生牛肉面大王 | 李先生牛肉面大王会员 | `wx9710b09df6cb09a9` | 签到得好礼 | **企迈** | ✅ 已跑通 |
 | OPPO 商城 | OPPO商城 | `wx9c825da1a7ba062e` | 每日签到得积分（累计 7 天） | **OPPO 商城** | ✅ 已跑通 |
+| 奈雪点单 | 奈雪点单 | `wxab7430e6e8b9a4ab` | 每日签到得奈雪币 | **品道自研** | ✅ 已跑通 |
 
 > 全部已真机跑通（自动开小程序 → 取身份 → 不是会员则**自动注册** → 签到）；
 > 返回 `415 今日已签到` 或 `200 签到成功` 都算完成。
 > 返回码语义：`200` 成功 / `415` 今日已签 / `406` 不在可签时段 / `401` 还不是会员 / `405` 该租户没活动。
 
-**首次接入**：吾享 / 易东 / 微租林**什么都不用做**；**企迈**与 **OPPO 商城**要过一遍手机号授权
+**首次接入**：吾享 / 易东 / 微租林 / **奈雪点单** 什么都不用做；**企迈**与 **OPPO 商城**要过一遍手机号授权
 （每个品牌一辈子一次，已做成脚本 —— 见第五节）。
 
 **签到给什么**：一般是**会员积分**（辣可可每天 +1，连签 10 / 20 / 30 天分别加赠 10 / 15 / 20，
@@ -48,12 +49,12 @@
 > 📖 **单个品牌的细节**都在 `brands.json` 各条目的 `note` 字段里 —— 过桥缘名下还有两个同活动的
 > 小程序（签一个就够）、绿茵阁 / 我的小板凳搜索时同族小程序很多（`keyword` 必须用**全名**）、
 > 刘一手对应的是**巴塞罗那店**，以及各品牌的 `gameId / activityId / 商户号 / 卡号`…
-> **各后端的接口与踩坑**在 `docs/` 下的四份文档：
-> [易东](docs/YD_API.md) · [微租林](docs/WZL_API.md) · [企迈](docs/QMAI_API.md) · [OPPO 商城](docs/OPPO_API.md)。
+> **各后端的接口与踩坑**在 `docs/` 下的五份文档：
+> [易东](docs/YD_API.md) · [微租林](docs/WZL_API.md) · [企迈](docs/QMAI_API.md) · [OPPO 商城](docs/OPPO_API.md) · [奈雪点单](docs/NAIXUE_API.md)。
 
 还有一批别的服务商的小程序也有签到（五条友、竹园村、望京小腰、大渔铁板烧、大龙燚…），
-接口各不相同，本合集**按后端逐个适配**：目前支持 **吾享 / 易东 / 微租林 / 企迈 / OPPO 商城** 五个
-（后四个见第五节）。美团 / 有赞 / 口碑·饿了么 走**平台级账号体系**（用各自的账号登录，
+接口各不相同，本合集**按后端逐个适配**：目前支持 **吾享 / 易东 / 微租林 / 企迈 / OPPO 商城 / 品道自研** 六个
+（后五个见第五节）。美团 / 有赞 / 口碑·饿了么 走**平台级账号体系**（用各自的账号登录，
 签到也只是平台 H5），成本与收益不成比例，暂不做。
 
 ---
@@ -144,6 +145,7 @@ wxsign/
 │   └── _template.env
 ├── docs/DEPLOY.md       从零部署 + 后续运维：微信侧故障、多开实例、卸干净、换微信账号
 ├── docs/OPPO_API.md     OPPO 商城后端逐条实测记录（会话 / 档期 / activityId 自动发现）
+├── docs/NAIXUE_API.md   奈雪点单（品道自研）后端逐条实测记录（登录 / 签到 / 幂等）
 ├── wmpf/                hook 挂不上时的自救工具（部署阶段就要用一次）
 │   ├── check_wmpf.sh       验 WMPF 版本有没有对应偏移配置（纯只读）
 │   ├── hook_patch.sh       给上游打那两个必需的补丁（幂等，见 [DEPLOY.md 第 4.1 节](docs/DEPLOY.md#41-必须打的两个补丁)）
@@ -172,6 +174,7 @@ wxsign/
 ├── wxoppo.py            （容器内跑）OPPO 商城取会话：读 storage 的 logininfo（NEWOPPOSID + openId）
 ├── wxoppo_auth.py       （容器内跑）OPPO「首次手机号快捷登录」全自动 —— 只需跑一次
 ├── wxoppo_act.py        （容器内跑）OPPO 自动发现当前档期的 activityId（备选：驱动 H5 + CDP hook）
+├── wxnaixue.py          （容器内跑）奈雪点单取会话：读 getApp().globalData.accessToken（Bearer）
 ├── wxapkg.py            （容器内跑）解 wxapkg 并在里面搜 —— **不用打开小程序就能逆向**接口/签名
 ├── open_target.py       （容器内跑）按 appId 复核着开目标小程序（比按标题判更可靠）
 ├── LICENSE              保留所有权利（源码公开，但**不是开源**，见第九节）
@@ -199,7 +202,7 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 所以做法是**一个引擎 + 每品牌一份 `brands/<slug>.env`**：
 加品牌只加配置文件，不动代码，也没有 N 份要各自维护的脚本。
 
-### 另外四个后端：易东（eingdong）、微租林（weizulin）、企迈（qmai）、OPPO 商城（oppo）
+### 另外五个后端：易东（eingdong）、微租林（weizulin）、企迈（qmai）、OPPO 商城（oppo）、品道自研（pindao）
 
 上面「一个引擎签所有品牌」只对**吾享内部**成立。别的服务商接口各不相同，所以
 `brands.json` 多了个 `engine` 字段来选后端 —— **不写 = 吾享**，老条目一个都不用改。
@@ -212,12 +215,13 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 | `weizulin` | 微租林 `saas.funjs.top/api` | `Authorization: Bearer <JWT>` | `wx.login` 的 code（换 token 时用） |
 | `qmai` | 企迈 `webapi.qmai.cn/web/cmk-center` | `Qm-User-Token` + `store-id` 请求头 | `wxqm.py` **双路**：storage 的 `loginData`，取不到就抓真实请求头 |
 | `oppo` | OPPO 商城 `msec.opposhop.cn`（H5 侧 `hd.opposhop.cn/api`） | `NEWOPPOSID` + `openid` 请求头 | `wxoppo.py` 读 storage 的 `logininfo`（`encryptedSession` / `openId`） |
+| `pindao` | 奈雪点单 `tm-api.pin-dao.cn`（品道自研） | `Authorization: Bearer <accessToken>` | `wxnaixue.py` 读 `getApp().globalData.accessToken`（JWT，120 天） |
 
 非吾享后端多一个**首次接入**的动作（每个品牌一辈子一次）：
 
 | engine | 首次要做什么 | 谁做 |
 |---|---|---|
-| `eingdong` / `weizulin` | **什么都不用** —— 服务端自己持 appsecret 换 openid，无授权弹窗 | — |
+| `eingdong` / `weizulin` / `pindao` | **什么都不用** —— 服务端自己持 appsecret 换 openid，无授权弹窗 | — |
 | `qmai` | 过一遍**手机号授权**（企迈要求已绑手机号的会员） | `wxqm_auth.py`，全自动 |
 | `oppo` | 过一遍**手机号快捷登录**（OPPO 要求绑手机号） | `wxoppo_auth.py`，全自动 |
 
@@ -302,8 +306,31 @@ POST /cn/oapi/marketing/cumulativeSignIn/signIn  {activityId}   →  签到
 > 与企迈的**不同点**值得注意：企迈的 `activityId` 是商户级固定 ID（配在 `qm_activity`），
 > OPPO 的是**按档期滚动**的 —— 所以 OPPO 必须能自己发现，不能只靠配置。
 
+**奈雪点单**（`奈雪点单`）：**品道自研**（`pin-dao.cn`），「奈雪币」每日签到。
+⚠️ 别被包里的 `qmai.cn/naixue-login` 骗了 —— 企迈只承担登录/会员的一部分，
+**签到不在企迈、也不在 H5**，是小程序原生页自己调的接口：
+
+```
+wxnaixue.py 读 getApp().globalData.accessToken  →  Bearer（JWT，120 天）
+        ↓
+POST /user/sign/save   {signDate:"2026-9-27"}
+   ← 页面 pkgBasics/pages/signInReminder/signInReminder 一 onShow 就自动调它
+```
+
+> ⚠️ **三个坑**（细节见 [`docs/NAIXUE_API.md`](docs/NAIXUE_API.md)）：
+> 1. body 是**两层** `{common:{…}, params:{…}}`，业务入参一律进 `params`；且网关
+>    **强校验 `common.nonce`** —— 漏了它直接回 `{"error_msg":"invalid request body, no nonce"}`。
+> 2. `signDate` **不补零**：原码是 `getFullYear()+"-"+(getMonth()+1)+"-"+getDate()`
+>    → `2026-9-27`，**不是** `2026-09-27`。
+> 3. `common.openId` 是原码里的**硬编码常量**（`QL6ZOftGzbziPlZwfiXM`，不是真 openId），
+>    签名 = `Base64(HmacSHA1("nonce=…&openId=…&timestamp=…", salt))`，照抄即可。
+>
+> 该接口**幂等**（同一天重复调都回 `code=0`，不会重复发币），所以**不需要"先查后签"**；
+> 签到成果用 `/user/memberCenter/userAsset` 的 `coin`（奈雪币余额）佐证。
+
 逐条实测记录见 [`docs/YD_API.md`](docs/YD_API.md)、[`docs/WZL_API.md`](docs/WZL_API.md)、
-[`docs/QMAI_API.md`](docs/QMAI_API.md) 与 [`docs/OPPO_API.md`](docs/OPPO_API.md)。
+[`docs/QMAI_API.md`](docs/QMAI_API.md)、[`docs/OPPO_API.md`](docs/OPPO_API.md) 与
+[`docs/NAIXUE_API.md`](docs/NAIXUE_API.md)。
 
 ### 签到走同一套 sign 接口
 

@@ -1,13 +1,23 @@
 # -*- coding: utf-8 -*-
-"""面板搜索逐张开卡，CDP 认 appId；命中目标就保持打开并退出。不跑 wxclean、不抬主窗口。"""
+"""面板搜索逐张开卡，CDP 认 appId；命中目标就保持打开并退出。不跑 wxclean、不抬主窗口。
+
+**为什么用 appId 认目标、不用标题**：同名/同族小程序太常见 ——
+实测「蜜雪冰城」搜出 8 个（蜜雪冰城 / 蜜雪冰城香港澳门 / 蜜雪加盟宝 / 蜜管家CMS /
+蜜雪集团大咖国际茶饮梦工厂 / 蜜雪冰城周边商城 / 蜜雪合作中心 / 蜜雪智慧园区），
+「来菜」搜出 2 个（不同商户、openId 完全不同）。标题一致 ≠ 同一个号。
+
+用法：`WXSIGN_APPID=wx… WXSIGN_KEYWORD=蜜雪冰城 python3 open_target.py`
+（不传则用下面的默认值，即 OPPO 商城。）
+"""
+import os
 import sys
 import time
 sys.path.insert(0, "/tmp")
 import wxopen as R
 import wxcdp
 
-TARGET = "wx9c825da1a7ba062e"   # OPPO商城
-KW = "OPPO商城"
+TARGET = os.environ.get("WXSIGN_APPID") or "wx9c825da1a7ba062e"   # 默认 OPPO商城
+KW = os.environ.get("WXSIGN_KEYWORD") or "OPPO商城"
 
 W, H = R.size()
 panel = R.open_panel(W, H)

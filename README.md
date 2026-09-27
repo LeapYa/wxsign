@@ -4,6 +4,8 @@
 
 目前覆盖 **吾享（wuuxiang）** 系 —— 天财商龙旗下的餐饮 SaaS。
 辣可可、来菜、九村烤脑花、酒煮江湖用的是它，所以**一套脚本就能全签**。
+另有 **4 个非吾享后端**（易东 / 微租林 / 企迈 / **OPPO 商城**）接口各不相同，
+由 `brands.json` 的 `engine` 字段分派 —— 加品牌只改配置，不动代码。
 
 > **上手就三步**：把 `wxsign/` 放进青龙脚本目录 → 配几个环境变量 → 加一条定时任务
 > `bash /ql/data/scripts/wxsign/sign.sh`。
@@ -16,7 +18,7 @@
 
 ---
 
-## 一、能签到的小程序（11 个）
+## 一、能签到的小程序（12 个）
 
 | 品牌 | 小程序 | appId | 签到活动 | 后端 | 状态 |
 |---|---|---|---|---|---|
@@ -31,8 +33,9 @@
 | 许家去水印 | 许家去水印 | `wx2b979b1c16784d44` | 每日签到（送**去水印次数**） | **微租林** | ✅ 已跑通 |
 | 呷哺呷哺 | 呷哺呷哺 | `wx6822e696198e2763` | 签到得好礼（送哺币） | **企迈** | ✅ 已跑通 |
 | 李先生牛肉面大王 | 李先生牛肉面大王会员 | `wx9710b09df6cb09a9` | 签到得好礼 | **企迈** | ✅ 已跑通 |
+| OPPO 商城 | OPPO商城 | `wx9c825da1a7ba062e` | 每日签到得积分（累计 7 天） | **OPPO 商城** | ✅ 已跑通 |
 
-> **状态**：这 11 个都已真机跑通（自动开小程序 → 取身份 → 不是会员则**自动注册** → 签到），
+> **状态**：这 12 个都已真机跑通（自动开小程序 → 取身份 → 不是会员则**自动注册** → 签到），
 > 返回 `415 今日已签到` 或 `200 签到成功` 都算完成。
 >
 > ⚠️ **企迈系**（呷哺呷哺 / 李先生牛肉面大王）的签到要求**已绑手机号的会员**，所以**接入它的第一次**要过一遍手机号授权。
@@ -82,7 +85,7 @@
 > ⚠️ 「刘一手」这个 appId 对应的是**巴塞罗那店**（登录应答里的门店名就是它），国内门店用不上 ——
 > 留着它是因为它是**易东后端**的第一个样本，能证明第二个引擎是通的。
 > 同后端的「巧娘子」链路已完全打通（登录成功），但**该门店服务端没开签到活动**
-> （接口原话「商家未开启签到」），所以没算进这 11 个。
+> （接口原话「商家未开启签到」），所以没算进这 12 个。
 >
 > **企迈**（呷哺呷哺）走的是 **`cmk-center/sign/*`** 那套接口 —— 详见第五节与
 > [`docs/QMAI_API.md`](docs/QMAI_API.md)。这个后端的坑比前几个加起来还多，
@@ -197,6 +200,7 @@ wxsign/
 ├── brands/              每品牌凭证（自动生成，含 token，别提交）
 │   └── _template.env
 ├── docs/DEPLOY.md       从零部署 + 后续运维：微信侧故障、多开实例、卸干净、换微信账号
+├── docs/OPPO_API.md     OPPO 商城后端逐条实测记录（会话 / 档期 / activityId 自动发现）
 ├── wmpf/                hook 挂不上时的自救工具（部署阶段就要用一次）
 │   ├── check_wmpf.sh       验 WMPF 版本有没有对应偏移配置（纯只读）
 │   ├── hook_patch.sh       给上游打那两个必需的补丁（幂等，见 [DEPLOY.md 第 4.1 节](docs/DEPLOY.md#41-必须打的两个补丁)）
@@ -222,6 +226,10 @@ wxsign/
 ├── wxcode.py            （容器内跑）通用取码器：只取 appId + wx.login 的 code（微租林用它）
 ├── wxqm.py              （容器内跑）企迈后端取登录态：storage 优先，取不到就抓真实请求头
 ├── wxqm_auth.py         （容器内跑）企迈「首次手机号授权」全自动 —— 每个品牌只需跑一次
+├── wxoppo.py            （容器内跑）OPPO 商城取会话：读 storage 的 logininfo（NEWOPPOSID + openId）
+├── wxoppo_auth.py       （容器内跑）OPPO「首次手机号快捷登录」全自动 —— 只需跑一次
+├── wxoppo_act.py        （容器内跑）OPPO 自动发现当前档期的 activityId（备选：驱动 H5 + CDP hook）
+├── open_target.py       （容器内跑）按 appId 复核着开目标小程序（比按标题判更可靠）
 ├── LICENSE              保留所有权利（源码公开，但**不是开源**，见第九节）
 └── README.md
 ```
@@ -247,7 +255,7 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 所以做法是**一个引擎 + 每品牌一份 `brands/<slug>.env`**：
 加品牌只加配置文件，不动代码，也没有 N 份要各自维护的脚本。
 
-### 另外三个后端：易东（eingdong）、微租林（weizulin）、企迈（qmai）
+### 另外四个后端：易东（eingdong）、微租林（weizulin）、企迈（qmai）、OPPO 商城（oppo）
 
 上面「一个引擎签所有品牌」只对**吾享内部**成立。别的服务商接口各不相同，所以
 `brands.json` 多了个 `engine` 字段来选后端 —— **不写 = 吾享**，老条目一个都不用改。
@@ -259,6 +267,7 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 | `eingdong` | 易东 `zhyx.eingdong.com/api/index.php` | cookie `sessionKey=<sessionId>` | `wx.login` 的 code + ext 里的 storeid |
 | `weizulin` | 微租林 `saas.funjs.top/api` | `Authorization: Bearer <JWT>` | `wx.login` 的 code（换 token 时用） |
 | `qmai` | 企迈 `webapi.qmai.cn/web/cmk-center` | `Qm-User-Token` + `store-id` 请求头 | `wxqm.py` **双路**：storage 的 `loginData`，取不到就抓真实请求头 |
+| `oppo` | OPPO 商城 `msec.opposhop.cn`（H5 侧 `hd.opposhop.cn/api`） | `NEWOPPOSID` + `openid` 请求头 | `wxoppo.py` 读 storage 的 `logininfo`（`encryptedSession` / `openId`） |
 
 非吾享后端多一个**首次接入**的动作（每个品牌一辈子一次）：
 
@@ -266,6 +275,7 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 |---|---|---|
 | `eingdong` / `weizulin` | **什么都不用** —— 服务端自己持 appsecret 换 openid，无授权弹窗 | — |
 | `qmai` | 过一遍**手机号授权**（企迈要求已绑手机号的会员） | `wxqm_auth.py`，全自动 |
+| `oppo` | 过一遍**手机号快捷登录**（OPPO 要求绑手机号） | `wxoppo_auth.py`，全自动 |
 
 **易东**（`刘一手`）：**没有签名、没有 nonce**，就是一个 cookie —— 比吾享还简单。
 
@@ -322,8 +332,34 @@ POST /web/cmk-center/sign/takePartInSign       {activityId, storeId}  →  签�
 > `activityId` 是**商户级活动的固定 ID**（随签到入口由服务端下发，包里没有），
 > 所以配在 `brands.json` 的 `qm_activity` 里。
 
-逐条实测记录见 [`docs/YD_API.md`](docs/YD_API.md)、[`docs/WZL_API.md`](docs/WZL_API.md)
-与 [`docs/QMAI_API.md`](docs/QMAI_API.md)。
+**OPPO 商城**（`OPPO商城`）：**唯一一个不是"会员积分"的后端** —— 是 OPPO 官方商城的
+「每日签到得积分」。会话是两个**请求头**（无签名）：
+
+```
+wxoppo.py 读 storage 的 logininfo  →  NEWOPPOSID（= encryptedSession）+ openId
+        ↓
+GET  /cn/oapi/marketing/cumulativeSignIn/getSignInDetail?activityId=…
+        →  todaySignIn（服务端背书的「今天签过了」）+ baseAwards（7 天，status=1 已签）
+POST /cn/oapi/marketing/cumulativeSignIn/signIn  {activityId}   →  签到
+```
+
+> ⚠️ **三个坑**（每个都让我错判过一轮，细节见 [`docs/OPPO_API.md`](docs/OPPO_API.md)）：
+> 1. **别用「键名含 token 就当 sid」的启发式** —— storage 里还有个 `constToken`，
+>    会被误取走 → 服务端回 `403 用户未登录`。认死 `logininfo.encryptedSession`。
+> 2. **`activityId` 会随档期换**（实测 7 月 → 9 月），而**旧档期的 `getSignInDetail`
+>    照样回 200**（返回那 7 天的陈旧数据）—— 只有 `signIn` 才会回 `5007 活动已经结束`。
+>    极易误判成「活动还在、只是签不上」。所以**幂等判据用 `todaySignIn`，
+>    不要靠"试签一次看错误码"**（那还会把 `5007` 和「今天签过了」混在一起）。
+> 3. **`activityId` 现在是全自动发现的**（不用每月手动拿一次）：承载签到页的 H5 是 **SSR**，
+>    HTML 里内联了活动 DSL，其中 `SignIn_*` 组件的配置就写着 activityId →
+>    一次普通 GET 拿到（实测 0.3s）。失败时退到备选：驱动 H5 + CDP hook 抓它实际发的请求
+>    （`wxoppo_act.py`）。遇到 `5005/5007` 还会**自动重新发现 + 用新 ID 重试一次**。
+>
+> 与企迈的**不同点**值得注意：企迈的 `activityId` 是商户级固定 ID（配在 `qm_activity`），
+> OPPO 的是**按档期滚动**的 —— 所以 OPPO 必须能自己发现，不能只靠配置。
+
+逐条实测记录见 [`docs/YD_API.md`](docs/YD_API.md)、[`docs/WZL_API.md`](docs/WZL_API.md)、
+[`docs/QMAI_API.md`](docs/QMAI_API.md) 与 [`docs/OPPO_API.md`](docs/OPPO_API.md)。
 
 ### 签到走同一套 sign 接口
 
@@ -639,17 +675,29 @@ python3 wxsign.py <slug>
    那条路走的是逻辑层，一直是按 appId 挑上下文的。
 4. **注册走微信授权弹窗，不需要手机号**（已真机跑通）。配 `WXSIGN_REGISTER_PHONE`
    可改走 API 直连，但那条路**没真发过请求** —— 发出去就在账号上真实建会员。
-5. **企迈系的「首次手机号授权」要单独跑一次，引擎不会自动替你跑。**
-   每个品牌一辈子一次，跑法见[第一节](#一能签到的小程序10-个)。没跑过的症状很好认：
-   `RESULT xxx code=NOIDENT msg=企迈会话失效/未登录`。
-   另有两个企迈专属退出码：`NOACTID` = `brands.json` 里缺 `qm_activity`（活动 ID 见该字段注释）、
-   `NOIDENT` = 拿不到企迈登录态（小程序没开 / hook 不通）。
+5. **企迈 / OPPO 商城的「首次手机号授权」要单独跑一次，引擎不会自动替你跑。**
+   每个品牌一辈子一次，跑法见[第一节](#一能签到的小程序12-个)。没跑过的症状很好认：
+   `RESULT xxx code=NOIDENT`。
+   - **企迈**：`NOACTID` = `brands.json` 里缺 `qm_activity`（活动 ID 见该字段注释）、
+     `NOIDENT` = 拿不到企迈登录态（小程序没开 / hook 不通）；
+   - **OPPO 商城**：`NOIDENT` = 拿不到 OPPO 会话（`wxoppo.py`）、
+     `NOACTID` = activityId 自动发现与配置都为空。
+     ⚠️ OPPO 的 `activityId` **按档期滚动**（7 月 → 9 月换过一次），
+     但**引擎会自动发现**它 —— 换档期、甚至换档期时签到失败，都会自动重新发现并重试，
+     通常不用人工介入。只有两条发现路径都失效（OPPO 改版）时才需要按
+     [`docs/OPPO_API.md`](docs/OPPO_API.md) 第五节手工确认。
 6. **界面自动化会碰到「覆盖层」，但绝大多数都能按结构找、不必猜颜色**：
    - **小程序自己的授权层 / 弹层**（企迈的「欢迎加入<品牌>」那一层）→ 走 `wxdom`
      **按选择器 + 文案**定位，一次颜色判断都没有
      （[那节](#界面操作怎么找按钮按文案不按颜色)有完整判据）。
      ⚠️ 品牌小程序的按钮**绝不能**按颜色找 —— 企迈有几十上百个商户，主题各自跟活动走
      （实测呷哺的授权按钮先是橙、后来变蓝；李先生是蓝）。**颜色判据从根上不成立。**
+   - **H5 / web-view 自带的弹层**（OPPO 商城的「订阅提示 / 我知道了 / 去设置」）→
+     同样**按文案点**，但 ⚠️ **别用 Escape**：实测 Escape 对它画面变化 **0.0%**
+     （Escape 只对**微信原生**框有效），而点「我知道了」能关（画面变化 **24.8%**）。
+     这个框**一打开小程序就弹**、盖在最上层 → 之后点底部导航/按钮**全部落空**，
+     现场像"坐标算错了"。清法是 `wxdom.dismiss_dialogs()`：
+     按文案找 → 点 → **画面差异验证**（有框继续清、没框一次都不多点）。
    - **微信原生弹窗**（手机号授权的「允许」、退出登录确认框）→ 这个**才**只能用像素。
      判据是**颜色**，理由是它的文案与配色由**微信客户端**定死、不随品牌/活动变。
      这是唯一允许用颜色的地方。

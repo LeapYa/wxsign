@@ -95,7 +95,15 @@ POST /api/index.php/signin/check_in_1  cookie: sessionKey=<sk>
 - **跨微信重启仍有效**：这个 sessionKey 是微信容器 `docker restart` **之前**取的，
   重启后（含用户在手机重新确认登录）**复查与签到都正常** ——
   因为它是易东服务端的会话，**与微信客户端的登录态无关**。
-  也就是说：每天只需重新拿一次 code 换 sessionKey，之后的调用不受微信侧影响。
+
+> ⚠️ **但引擎不落盘它**（2026-09-28 定）：虽然服务端给 8 小时，日常跑批是**每天一次
+> （间隔 24h）**，必然已过期 → 落盘等于白存。而且原代码**写了从来不读**
+> （`do_sign_yd` 每次都是「取新 code → 换新 sessionKey」），是个纯死代码。
+> 现在 `save_env()` 统一滤掉这类短效凭证（`VOLATILE_KEYS = ("WX_TOKEN", "YD_SESSIONKEY")`），
+> 本后端只落盘 `YD_STOREID`（`yd_ident` 取不到 `ext.storeid` 时，它是有用的兜底）。
+>
+> 对照：微租林 `WZL_TOKEN`（JWT，**7 天**）寿命够长，**仍然落盘** —— 而且那份缓存是真用得上
+> 的：`do_sign_wzl` 会先拿它去查状态，被拒（401）才重新登录。
 
 ## 同族其他接口（从包内 `url:"..."` 清单提取，共 123 个唯一）
 

@@ -141,11 +141,24 @@ def load_env(slug):
     return env
 
 
+# ⚠️ **短效凭证不落盘**（2026-09-28）—— 落盘只对「下次跑还真可能用得上」的凭证有意义：
+#   · 易东 `YD_SESSIONKEY`：实测只活 ~8 小时（`docs/YD_API.md` 里有 Set-Cookie expires 记录），
+#     而原代码**写了从来不读** —— 每次都是「取新 code → 换新 sessionKey」，纯死代码。
+#   · 吾享 `WX_TOKEN`：短效 JWT，约 1~2 小时。
+#   日常跑批是**每天一次（间隔 24h）**，这两个必然已过期 → 落盘等于白存，
+#   还容易让人误以为「下次能复用」。所以写入时统一滤掉。
+#   （**内存里的 `env` 不受影响** —— 本次运行照常用；过滤只发生在落盘那一刻。）
+#   对照：微租林 `WZL_TOKEN`（JWT，**7 天**）寿命够长，**仍然落盘** —— 那份缓存是真用得上的：
+#   `do_sign_wzl` 会先拿它去查状态，401 才重新登录。
+VOLATILE_KEYS = ("WX_TOKEN", "YD_SESSIONKEY")
+
+
 def save_env(slug, env):
     os.makedirs(ENV_DIR, exist_ok=True)
     p = env_path(slug)
     with open(p, "w", encoding="utf-8") as f:
-        f.write("\n".join("%s=%s" % (k, v) for k, v in env.items() if v) + "\n")
+        f.write("\n".join("%s=%s" % (k, v) for k, v in env.items()
+                          if v and k not in VOLATILE_KEYS) + "\n")
     os.chmod(p, 0o600)
 
 
@@ -589,7 +602,12 @@ def agree_privacy(rounds=4):
 
 
 def refresh_token(brand, env, force=False):
-    """在 hook 容器里调 wx.login 换新 token。token 是短效 JWT，过期只能重取。"""
+    """在 hook 容器里调 wx.login 换新 token。token 是短效 JWT（约 1~2 小时），过期只能重取。
+
+    ⚠️ token **不落盘**（`save_env()` 会滤掉，见 `VOLATILE_KEYS`）—— 日常跑批间隔 24h，
+       它必然已过期，落盘只会让人误以为「下次能复用」。所以下面「仍有效就跳过」这条判据
+       只在**同一次运行内**有意义（比如 `run_brand` 中途再次调用 `refresh_token` 时）。
+    """
     tok = env.get("WX_TOKEN", "")
     exp = jwt_exp(tok) if tok else None
     if not force and exp and exp - time.time() > 120:
@@ -971,8 +989,10 @@ def do_sign_yd(brand, env):
         return False, "LOGIN", "登录应答里没有 sessionId"
     log("  [yd] 已登录：门店「%s」 openId=%s"
         % (r.get("store_name", storeid), r.get("openId", "")))
-    if env.get("YD_SESSIONKEY") != sk:          # 落盘只是省一次 login，不是必需
-        env["YD_SESSIONKEY"] = sk
+    # ⚠️ **sessionKey 不落盘**（2026-09-28 改）：它只活 ~8 小时，每天跑一次必然已过期；
+    #    而且原来的代码**写了从来不读** —— 纯死代码（`save_env` 现在统一滤掉它，见 VOLATILE_KEYS）。
+    #    `YD_STOREID` 仍然落盘：`yd_ident` 拿不到 ext.storeid 时，它是有用的兜底。
+    if storeid and env.get("YD_STOREID") != storeid:
         env["YD_STOREID"] = storeid
         save_env(brand["slug"], env)
 

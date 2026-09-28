@@ -1915,6 +1915,90 @@ def do_sign_mx(brand, env):
     return mx_lottery.run(mode=mode, instance=INSTANCE, ctmp=CTMP, node=node, log=log)
 
 
+# ── 荣耀商城（honor）：第 8 个后端 ────────────────────────────────────────────
+def honor_sign(brand, wait=300):
+    """在微信容器里跑 `wxhonor.py signin --json`，返回它吐出的 dict（失败 None）。
+
+    与 oppo_ident 同一个套路：**容器内**执行（要 CDP + 窗口），宿主机读它打印的
+    `HONOR_JSON=` 一行。荣耀这边不需要 xdotool（签到不发鼠标事件 —— 全在 H5 里
+    发 fetch），所以比 OPPO 还干净。
+    """
+    if not INSTANCE:
+        log("  [honor] 未设 WOC_INSTANCE → 起不了会话")
+        return None
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxhonor.py"), "signin", "--json"],
+                           capture_output=True, text=True, timeout=wait)
+    except Exception as e:                                  # noqa: BLE001
+        log("  [honor] 执行异常：%s" % e)
+        return None
+    out = (p.stdout or "") + (p.stderr or "")
+    got = None
+    for line in out.splitlines():
+        if line.startswith("HONOR_JSON="):
+            try:
+                got = json.loads(line[len("HONOR_JSON="):])
+            except ValueError:
+                pass
+        elif line.strip():
+            log("     " + line.strip()[:180])
+    if not got:
+        log("  [honor] 没拿到结果（wxhonor.py rc=%s）" % p.returncode)
+    return got
+
+
+def do_sign_honor(brand, env):
+    """荣耀商城「签到领积分」。返回 (是否成功, 业务码, 说明)。
+
+    ⚠️ 与其余 7 个后端的**根本差别**：签到**不在小程序原生页，在 H5 里**。
+    小程序页面 `login4Qxmp`（标题「任务页面」）用 web-view 承载
+    `www.honor.com/cn/msale/mp/jobcenter.html`，签到逻辑全在那份 H5 里
+    （`sign_in_interactive.js`）。所以「打开小程序就能签」这句话在这里**不成立** ——
+    必须先 navigateTo 那个页面，再 attach 它的 webview target。
+
+    链路（细节与非猜测的来源见 wxhonor.py 的 docstring）：
+        wxhonor.py（容器内）→ 逻辑层 navigateTo 任务中心页 → 等 H5 target 出现
+        → attachToTarget(flatten) → 在页面内 fetch：
+            POST {openapiDomain}/tdcs/taskcenter/queryTaskCenterInfo   查今天签没签
+            POST {openapiDomain}/tdcs/taskcenter/taskCenterSignIn      签到
+    认证是 `.honor.com` 的 cookie（euid / encryptRtNew / CSRF-TOKEN），
+    **由页面自己带** —— 我们一个 cookie 都不碰，也不碰华为/荣耀账号密码。
+
+    `activityCode` 每期会变，但**零人工**：它是页面 HTML 里内联的组件属性
+    `.sign-in-style4[data-activity-code]`，现场读（所以 brands.json 里不用配）。
+
+    返回码：200 成功 / 415 今日已签（服务端 signInToday，幂等，不重复发请求）/
+            NOH5 连不上 H5（小程序没开 / hook 没挂）/ RISK 风控或需验证码（**不重试**）。
+    """
+    r = honor_sign(brand)
+    if not r:
+        return False, "NOH5", "连不上任务中心 H5（荣耀商城开着吗？hook 通吗？）"
+    if r.get("__exc__"):
+        return False, "ERRJS", "H5 里执行异常：%s" % str(r["__exc__"])[:160]
+    if r.get("err"):
+        return False, "NOH5", "H5 里没找到签到组件（%s）" % str(r["err"])[:120]
+
+    days = "%s/%s" % (r.get("continuousSignIn"), r.get("signInCycle"))
+    if r.get("signInToday") is True or r.get("alreadySigned"):
+        return True, "415", "今日已签到（连续 %s 天，累计 %s 分）" % (days, r.get("accumulatePoints"))
+
+    code = str(r.get("signCode") or "")
+    msg = str(r.get("signMsg") or "")
+    if code == "0":
+        res = r.get("signResult") if isinstance(r.get("signResult"), dict) else {}
+        pt = res.get("earnPoint")
+        return True, "200", "签到成功，+%s 积分（累计 %s）" % (pt, r.get("accumulatePoints"))
+    if "aready.signin" in code:
+        return True, "415", "今日已签到（服务端判定，连续 %s 天）" % days
+
+    low = (code + " " + msg).lower()
+    if any(k in low for k in ("risk", "verify", "captcha", "geetest", "frequent", "风控", "验证")):
+        return False, "RISK", "疑似风控/需验证码，不重试：%s" % (code or msg)[:120]
+    return False, "FAIL", "签到失败 code=%s msg=%s" % (code or "?", msg[:120])
+
+
 # 后端 → 签到实现。往后加新后端只需要三步：写一个 `do_sign_xxx(brand, env)`
 # → 在这张表里注册一行 → brands.json 里给条目写 `engine`（不写 = 吾享）。
 # 主流程（main）也读这张表做分派，别再往 if 链里塞。
@@ -1925,6 +2009,7 @@ _SIGNERS = {
     "oppo": do_sign_oppo,
     "pindao": do_sign_naixue,
     "duiba": do_sign_mx,
+    "honor": do_sign_honor,
 }
 
 

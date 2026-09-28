@@ -1,6 +1,6 @@
 {
   "_comment": "小程序签到·活动合集 —— 品牌表。静态信息在此，凭证在 brands/<slug>.env。",
-  "_engines": "两个后端：缺省 = 吾享（wuuxiang / 天财商龙 CRM7，见 crm_base）｜eingdong = 易东（zhyx.eingdong.com，链路见 survey/YD_API.md）。条目用 engine 字段选，不写就是 wuuxiang。｜oppo = OPPO 商城（msec.opposhop.cn；会话是请求头 NEWOPPOSID+openid，读小程序自己发的头；见条目 note）。",
+  "_engines": "八个后端：缺省 = 吾享（wuuxiang / 天财商龙 CRM7，见 crm_base）｜eingdong = 易东（zhyx.eingdong.com，链路见 survey/YD_API.md）｜weizulin = 微租林｜qmai = 企迈（cmk-center/sign/*）｜oppo = OPPO 商城（msec.opposhop.cn）｜pindao = 奈雪点单（tm-api.pin-dao.cn）｜duiba = 兑吧｜honor = 荣耀商城（签到在**任务中心 H5**，不是小程序原生页；见条目 note）。条目用 engine 字段选，不写就是 wuuxiang。",
   "engine_version": 1,
   "crm_base": "https://scrm.wuuxiang.com/crm7game-api",
   "login_url": "https://wechat.wuuxiang.com/i5xforyou/auth/login",
@@ -290,6 +290,18 @@
       "verified": true,
       "mx_mode": "draw",
       "note": "**第六个后端：蜜雪冰城「雪王币抽奖」（兑吧 duiba 大转盘）** —— 注意这**不是签到**，是「每日免费抽奖 1 次」。\n\n入口：「我的 → 会员权益」第 3 条**「雪王币抽奖」**（`activityType:1013`，由 `/v2/memberRights/mainPage/levels` 下发 `jumpUrl`）。承载页是**第三方 H5**、**不在小程序包里**：`https://76177-activity.dexfu.cn/galaxy/app/project/2924/index.html`（兑吧 spark，活动「抽10000份雪王周边」，档期 2026-09-01~09-30）。\n\n链路：蜜雪 accessToken → `GET /v1/duiba/getLoginUrl?dbredirect=<活动URL>` 换**免密登录 URL** → 访问它拿 dexfu 会话 cookie → `luck/index.do` 查状态 → `luck/draw.do` 抽奖。\n\n⚠️ **两处与其它后端不同，都很关键**：\n1. **写接口要 JS-challenge token**：`getTokenKey.query` / `getToken.query` 返回的**不是 token 值**，而是**每次不同的混淆 JS**（≈2.8KB + 17KB）；前端把它注入 `<script>` 执行后再调 `window.<新函数>()` 取 token（那个函数名由 `eval(String.fromCharCode(…))` 拼出，在 JS 文件里 grep 不到）。实现在 `mx_lottery.py`，用 **Node 沙箱**执行 —— 需要 `WXSIGN_NODE` 指向 node 可执行文件。\n2. **免费次数为 0 时绝不能调 draw**：服务端会**扣 20 雪王币**继续抽。`mx_lottery.run()` 一律先查 `remainFreeTimes`，>0 才抽；等于 0 直接回 `415 今日免费次数已用完`。**别绕过这条保护**。\n\n实测（2026-09-27）：`remainFreeTimes 1→0`、`hadPlayTime 0→1`、当天结果「谢谢参与」。\n\n⚠️ 活动规则明文禁止机器人/爬虫参与（一经发现取消领奖资格并收回奖励），是否每天自动跑需自行权衡。完整记录见 `docs/MXBC_LOTTERY.md`。"
+    },
+    {
+      "slug": "honor",
+      "name": "荣耀商城",
+      "appid": "wx06a8d8c84a18be25",
+      "keyword": "荣耀商城",
+      "miniapp": "荣耀商城",
+      "engine": "honor",
+      "type": "sign",
+      "enabled": true,
+      "verified": false,
+      "note": "**第八个后端：荣耀商城（honor.com）** —— 「签到领积分」。\n\n⚠️ **根本差别：签到不在小程序原生页，在 H5 里**。荣耀商城小程序（购物）本身**没有签到**：整包 grep「签到/打卡/赚积分/每日任务/签到有礼」零命中（只剩 5 处孤立 i18n 定义、无使用处），tabBar 也只有 首页/分类/我的。签到本体是**任务中心 H5**（`www.honor.com/cn/msale/mp/jobcenter.html`），由小程序页面 `packageActivity/pages/login4Qxmp/login4Qxmp`（标题「任务页面」）用 web-view 承载 —— 而 H5 是**独立 CDP target（type=webview）**，主 page 的 ctx 列表里**看不见**，必须 `Target.attachToTarget(flatten=True)` 拿 sessionId。\n\n⚠️ 所以「打开小程序就签」在这里**不成立**：必须先 navigateTo 那个页面、等 H5 起来、再 attach。`wxhonor.py` 干这件事（`h5` / `info` / `signin` 三个命令）。\n\n链路（全部从 H5 的 `sign_in_interactive.js` 读出来的，非猜测）：\n  · 幂等：`POST {openapiDomain}/tdcs/taskcenter/queryTaskCenterInfo`\n    body `{activityCode, taskPortal:\"4\", beCode:\"CN\"}` → `result.signInInfo.signInToday`\n  · 签到：`POST {openapiDomain}/tdcs/taskcenter/taskCenterSignIn`\n    body `{activityCode, taskPortal:\"4\", agent:navigator.userAgent, oas_refer:location.origin+\"/\", variedData:<cookie>}`\n    返回 `code \"0\"` 成功 ／ `\"task.center.today.aready.signin\"`(numCode 3027) 今日已签\n  · `openapiDomain` = `https://openapi-cn.c.honor.com`（页面 `window.pageConfig.openapiDomain`）\n  · 另有 `/tdcs/taskcenter/taskCenterSupplySignIn`（补签）、`/tdcs/geeTest/validate`（极验）、\n    `/tdcs/taskcenter/taskCenterValidateRisk`（风控校验，**只给任务用，签到不经过它**）\n\n**`activityCode` 每期会变，但零人工**：它是页面 HTML 里内联的组件属性\n`.sign-in-style4[data-activity-code]`，现场读 —— 所以 brands.json 里**不用配**\n（这点比 OPPO 的 `oppo_activity` 还省事）。实测当前档期 `QDHDz5SM67T65XPOBMBBQ1`，\n`endTime 2026-09-30`，周期 5 天（+8/+9/+11/+13/+17）。\n\n**认证**：`.honor.com` 的 cookie（`euid` / `encryptRtNew` / `CSRF-TOKEN` / `hasSigned`）。\n做法是**在 H5 页面内发 fetch**（`credentials:'include'`）—— 认证全交给浏览器，我们\n一个 cookie 都不碰、也不碰账号密码。`CsrfToken` 头用页面自己暴露的 `window.csrftoken`。\n（纯 HTTP 变体也存在：把 cookie 导出来自己带；没必要，且要跨容器搬凭证。）\n\n**首次登录是一次性动作**（2026-09-28 实测）：微信手机号授权**即自动注册/登录荣耀账号**\n（包内文案原文：\"点击同意后，我们将申请获取您的**微信手机号**用于绑定登录或注册荣耀账号\"）\n—— **不需要像华为那样手工注册**。绑定关系在服务端、永久有效。`wxhonor.py login`\n全自动完成，**零硬编码坐标**：隐私弹窗走类名 `.confirm_btn`、登录入口走 `[class*=u-login]`\n+ 文案、微信原生「允许」框走绿色主按钮像素判据。\n\n⚠️ **顺手锤实的一个项目级隐患**（会影响所有品牌，待单独修）：`wxreg` 用\n`dy = outerHeight - innerHeight` 算页面原点，但小程序渲染层的 `innerHeight`\n**已经把底部原生 tabBar 扣掉了**，于是它把 tabBar 也算进了顶部偏移。荣耀实测：\n「我的」页 ctx=11 给 **101**（点低 55px）、首页 ctx=6 给 45（恰好对）——\n**同一判据换个 ctx 结论就变**。正确做法 = `窗口原点 + 逻辑层 safeArea.top`（=44），\n`wxhonor.py` 里就是这么算的。\n\n⚠️ **别把华为商城（`wx208389d90830e5b7`）也当成有签到**：已查实、别再试。整包 grep\n零命中；80 个 `/mcp/` 接口里没有签到；登录后翻遍「我的」+ 会员积分页 + 首页滚动都没有；\n官方积分规则原文写的是签到在「**我的华为 APP**」。且微信里**没有**「我的华为」小程序。\n\n⚠️ **本条 verified=false 的原因**：链路每一环都实测过（自动导航开 H5 → attach →\n读 activityCode → 查档期 → 发签到请求，服务端回了正确的业务码\n`task.center.today.aready.signin`），但接入当天**恰好已签**，没能录到一次\n「未签 → 成功」的完整结果。次日首次自动跑通后请把它改成 true。"
     }
   ]
 }

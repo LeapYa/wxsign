@@ -4,7 +4,7 @@
 
 目前覆盖 **吾享（wuuxiang）** 系 —— 天财商龙旗下的餐饮 SaaS。
 辣可可、来菜、九村烤脑花、酒煮江湖用的是它，所以**一套脚本就能全签**。
-另有 **6 个非吾享后端**（易东 / 微租林 / 企迈 / **OPPO 商城** / **品道自研** / **兑吧**）接口各不相同，
+另有 **7 个非吾享后端**（易东 / 微租林 / 企迈 / **OPPO 商城** / **品道自研** / **兑吧** / **荣耀商城**）接口各不相同，
 由 `brands.json` 的 `engine` 字段分派 —— 加品牌只改配置，不动代码。
 
 > **上手就三步**：把 `wxsign/` 放进青龙脚本目录 → 配几个环境变量 → 加一条定时任务
@@ -18,7 +18,7 @@
 
 ---
 
-## 一、能签到的小程序（14 个）
+## 一、能签到的小程序（15 个）
 
 | 品牌 | 小程序 | appId | 签到活动 | 后端 | 状态 |
 |---|---|---|---|---|---|
@@ -36,12 +36,18 @@
 | OPPO 商城 | OPPO商城 | `wx9c825da1a7ba062e` | 每日签到得积分（累计 7 天） | **OPPO 商城** | ✅ 已跑通 |
 | 奈雪点单 | 奈雪点单 | `wxab7430e6e8b9a4ab` | 每日签到得奈雪币 | **品道自研** | ✅ 已跑通 |
 | 蜜雪冰城 | 蜜雪冰城 | `wx7696c66d2245d107` | **每日抽奖**（雪王币，兑吧大转盘） | **兑吧** | ✅ 已跑通 |
+| 荣耀商城 | 荣耀商城 | `wx06a8d8c84a18be25` | 签到领积分（5 天周期 +8/+9/+11/+13/+17） | **荣耀商城** | 🟡 链路已验证 |
 
-> 全部已真机跑通（自动开小程序 → 取身份 → 不是会员则**自动注册** → 签到）；
+> 除**荣耀商城**外全部已真机跑通（自动开小程序 → 取身份 → 不是会员则**自动注册** → 签到）；
 > 返回 `415 今日已签到` 或 `200 签到成功` 都算完成。
+> 荣耀商城的**链路每一环都实测过**（自动开任务中心 H5 → 读 `activityCode` → 查档期 → 真发签到请求，
+> 服务端回了正确的业务码 `task.center.today.aready.signin`），但接入当天**恰好已签**，
+> 没录到一次「未签 → 成功」—— 次日首次自动跑通即视为完成。
+> ⚠️ 它还有个**结构性差别**：签到**不在小程序原生页、在 H5 里**，所以「打开小程序就能签」在这里不成立
+> （详见第五节）。
 > 返回码语义：`200` 成功 / `415` 今日已签 / `406` 不在可签时段 / `401` 还不是会员 / `405` 该租户没活动。
 
-**首次接入**：吾享 / 易东 / 微租林 / **奈雪点单** 什么都不用做；**企迈**与 **OPPO 商城**要过一遍手机号授权
+**首次接入**：吾享 / 易东 / 微租林 / **奈雪点单** 什么都不用做；**企迈**、**OPPO 商城** 与 **荣耀商城**要过一遍手机号授权
 （每个品牌一辈子一次，已做成脚本 —— 见第五节）。
 
 **签到给什么**：一般是**会员积分**（辣可可每天 +1，连签 10 / 20 / 30 天分别加赠 10 / 15 / 20，
@@ -50,12 +56,12 @@
 > 📖 **单个品牌的细节**都在 `brands.json` 各条目的 `note` 字段里 —— 过桥缘名下还有两个同活动的
 > 小程序（签一个就够）、绿茵阁 / 我的小板凳搜索时同族小程序很多（`keyword` 必须用**全名**）、
 > 刘一手对应的是**巴塞罗那店**，以及各品牌的 `gameId / activityId / 商户号 / 卡号`…
-> **各后端的接口与踩坑**在 `docs/` 下的五份文档：
-> [易东](docs/YD_API.md) · [微租林](docs/WZL_API.md) · [企迈](docs/QMAI_API.md) · [OPPO 商城](docs/OPPO_API.md) · [奈雪点单](docs/NAIXUE_API.md) · [蜜雪冰城](docs/MXBC_LOTTERY.md)。
+> **各后端的接口与踩坑**在 `docs/` 下的七份文档：
+> [易东](docs/YD_API.md) · [微租林](docs/WZL_API.md) · [企迈](docs/QMAI_API.md) · [OPPO 商城](docs/OPPO_API.md) · [奈雪点单](docs/NAIXUE_API.md) · [蜜雪冰城](docs/MXBC_LOTTERY.md) · [荣耀商城](docs/HONOR_API.md)。
 
 还有一批别的服务商的小程序也有签到（五条友、竹园村、望京小腰、大渔铁板烧、大龙燚…），
-接口各不相同，本合集**按后端逐个适配**：目前支持 **吾享 / 易东 / 微租林 / 企迈 / OPPO 商城 / 品道自研 / 兑吧** 七个
-（后六个见第五节）。美团 / 有赞 / 口碑·饿了么 走**平台级账号体系**（用各自的账号登录，
+接口各不相同，本合集**按后端逐个适配**：目前支持 **吾享 / 易东 / 微租林 / 企迈 / OPPO 商城 / 品道自研 / 兑吧 / 荣耀商城** 八个
+（后七个见第五节）。美团 / 有赞 / 口碑·饿了么 走**平台级账号体系**（用各自的账号登录，
 签到也只是平台 H5），成本与收益不成比例，暂不做。
 （有赞已确证一例：「奈雪的茶商城」`wxe611cd893c49d73e` 就是有赞，见 `docs/NAIXUE_API.md`。）
 
@@ -157,6 +163,7 @@ wxsign/
 ├── docs/OPPO_API.md     OPPO 商城后端逐条实测记录（会话 / 档期 / activityId 自动发现）
 ├── docs/NAIXUE_API.md   奈雪点单（品道自研）后端逐条实测记录（登录 / 签到 / 幂等）
 ├── docs/MXBC_LOTTERY.md 蜜雪冰城「雪王币抽奖」实测记录（兑吧 duiba / JS-challenge / 会话）
+├── docs/HONOR_API.md    荣耀商城后端逐条实测记录（**签到在任务中心 H5** / webview attach / activityCode 自动发现）
 ├── wmpf/                hook 挂不上时的自救工具（部署阶段就要用一次）
 │   ├── check_wmpf.sh       验 WMPF 版本有没有对应偏移配置（纯只读）
 │   ├── hook_patch.sh       给上游打那两个必需的补丁（幂等，见 [DEPLOY.md 第 4.1 节](docs/DEPLOY.md#41-必须打的两个补丁)）
@@ -187,6 +194,7 @@ wxsign/
 ├── wxoppo_act.py        （容器内跑）OPPO 自动发现当前档期的 activityId（备选：驱动 H5 + CDP hook）
 ├── wxnaixue.py          （容器内跑）奈雪点单取会话：读 getApp().globalData.accessToken（Bearer）
 ├── wxmx.py              （容器内跑）蜜雪冰城取会话：读 getApp().globalData.accessToken
+├── wxhonor.py           （容器内跑）荣耀商城：手机号授权登录 + **任务中心 H5** 签到（**唯一签到在 H5 的后端**：要 attach webview）
 ├── mx_lottery.py        蜜雪「雪王币抽奖」实现（兑吧 duiba；用 Node 跑服务端下发的 JS-challenge）
 ├── wxapkg.py            （容器内跑）解 wxapkg 并在里面搜 —— **不用打开小程序就能逆向**接口/签名
 ├── open_target.py       （容器内跑）按 appId 复核着开目标小程序（比按标题判更可靠）
@@ -215,7 +223,7 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 所以做法是**一个引擎 + 每品牌一份 `brands/<slug>.env`**：
 加品牌只加配置文件，不动代码，也没有 N 份要各自维护的脚本。
 
-### 另外六个后端：易东（eingdong）、微租林（weizulin）、企迈（qmai）、OPPO 商城（oppo）、品道自研（pindao）、兑吧（duiba）
+### 另外七个后端：易东（eingdong）、微租林（weizulin）、企迈（qmai）、OPPO 商城（oppo）、品道自研（pindao）、兑吧（duiba）、荣耀商城（honor）
 
 上面「一个引擎签所有品牌」只对**吾享内部**成立。别的服务商接口各不相同，所以
 `brands.json` 多了个 `engine` 字段来选后端 —— **不写 = 吾享**，老条目一个都不用改。
@@ -230,6 +238,7 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 | `oppo` | OPPO 商城 `msec.opposhop.cn`（H5 侧 `hd.opposhop.cn/api`） | `NEWOPPOSID` + `openid` 请求头 | `wxoppo.py` 读 storage 的 `logininfo`（`encryptedSession` / `openId`） |
 | `pindao` | 奈雪点单 `tm-api.pin-dao.cn`（品道自研） | `Authorization: Bearer <accessToken>` | `wxnaixue.py` 读 `getApp().globalData.accessToken`（JWT，120 天） |
 | `duiba` | 蜜雪冰城「雪王币抽奖」`76177-activity.dexfu.cn`（兑吧） | `Authorization: Bearer <accessToken>` + **JS-challenge token** | `wxmx.py` 读 `globalData.accessToken`，再换兑吧免密登录 URL |
+| `honor` | 荣耀商城 `openapi-cn.c.honor.com`（**签到在任务中心 H5**，不是小程序原生页） | `.honor.com` 的 cookie（`euid` + `encryptRtNew` + `CSRF-TOKEN`） | `wxhonor.py` attach H5 的 webview target，**在页面内**发 fetch（认证交给浏览器，一个 cookie 都不碰） |
 
 非吾享后端多一个**首次接入**的动作（每个品牌一辈子一次）：
 
@@ -238,6 +247,7 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 | `eingdong` / `weizulin` / `pindao` / `duiba` | **什么都不用** —— 服务端自己持 appsecret 换 openid，无授权弹窗 | — |
 | `qmai` | 过一遍**手机号授权**（企迈要求已绑手机号的会员） | `wxqm_auth.py`，全自动 |
 | `oppo` | 过一遍**手机号快捷登录**（OPPO 要求绑手机号） | `wxoppo_auth.py`，全自动 |
+| `honor` | 过一遍**微信手机号授权**（荣耀是**授权即自动注册/登录荣耀账号**，不用手工注册） | `wxhonor.py login`，全自动 |
 
 **易东**（`刘一手`）：**没有签名、没有 nonce**，就是一个 cookie —— 比吾享还简单。
 
@@ -365,9 +375,45 @@ GET  …/project/2924/luck/draw.do?token=…       → 抽奖
 >    `mx_lottery.run()` 一律先查 `remainFreeTimes`，>0 才抽；等于 0 直接回 `415`
 >    （语义与「今日已签到」同义，引擎算完成）。**别绕过这条保护。**
 
+**荣耀商城**（`荣耀商城`）：**唯一一个「签到不在小程序里」的后端**。荣耀商城小程序本身
+（卖手机那个）**没有签到** —— 整包 grep「签到/打卡/赚积分/每日任务」零命中，tabBar 也只有
+首页/分类/我的。签到本体在**任务中心 H5**（`www.honor.com/cn/msale/mp/jobcenter.html`），
+由小程序页面 `login4Qxmp`（标题「任务页面」）用 web-view 承载。**所以「打开小程序就能签」
+在这里不成立** —— 必须先 navigateTo 那个页面，再 attach 它的 webview。
+
+```
+wxhonor.py  逻辑层 wx.navigateTo → /packageActivity/pages/login4Qxmp/login4Qxmp
+   ↓  等 H5 的 webview target 出现
+   ↓  Target.attachToTarget(flatten=True)   ← ⚠️ 主 page 的 ctx 列表里**看不见** webview 内部
+在 H5 页面内 fetch（credentials:'include' —— 认证交给浏览器，一个 cookie 都不碰）
+   ↓
+POST {openapiDomain}/tdcs/taskcenter/queryTaskCenterInfo   {activityCode, taskPortal:"4", beCode:"CN"}
+   → result.signInInfo.signInToday              ← 幂等判据（服务端背书）
+POST {openapiDomain}/tdcs/taskcenter/taskCenterSignIn
+     {activityCode, taskPortal:"4", agent:UA, oas_refer:location.origin+"/", variedData:<cookie>}
+   → code "0" 成功 ／ "task.center.today.aready.signin"(numCode 3027) 今日已签
+```
+
+> **`activityCode` 每期会变，但零人工**：它是页面 HTML 里内联的组件属性
+> （`.sign-in-style4[data-activity-code]`），现场读 —— 所以 `brands.json` 里**不用配**
+> （比 OPPO 的 `oppo_activity` 还省事）。`openapiDomain` 取自 H5 的 `window.pageConfig`。
+>
+> **首次登录**：微信手机号授权**即自动注册/登录荣耀账号**（包内文案："将申请获取您的微信手机号
+> 用于绑定登录或注册荣耀账号"）—— **不需要像华为那样手工注册**。`wxhonor.py login` 全自动、
+> 零硬编码坐标（隐私弹窗走 `.confirm_btn`、登录入口走 `[class*=u-login]`、微信原生「允许」框
+> 走绿色主按钮像素判据）。绑在服务端，永久有效。
+>
+> ⚠️ **别把它和「华为商城」搞混** —— 华为商城小程序**没有签到**（见第七节）。
+>
+> ⚠️ 顺带锤实一个**会影响所有品牌**的隐患：`wxreg` 用 `outerHeight - innerHeight` 算页面原点，
+> 但小程序渲染层的 `innerHeight` **已经把底部原生 tabBar 扣掉了**，于是 tabBar 高度也被算成
+> 「顶部偏移」。荣耀实测：「我的」页给 **101**（点低 55px）、首页给 45（恰好对）——
+> **同一判据换个 ctx 结论就变**，极易误判成"点不着"。正确做法 = `窗口原点 + 逻辑层 safeArea.top`，
+> `wxhonor.py` 里就是这么算的。
+
 逐条实测记录见 [`docs/YD_API.md`](docs/YD_API.md)、[`docs/WZL_API.md`](docs/WZL_API.md)、
-[`docs/QMAI_API.md`](docs/QMAI_API.md)、[`docs/OPPO_API.md`](docs/OPPO_API.md) 与
-[`docs/NAIXUE_API.md`](docs/NAIXUE_API.md)。
+[`docs/QMAI_API.md`](docs/QMAI_API.md)、[`docs/OPPO_API.md`](docs/OPPO_API.md)、
+[`docs/NAIXUE_API.md`](docs/NAIXUE_API.md) 与 [`docs/HONOR_API.md`](docs/HONOR_API.md)。
 
 ### 签到走同一套 sign 接口
 
@@ -725,8 +771,8 @@ python3 wxapkg.py files <appId>                   # 列页面/模块路径
      日常签到走的就是逻辑层，一直是按 appId 挑上下文的。）
 4. **注册走微信授权弹窗，不需要手机号**（已真机跑通）。配 `WXSIGN_REGISTER_PHONE`
    可改走 API 直连，但那条路**没真发过请求** —— 发出去就在账号上真实建会员。
-5. **企迈 / OPPO 商城的「首次手机号授权」要单独跑一次，引擎不会自动替你跑。**
-   每个品牌一辈子一次，跑法见[第一节](#一能签到的小程序12-个)。没跑过的症状很好认：
+5. **企迈 / OPPO 商城 / 荣耀商城的「首次手机号授权」要单独跑一次，引擎不会自动替你跑。**
+   每个品牌一辈子一次，跑法见[第一节](#一能签到的小程序15-个)。没跑过的症状很好认：
    `RESULT xxx code=NOIDENT`。
    - **企迈**：`NOACTID` = `brands.json` 里缺 `qm_activity`（活动 ID 见该字段注释）、
      `NOIDENT` = 拿不到企迈登录态（小程序没开 / hook 不通）；
@@ -734,8 +780,13 @@ python3 wxapkg.py files <appId>                   # 列页面/模块路径
      `NOACTID` = activityId 自动发现与配置都为空。
      ⚠️ OPPO 的 `activityId` **按档期滚动**（7 月 → 9 月换过一次），
      但**引擎会自动发现**它 —— 换档期、甚至换档期时签到失败，都会自动重新发现并重试，
-     通常不用人工介入。只有两条发现路径都失效（OPPO 改版）时才需要按
+     通常不用人工介入。     只有两条发现路径都失效（OPPO 改版）时才需要按
      [`docs/OPPO_API.md`](docs/OPPO_API.md) 第五节手工确认。
+   - **荣耀商城**：`NOH5` = 连不上任务中心 H5（荣耀商城没开 / hook 不通）。
+     跑法：容器内 `python3 wxhonor.py login`（全自动）。⚠️ 它是**授权即自动注册荣耀账号**
+     —— 微信手机号授权那一下就同时完成注册 + 登录，**不用手工填手机号 + 密码**。
+     但那个微信原生「允许」框**会自己超时消失**，所以脚本是「点登录入口 → 立刻轮询抓『允许』」
+     一气呵成 —— **别在中间插别的命令**（插一次就可能错过窗口期）。
 6. **界面自动化会碰到「覆盖层」，但绝大多数都能按结构找、不必猜颜色**：
    - **小程序自己的授权层 / 弹层**（企迈的「欢迎加入<品牌>」那一层）→ 走 `wxdom`
      **按选择器 + 文案**定位，一次颜色判断都没有
@@ -780,6 +831,33 @@ python3 wxapkg.py files <appId>                   # 列页面/模块路径
      但点侧边栏「小程序」图标窗口树毫无变化。这时引擎**不再纠缠面板**，改用**主窗口顶部搜索**
      直接搜小程序并点开（不依赖面板，开完用 appId 复核），这条兜底从 2026-09-25 起默认启用。
    三者都只在**批量跑**时才明显 —— 这也是 `--all` 要串行、每个品牌约 1~2 分钟的原因。
+10. **华为商城小程序「没有签到」—— 查实了，别再试。** 四条互相印证：
+    (a) 整包 grep「签到 / 打卡 / 赚积分 / 领积分 / 每日任务 / 任务中心 / 签到有礼 / 签到提醒」
+        **零命中** —— 只剩 5 处孤立 i18n 定义（`signIn` / `signed` / `dailySignIn` / `theDay` /
+        `couponDelivery`），**无任何使用处**；
+    (b) 80 个 `/mcp/` 接口里没有签到，tabBar 只有 `pages/index` / `classify` / `personal`；
+    (c) 登录后翻遍「我的」全部菜单（订单 / 拼团 / 售后 / 优惠券 / 积分 / 地址 / 消息…）
+        + 会员积分页 + 首页滚动 → **没有签到入口**；
+    (d) 官方积分规则 H5 原文：签到打卡在「**我的华为 APP**」，不在微信小程序。
+    微信里也**没有**「我的华为」小程序（扫过全部缓存包）。所以华为商城的积分只能靠购物拿。
+    > 顺手记两条华为的**登录**特性（万一以后要用）：`我的` 页未登录时只有「点击账号登录」
+    > → 进 H5《绑定华为账号》。**已绑定 → 微信可一键登录；未绑定 → 只能手动**
+    > （手机号 + 短信码 + 密码注册，或账号密码登录）。注册走 OAuth2
+    > （`client_id=10049053`，回调 `m.vmall.com/mp/toWechatMini.html`），表单里有个隐藏字段
+    > `hwmeta` = 华为风控 SDK 现场生成的设备指纹 —— 这就是**纯 API 注册不划算**的原因
+    > （得对它的 JS 逆一遍，易碎），用 CDP 驱动页面反而稳（风控参数由页面自己生成）。
+    > ⚠️ 别用「包里有『华为』字样」判它 —— 扫包时会命中一堆**引用了华为 SDK** 的无关小程序
+    > （实测命中过火锅店、军舰图、跑胡子棋牌），要按**标题/图标**确认。
+11. **⚠️ `wxreg` 算「页面原点」的方式有隐患 —— 待修，会影响所有品牌。**
+    它用 `dy = outerHeight - innerHeight`，但小程序渲染层的 `innerHeight`
+    **已经把底部原生 tabBar 扣掉了** —— 于是这个差值 = 标题栏 + tabBar，被整个当成「顶部偏移」，
+    **在有原生 tabBar 的页面上会整体点低一个 tabBar 的高度**。
+    荣耀实测（窗口 1022×810）：「我的」页 ctx=11 给 **101**（= 44 标题栏 + **55** tabBar，**点低 55px**）、
+    首页 ctx=6 给 45（恰好等于 `safeArea.top`）—— **同一判据换个 ctx 结论就变**，
+    极易误判成「坐标算错了」或「这个元素不存在」（我因此连点空两次）。
+    正确做法 = `页面原点 = 窗口原点(screenX/screenY) + 逻辑层 safeArea.top`，
+    见 `wxhonor.py` 的 `origin()`。⚠️ 修它会波及所有品牌，**要单独一轮 + 全品牌回归**，
+    别在接新品牌时顺手改。
 
 ---
 

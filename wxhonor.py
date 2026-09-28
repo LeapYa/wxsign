@@ -29,45 +29,32 @@
 `safeArea.top` 从**逻辑层** `wx.getSystemInfoSync()` 拿（结构量，不是魔法数）。
 实测这样算出 (129, 151)，与截图里按钮的真实位置吻合；用 101 则会点空。
 
-## 三、签到：**不在小程序里，在 H5 里**
-荣耀的「签到领积分」是**任务中心 H5**（`www.honor.com/cn/msale/mp/jobcenter.html`），
-由小程序页面 `login4Qxmp`（标题「任务页面」）用 web-view 承载。
-H5 是**独立 CDP target（type=webview）**，主 page 的 ctx 列表里看不到它 ——
-必须 `Target.attachToTarget(flatten=True)` 拿 sessionId 才能操作。
+## 三、取身份：凭证是 **cookie**，签到是**纯 HTTP**
+荣耀商城的签到**不在小程序原生页** —— 小程序本身（卖手机那个）**没有签到**。
+签到在**任务中心 H5**（`www.honor.com/cn/msale/mp/jobcenter.html`），
+由小程序页面 `packageActivity/pages/login4Qxmp/login4Qxmp`（标题「任务页面」）用 web-view 承载。
 
-签到链路（全部从 H5 的 `sign_in_interactive.js` 里读出来的，非猜测）：
+但**签到不需要打开那个 H5**（2026-09-28 实测，全链路纯 HTTP）：
+  · **`activityCode`（每期会变的那个）** —— 一次普通 GET 拿 H5 的 HTML，
+    正则提 `data-activity-code` 就行。**不需要 cookie、不需要打开页面。**
+  · **凭证全在 `.honor.com` 的 cookie 里**：`euid` / `encryptRtNew` / `CSRF-TOKEN`。
+    而 `Network.getAllCookies` 是 **browser 级**命令 —— attach 到**任意** target
+    （哪怕只是小程序的 `page-frame.html`）就能读到整份 cookie jar
+    → **不需要打开 H5 就能取身份**。
+  · 剩下就是两个 POST（纯 HTTP），见 `wxsign.py` 的 `do_sign_honor`。
 
-    # 幂等判据：服务端背书的「今天签过了」
-    POST {openapiDomain}/tdcs/taskcenter/queryTaskCenterInfo
-    body {"activityCode":…, "taskPortal":"4", "beCode":"CN"}
-    → result.signInInfo.signInToday === true
-
-    # 签到本体
-    POST {openapiDomain}/tdcs/taskcenter/taskCenterSignIn
-    body {"activityCode", "taskPortal":"4", "agent":navigator.userAgent,
-          "oas_refer":location.origin+"/", "variedData":<cookie variedData>}
-    → code "0" 成功；"task.center.today.aready.signin"(numCode 3027) = 今日已签
-
-`activityCode` **不在 URL 上**，是页面 HTML 里内联的组件配置：
-    <div class="J_mod sign-in-style4 mod-838… mod-sign-in" data-activity-code="QDHDz5SM67T65XPOBMBBQ1">
-所以取它的稳定判据 = **`.sign-in-style4[data-activity-code]`**（每期换档期会变，
-但属性名不变，不许硬编码那个值）。
-
-⚠️ 认证（`euid` / `encryptRtNew` / `CSRF-TOKEN` / `hasSigned`）在 **`.honor.com` 的
-cookie** 里 —— 所以**在 H5 页面内发 fetch**（`credentials:'include'`）最省事，
-认证完全交给浏览器自己，我们一个 cookie 都不碰。（另有一个纯 HTTP 变体：
-把 cookie 导出来自己带，但没必要。）
+所以本模块只干两件事：
+  ① `ident` —— 从 CDP 读 `.honor.com` 的 cookie jar（交给引擎纯 HTTP 用）
+  ② 首次接入的**一次性**授权（`login`）+ 排障用的 UI 工具（`status/agree/personal/tap`）
 
 ## 四、用法（容器内跑）
-    python3 wxhonor.py status     # 当前在哪一页 / 隐私弹窗在不在 / 登录态
-    python3 wxhonor.py origin     # 打印页面原点与它的推导过程
-    python3 wxhonor.py agree      # 点掉隐私声明的「同意」（加 --dry 只看不点）
-    python3 wxhonor.py login      # 点「点击账号登录」，触发微信手机号授权
-    python3 wxhonor.py personal   # 逻辑层 wx.switchTab 跳到「我的」页
+    python3 wxhonor.py ident    # 【引擎用】读 cookie jar → 打印 HONOR_IDENT={...}
+    python3 wxhonor.py status   # 当前在哪一页 / 隐私弹窗在不在 / 登录态
+    python3 wxhonor.py origin   # 打印页面原点与它的推导过程
+    python3 wxhonor.py agree    # 点掉隐私声明的「同意」（加 --dry 只看不点）
+    python3 wxhonor.py login    # 点「点击账号登录」，触发微信手机号授权（一辈子一次）
+    python3 wxhonor.py personal # 逻辑层 wx.switchTab 跳到「我的」页
     python3 wxhonor.py tap <文案>  # 按文案点（现取坐标）
-    python3 wxhonor.py h5         # 打开（或复用）任务中心 H5，打印它的 target
-    python3 wxhonor.py info       # 读 H5：activityCode / 已签天数 / 档期 / 积分
-    python3 wxhonor.py signin     # 签到（幂等：已签直接报 415，不重复发请求）
 """
 import json
 import subprocess
@@ -386,18 +373,36 @@ def cmd_tap():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  任务中心 H5（签到在这里）
+#  取身份：荣耀的会话在 **cookie** 里（不在小程序 storage）
 # ══════════════════════════════════════════════════════════════════════════
-_H5_ID = [9000]
+# ⚠️ 关键事实：**不用打开任何 H5 就能读到整份 cookie**。
+#    `Network.getAllCookies` 是 **browser 级**命令 —— attach 到**任意** target
+#    （哪怕只是小程序渲染层的 `page-frame.html`）都能拿到全部 cookie jar。
+#    所以「取身份」这一步**完全不驱动界面**，只要小程序开着。
+#
+# 为什么是 cookie：
+#   · `.honor.com` 的 `euid`（用户 id，httpOnly）+ `encryptRtNew`（加密 refresh token）
+#     + `CSRF-TOKEN` 就是全部凭证 —— 签到请求只要带它们就通（2026-09-28 实测）。
+#   · `window.csrftoken` 与 cookie 里的 `CSRF-TOKEN` **是同一个值**
+#     （`csrftoken.js` 只是个按域名返回硬编码串的函数），所以不必去读页面变量。
+#   · `variedData`（设备指纹，2081 字节）也在 cookie 里。
+#   ⚠️ 磁盘上 `radium/web/profiles/webview_<hash>/Cookies` 里确实有这些 cookie，
+#     但值是 Chromium 的 `v10` AES-GCM 密文（解它要 keyring key）—— 不值得。
+#     走 CDP 读出来就是明文，一步到位。
+#
+# `python3 wxhonor.py ident` → 打印一行 `HONOR_IDENT={...}`，引擎解析后用纯 HTTP 签到。
+
+HONOR_DOMAIN = "honor.com"
+_ID = [9000]
 
 
-def _h5_send(ws, method, params=None, sid=None):
-    _H5_ID[0] += 1
-    ws.send({"id": _H5_ID[0], "method": method, "params": params or {}}, sessionId=sid)
-    return _H5_ID[0]
+def _cdp_send(ws, method, params=None, sid=None):
+    _ID[0] += 1
+    ws.send({"id": _ID[0], "method": method, "params": params or {}}, sessionId=sid)
+    return _ID[0]
 
 
-def _h5_wait(ws, want, timeout=12.0, sid=None):
+def _cdp_wait(ws, want, timeout=12.0, sid=None):
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
@@ -411,209 +416,91 @@ def _h5_wait(ws, want, timeout=12.0, sid=None):
     return None
 
 
-def find_h5(ws):
-    """任务中心 H5（webview target）；没有返回 None。
-    ⚠️ 它在主 page 的 ctx 列表里**看不见** —— web-view 是独立 target。"""
-    wid = _h5_send(ws, "Target.getTargets")
-    infos = (((_h5_wait(ws, wid) or {}).get("result")) or {}).get("targetInfos") or []
+def pick_miniapp_target(ws):
+    """挑一个**小程序的** page target。先按 appId 匹配，再退到任意 servicewechat 页。
+
+    ⚠️ 刻意**不要求**是承载签到的那个 webview：cookie 读取是 browser 级的，在哪都行，
+       所以「取身份」不必先把任务中心 H5 打开（那是上一版实现绕的远路）。
+    """
+    wid = _cdp_send(ws, "Target.getTargets")
+    infos = (((_cdp_wait(ws, wid) or {}).get("result")) or {}).get("targetInfos") or []
     for t in infos:
-        if t.get("type") == "webview" and H5_KEY in (t.get("url") or ""):
+        if t.get("type") == "page" and ("servicewechat.com/%s" % APPID) in (t.get("url") or ""):
+            return t
+    for t in infos:
+        if t.get("type") == "page" and "servicewechat.com" in (t.get("url") or ""):
             return t
     return None
 
 
-def nav_task_page(ws, wait_after=9.0):
-    """逻辑层 `wx.navigateTo` 跳到任务中心页（它内嵌签到 H5）。已在则跳过。"""
-    probe = ("(function(){try{return (typeof wx!=='undefined'&&typeof wx.navigateTo==='function')"
-             "?(wx.getAccountInfoSync().miniProgram.appId+'|'+(getCurrentPages().slice(-1)[0]||{}).route)"
-             ":'no'}catch(e){return 'ERR'}})()")
-    for ctx, v in _broadcast_pick(ws, probe, timeout=15.0):
-        if not (isinstance(v, str) and v.startswith("wx")):
-            continue
-        app, _, route = v.partition("|")
-        if app != APPID:
-            print("[honor] ⚠️ 当前小程序 appId=%s ≠ 荣耀商城 %s" % (app, APPID))
-            return False
-        if route and route.startswith("packageActivity/pages/login4Qxmp"):
-            print("[honor] 已在任务中心页（%s），不重复跳转" % route)
-            return True
-        expr = "wx.navigateTo({url:'%s'})||'ok'" % TASK_PAGE
-        ws.send({"id": 8500, "method": "Runtime.evaluate",
-                 "params": {"expression": expr, "contextId": ctx, "returnByValue": True}})
-        print("[honor] 逻辑层 ctx=%d route=%s → navigateTo %s" % (ctx, route or "-", TASK_PAGE))
-        time.sleep(wait_after)
-        return True
-    print("[honor] 找不到逻辑层 ctx（荣耀商城没开着？）")
-    return False
+def cmd_ident():
+    """读 `.honor.com` 的 cookie jar → 打印 `HONOR_IDENT={...}`。
 
+    输出：`{"ok":true, "appid":…, "target":…, "cookie":"k=v; k=v; …", "jar":{…},
+            "csrf":…, "has_login":bool, "uid":…, "user":…}`
 
-def h5_session(open_if_missing=True, wait=36.0):
-    """连上任务中心 H5，返回 (ws, sid, target)；失败 (ws, None, None)。
-
-    先复用已开着的 H5；没有就逻辑层导航开它（H5 加载要几秒，所以轮询等）。
+    引擎把 `cookie` 直接当 `Cookie:` 头用 —— 签到全流程纯 HTTP
+    （见 wxsign.py 的 `do_sign_honor`）。
     """
     ws = wxcdp.WS(timeout=25)
-    _h5_send(ws, "Target.setDiscoverTargets", {"discover": True})
+    _cdp_send(ws, "Target.setDiscoverTargets", {"discover": True})
     time.sleep(1.0)
-    t = find_h5(ws)
-    if not t and open_if_missing:
-        if nav_task_page(ws):
-            t0 = time.time()
-            while time.time() - t0 < wait:
-                time.sleep(2.0)
-                t = find_h5(ws)
-                if t:
-                    break
+    t = pick_miniapp_target(ws)
     if not t:
-        return ws, None, None
-    wid = _h5_send(ws, "Target.attachToTarget", {"targetId": t["targetId"], "flatten": True})
-    sid = (((_h5_wait(ws, wid, timeout=12.0) or {}).get("result")) or {}).get("sessionId")
+        print("[honor] 没找到小程序 target（荣耀商城开着吗？hook 通吗？）")
+        print("HONOR_IDENT=" + json.dumps({"ok": False, "err": "no-miniapp-target"}))
+        return 1
+    wid = _cdp_send(ws, "Target.attachToTarget", {"targetId": t["targetId"], "flatten": True})
+    sid = (((_cdp_wait(ws, wid) or {}).get("result")) or {}).get("sessionId")
     if not sid:
-        return ws, None, t
-    _h5_send(ws, "Runtime.enable", {}, sid=sid)
-    _h5_send(ws, "Page.enable", {}, sid=sid)
-    time.sleep(0.5)
-    return ws, sid, t
-
-
-def h5_eval(ws, sid, expr, timeout=40.0):
-    """在 H5 里求值（Promise 会自动 await），返回值 JSON 化。"""
-    wid = _h5_send(ws, "Runtime.evaluate",
-                   {"expression": expr, "returnByValue": True, "awaitPromise": True}, sid=sid)
-    r = _h5_wait(ws, wid, timeout=timeout, sid=sid)
-    if not r:
-        return None
-    res = r.get("result") or {}
-    if res.get("exceptionDetails"):
-        return {"__exc__": str(res["exceptionDetails"])[:400]}
-    v = (res.get("result") or {}).get("value")
-    if isinstance(v, str):
-        try:
-            return json.loads(v)
-        except Exception:
-            return v
-    return v
-
-
-# 在 H5 页面内发请求 —— 认证（cookie）由浏览器自己带，我们一个 cookie 都不碰。
-# __WANT__ 换成 true/false：true = 未签就签；false = 只查状态。
-_H5_JS = r"""
-(function(){
-  var el = document.querySelector('.sign-in-style4');
-  var ac = el ? String(el.getAttribute('data-activity-code') || '') : '';
-  var cfg = window.pageConfig || {};
-  var base = cfg.openapiDomain || 'https://openapi-cn.c.honor.com';
-  var vd = null;
-  try {
-    var m = String(document.cookie).match(/variedData=([^;]+)/);
-    vd = m ? decodeURIComponent(m[1]) : null;
-  } catch (e) {}
-  var H = {'Content-Type': 'application/json', 'CsrfToken': (window.csrftoken || '')};
-  var WANT = __WANT__;
-  var out = {activityCode: ac, base: base, hasVariedData: !!vd,
-             csrf: String(window.csrftoken || '').slice(0, 8) + '…'};
-  if (!ac) { out.err = 'no-activity-code（H5 里没有 .sign-in-style4）'; return JSON.stringify(out); }
-  return fetch(base + '/tdcs/taskcenter/queryTaskCenterInfo', {
-      method: 'POST', headers: H, credentials: 'include',
-      body: JSON.stringify({activityCode: ac, taskPortal: '4', beCode: 'CN'})
-    })
-    .then(function(r){ return r.json(); })
-    .then(function(j){
-      var R = j.result || {}, si = R.signInInfo || {};
-      out.queryCode = j.code;
-      out.signInToday = si.signInToday;
-      out.continuousSignIn = si.continuousSignIn;
-      out.signInCycle = si.signInCycle;
-      out.accumulatePoints = R.accumulatePoints;
-      out.endTime = R.endTime;
-      var td = (si.cycleSignInInfoList || []).filter(function(x){ return x.today; })[0];
-      out.todayEarnPoint = td ? td.earnPoint : null;
-      out.alreadySigned = (si.signInToday === true);
-      if (out.alreadySigned || !WANT) { return JSON.stringify(out); }
-      return fetch(base + '/tdcs/taskcenter/taskCenterSignIn', {
-          method: 'POST', headers: H, credentials: 'include',
-          body: JSON.stringify({activityCode: ac, taskPortal: '4',
-            agent: navigator.userAgent, oas_refer: location.origin + '/', variedData: vd})
-        })
-        .then(function(r){ return r.json(); })
-        .then(function(s){
-          out.signCode = s.code; out.signNumCode = s.numCode; out.signMsg = s.msg;
-          out.signSuccess = s.success; out.signResult = s.result;
-          return JSON.stringify(out);
-        });
-    });
-})()
-"""
-
-
-def h5_signin(want=True, open_if_missing=True):
-    """跑一轮「查状态 →（未签则）签到」。返回结果 dict（失败 None）。"""
-    ws, sid, t = h5_session(open_if_missing=open_if_missing)
-    if not sid:
-        print("[honor] 连不上任务中心 H5（页面没打开 / hook 没挂？）")
-        return None
-    print("[honor] H5 = %s" % (t.get("url") or "")[:110])
-    js = _H5_JS.replace("__WANT__", "true" if want else "false")
-    return h5_eval(ws, sid, js)
-
-
-def _report(r):
-    # `--json`：给引擎（wxsign.py 的 do_sign_honor）解析用。
-    # 约定与 wxoppo.py 的 `OPPO_JSON=` 一致：**一行、机器可读**。
-    if JSON_OUT:
-        print("HONOR_JSON=" + json.dumps(
-            r if isinstance(r, dict) else {"raw": str(r)}, ensure_ascii=False))
-    if not isinstance(r, dict):
-        print("[honor] 结果异常：%s" % str(r)[:300])
+        print("[honor] attachToTarget 失败")
+        print("HONOR_IDENT=" + json.dumps({"ok": False, "err": "attach-failed"}))
         return 1
-    if r.get("__exc__"):
-        print("[honor] 页面异常：%s" % r["__exc__"])
-        return 1
-    print("[honor] activityCode = %s" % r.get("activityCode"))
-    print("[honor] 档期结束     = %s    已连续签到 = %s/%s 天"
-          % (r.get("endTime"), r.get("continuousSignIn"), r.get("signInCycle")))
-    print("[honor] 累计积分     = %s    今日可得 = %s    今天已签 = %s"
-          % (r.get("accumulatePoints"), r.get("todayEarnPoint"), r.get("signInToday")))
-    if r.get("alreadySigned"):
-        print("[honor] → 今日已签到（幂等，不发签到请求）")
-        return 0
-    if "signCode" in r:
-        print("[honor] 签到返回     = code=%s numCode=%s success=%s msg=%s"
-              % (r.get("signCode"), r.get("signNumCode"), r.get("signSuccess"), r.get("signMsg")))
-        if r.get("signCode") == "0":
-            print("[honor] → 签到成功 ✅  %s" % (r.get("signResult"),))
-            return 0
-        if "aready.signin" in str(r.get("signCode")):
-            print("[honor] → 今日已签到（服务端判定）")
-            return 0
-        return 1
-    return 1
-
-
-def cmd_h5():
-    ws, sid, t = h5_session()
-    if not sid:
-        print("[honor] 任务中心 H5 没能就绪")
-        return 1
-    print("[honor] H5 target = %s" % t["targetId"])
-    print("[honor] H5 url    = %s" % (t.get("url") or ""))
-    print("[honor] sessionId = %s" % sid)
+    # 🔑 browser 级命令 —— 返回的是**整份** cookie jar（所有域名），与 attach 到谁无关
+    wid = _cdp_send(ws, "Network.getAllCookies", {}, sid=sid)
+    r = _cdp_wait(ws, wid, timeout=15.0, sid=sid)
+    cookies = (((r or {}).get("result")) or {}).get("cookies") or []
+    jar = {}
+    for c in cookies:
+        if not (c.get("domain") or "").endswith(HONOR_DOMAIN):
+            continue
+        n, v = c.get("name"), c.get("value")
+        if v is None:
+            continue
+        if n in jar and len(c.get("path") or "") < jar[n][0]:
+            continue                      # 同名多条时取 path 更具体的那条
+        jar[n] = (len(c.get("path") or ""), v)
+    jar = {k: v for k, (_, v) in jar.items()}
+    out = {
+        "ok": True,
+        "appid": APPID,
+        "target": (t.get("url") or "")[:120],
+        "cookie": "; ".join("%s=%s" % (k, v) for k, v in jar.items()),
+        "jar": jar,
+        "csrf": jar.get("CSRF-TOKEN", ""),
+        "has_login": bool(jar.get("euid")) and bool(jar.get("encryptRtNew")),
+        "uid": jar.get("uid", ""),
+        "user": jar.get("user", ""),
+    }
+    print("[honor] appId=%s  取自 %s" % (APPID, out["target"][:70]))
+    print("[honor] cookie %d 条：euid=%s  encryptRtNew=%s  CSRF-TOKEN=%s  variedData=%s" % (
+        len(jar),
+        "有" if jar.get("euid") else "**无**",
+        "有" if jar.get("encryptRtNew") else "**无**",
+        "有" if jar.get("CSRF-TOKEN") else "**无**",
+        ("%d 字节" % len(jar.get("variedData", ""))) if jar.get("variedData") else "**无**"))
+    print("[honor] 登录态：%s%s" % (
+        "已登录 ✅" if out["has_login"] else "**未登录**（先跑 wxhonor.py login）",
+        "   账号 %s / uid %s" % (out["user"], out["uid"]) if out["user"] else ""))
+    print("HONOR_IDENT=" + json.dumps(out, ensure_ascii=False))
     return 0
-
-
-def cmd_info():
-    return _report(h5_signin(want=False))
-
-
-def cmd_signin():
-    return _report(h5_signin(want=True))
 
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     fn = {"status": cmd_status, "origin": cmd_origin, "agree": cmd_agree,
           "login": cmd_login, "personal": cmd_personal, "tap": cmd_tap,
-          "h5": cmd_h5, "info": cmd_info, "signin": cmd_signin}.get(cmd)
+          "ident": cmd_ident}.get(cmd)
     if not fn:
         print(__doc__)
         return 2

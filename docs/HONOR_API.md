@@ -2,25 +2,25 @@
 
 > 首次打通 2026-09-28。这是本项目**唯一一个「签到不在小程序里」**的后端 ——
 > 签到本体是**任务中心 H5**，由小程序页面用 web-view 承载。
-> 「打开小程序就能签」在这里**不成立**，必须先 navigateTo 那个页面、再 attach 它的 webview。
+> 但**整条链路仍做成了纯 HTTP**：那个 H5 一次都不用打开（见第三节）。
 
 ## 一、结论（先看这段）
 
 - **荣耀商城小程序本身没有签到。** 整包 grep「签到 / 打卡 / 赚积分 / 领积分 / 每日任务 /
-  任务中心 / 签到有礼 / 签到提醒」**零命中**（只剩 5 处孤立 i18n 定义，**无使用处**），
+  任务中心 / 签到有礼」**零命中**（只剩 5 处孤立 i18n 定义，**无使用处**），
   tabBar 只有 `pages/index` / `classify` / `personal`。**别再在小程序里找入口。**
 - 签到在**任务中心 H5**（`www.honor.com/cn/msale/mp/jobcenter.html`），
   由小程序页面 `packageActivity/pages/login4Qxmp/login4Qxmp`（标题「任务页面」）承载。
-  **H5 是独立 CDP target（`type=webview`）** —— 主 page 的 ctx 列表里**看不见**它，
-  必须 `Target.attachToTarget(flatten=True)`。
-- API 主机 `https://openapi-cn.c.honor.com`。**没有签名、没有 nonce**。
-- 认证是**页面自己的 cookie**（`.honor.com`：`euid` / `encryptRtNew` / `CSRF-TOKEN`）——
-  所以最省事的做法是**在 H5 页面内发 `fetch(credentials:'include')`**，
-  认证交给浏览器，**一个 cookie 都不碰**。
-- **`activityCode` 每期会变，但零人工**：它是页面 HTML 里内联的组件属性
-  （`.sign-in-style4[data-activity-code]`），现场读 —— 所以 `brands.json` 里**不用配**。
+- ⭐ **但不需要打开那个 H5**。三件事各自都能纯算：
+  1. **`activityCode`（每期变）** ← 一次普通 GET 拉 H5 的 HTML，正则提内联属性
+     `data-activity-code`。**不要 cookie、不要打开页面** ⇒ 换档期**零人工**。
+  2. **cookie** ← `Network.getAllCookies` 是 **browser 级**命令，
+     attach 到**任意** target（哪怕只是小程序的 `page-frame.html`）就能读整份 cookie jar
+     ⇒ **不碰界面就能取身份**。
+  3. **两个 POST** ← 纯 HTTP（`honor_post`）。**没有签名、没有 nonce。**
+- 认证比想象中松：**`CsrfToken` 头可带可不带**（见第三节），已签路径上 `variedData` 也不必需。
 - 幂等判据用 `queryTaskCenterInfo` 的 `result.signInInfo.signInToday`（服务端背书），
-  且服务端对重复签到也回专门的码 `task.center.today.aready.signin`（双保险）。
+  服务端对重复签到另回专门码 `task.center.today.aready.signin`（双保险）。
 
 ## 二、归属与识别
 
@@ -28,46 +28,82 @@
 |---|---|
 | 小程序 | `荣耀商城`，appId `wx06a8d8c84a18be25` |
 | 承载签到的页面 | `packageActivity/pages/login4Qxmp/login4Qxmp`（标题「任务页面」） |
-| 承载签到的 H5 | `https://www.honor.com/cn/msale/mp/jobcenter.html?version=9` |
-| API 主机 | `https://openapi-cn.c.honor.com`（= H5 的 `window.pageConfig.openapiDomain`） |
+| 承载签到的 H5 | `https://www.honor.com/cn/msale/mp/jobcenter.html`（**引擎里不带 `?version=`**） |
+| API 主机 | `https://openapi-cn.c.honor.com` |
 | 埋点主机 | `https://dap-cn.c.hihonor.com`（与业务无关，可忽略） |
-| 签名/风控 | 无签名；有极验 `geetest`（**签到链路不经过它**，见第四节） |
+| 签名 / 风控 | 无签名；有极验 `geetest`（**签到链路不经过它**，见第四节） |
 | 档期（2026-09-28 实测） | `activityCode = QDHDz5SM67T65XPOBMBBQ1`，`2026-09-30 23:59:59+0800` 结束 |
 | 签到周期 | **5 天**：`dailyRewards = {1:8, 2:9, 3:11, 4:13, 5:17}` |
 
-> ⚠️ **别把「荣耀商城」和「我的华为」/「华为商城」搞混**：
-> 华为商城（`wx208389d90830e5b7`）**没有签到**（详见 README 第七节第 10 条）；
-> 微信里也**没有**「我的华为」小程序。荣耀商城是**独立品牌**（honor.com），
-> 不是华为的分身 —— 它自己的任务中心 H5 里确实有签到。
+> ⚠️ 别把「荣耀商城」和「我的华为」/「华为商城」搞混：华为商城（`wx208389d90830e5b7`）
+> **没有签到**（详见 README 第七节第 10 条）；微信里**也没有**「我的华为」小程序。
+> 荣耀商城是**独立品牌**（honor.com），不是华为的分身。
 
-## 三、认证：页面自己的 cookie
+## 三、凭证：`.honor.com` 的 cookie（而且能「离线」读）
 
-`.honor.com` 域下的 cookie（实测 dump 出来的全量里挑相关的）：
+### 有哪些
 
 | cookie | httpOnly | 长度 | 作用 |
 |---|---|---|---|
 | `euid` | ✅ | 67 | 用户 ID（**关键**） |
 | `encryptRtNew` | ❌ | 305 | 加密的 refresh token（**关键**） |
-| `CSRF-TOKEN` | ❌ | 42 | CSRF 令牌（**关键**） |
-| `uid` / `user` / `name` / `hasphone` | ❌ | 19 / 11 / 11 / 1 | 展示用 |
-| `hasLogin` / `hasSigned` | ❌ | 13 / 1 | 前端状态位（`hasSigned=1` = 今天签过） |
-| `variedData` | ❌ | 1559 | 设备指纹（**签到请求体里要带**） |
+| `CSRF-TOKEN` | ❌ | 42 | CSRF 令牌 |
+| `uid` / `user` / `name` | ❌ | 19 / 11 / 11 | 展示用（`user` = 脱敏手机号） |
+| `hasLogin` / `hasSigned` | ❌ | 13 / 1 | 前端状态位 |
+| `variedData` | ❌ | 2081+ | 设备指纹（签到 body 里带） |
+| `_areacode` / `HShop-AB` | ✅ | 2 / 1 | 区域 / AB 实验 |
 
-请求头里的 `CsrfToken` 取自 **H5 的 `window.csrftoken`**（由 `openapi-cn.c.honor.com/csrftoken.js`
-下发，页面加载时就有了）。
+合计 23 条（去重后）。
 
-**为什么选「在页面内发 fetch」而不是纯 HTTP**：这些 cookie（尤其 `euid` / `encryptRtNew`）
-在 webview 的 cookie jar 里，要搬出来得额外读一次、还要在容器间传凭证。
-而在页面内发请求，`credentials:'include'` 让浏览器自己带全 —— 更少变量、更少出错面。
-（纯 HTTP 变体存在且可行，只是没必要。）
+### ⭐ 怎么读到它 —— **不用打开任何页面**
 
-## 四、完整链路（每步都实测）
+```
+Target.getTargets        → 找一个 *小程序的* page target，例如
+                           page | AppIndex | https://servicewechat.com/wx06a8d8c84a18be25/118/page-frame.html
+Target.attachToTarget({targetId, flatten:true})   → sessionId
+Network.getAllCookies    （带上那个 sessionId）    → **整份** cookie jar
+```
+
+**关键点：`Network.getAllCookies` 是 browser 级命令** —— 它返回的是**整个浏览器**的 cookie
+（实测 80 条，横跨 `.honor.com` / `.opposhop.cn` / `.mxbc.net` / `.pin-dao.cn` …），
+**与 attach 到哪个 target 无关**。所以哪怕任务中心 H5 根本没打开，也照样读得到。
+
+> 这条也是「为什么不用另一种做法」的答案：磁盘上
+> `radium/web/profiles/webview_<hash>/Cookies` 里**确实**存着这些 cookie，
+> 但值是 Chromium 的 **`v10` AES-GCM 密文**（解它要 keyring key）—— 不值得。
+> 走 CDP 读出来是**明文**，一步到位。
+
+### ⭐ `CsrfToken` 就是 cookie 里的 `CSRF-TOKEN`
+
+H5 的 `window.csrftoken` 与 cookie 的 `CSRF-TOKEN` **实测完全相同**
+（都是 `L0VnV2pJeFokWlRqN2VmWnV6RnBFWEN1anRFdVdDMQ`）。原因是 `csrftoken.js` 本身
+只是个按域名返回**硬编码串**的函数：
+
+```js
+func getToken() {
+    var wDomain = ".hihonor.com;.hicloud.com;.honor.cn";
+    for (var i = 0; i < wds.length; i++) {
+        if (url.endsWith(wds[i])) { csrftoken = "UXNvVjlCcDEkeDlFY21JYzBlNm1XeXhaaUFrYmJVMA"; break; }
+    }
+}
+```
+
+（顺带说明：**不必**去读页面变量 —— cookie 里就有。而且它是个会过期的场景值，
+每次从 cookie 读才是对的。）
+
+**实测：这个头可带可不带** —— 查询与签到接口在「带 / 空 / 完全不发」三种情况下返回一致。
+代码里仍原样带上以保真（真签到路径万一校验它，不至于掉坑）。
+
+## 四、完整链路（纯 HTTP，每步实测）
 
 ```http
-# ① 幂等：查任务中心状态
+# ① 幂等：查任务中心状态（认证只需 cookie）
 POST https://openapi-cn.c.honor.com/tdcs/taskcenter/queryTaskCenterInfo
 Content-Type: application/json
-CsrfToken: <window.csrftoken>
+Cookie: euid=…; encryptRtNew=…; CSRF-TOKEN=…; variedData=…; …
+CsrfToken: <同 CSRF-TOKEN>
+Origin: https://www.honor.com
+Referer: https://www.honor.com/cn/msale/mp/jobcenter.html
 
 {"activityCode":"QDHDz5SM67T65XPOBMBBQ1","taskPortal":"4","beCode":"CN"}
 
@@ -82,17 +118,16 @@ CsrfToken: <window.csrftoken>
 ```http
 # ② 签到
 POST https://openapi-cn.c.honor.com/tdcs/taskcenter/taskCenterSignIn
-Content-Type: application/json
-CsrfToken: <window.csrftoken>
+（同样的头）
 
 {"activityCode":"QDHDz5SM67T65XPOBMBBQ1","taskPortal":"4",
- "agent":"<navigator.userAgent>",
+ "agent":"<User-Agent>",
  "oas_refer":"https://www.honor.com/",
  "variedData":"<cookie variedData>"}
 
-→ 成功：        {"code":"0","result":{ "earnPoint":8, ... }}
-→ 今天已签：    {"code":"task.center.today.aready.signin",
-                 "msg":"TASK CENTER TODAY AREADY SIGNIN","numCode":3027,"success":false}
+→ 成功：     {"code":"0","result":{ "earnPoint":8, ... }}
+→ 今天已签： {"code":"task.center.today.aready.signin",
+              "msg":"TASK CENTER TODAY AREADY SIGNIN","numCode":3027,"success":false}
 ```
 
 > **参数是从 H5 的 `sign_in_interactive.js` 里读出来的**（不是猜的）：
@@ -102,7 +137,7 @@ CsrfToken: <window.csrftoken>
 >                variedData: utils.cookie.get('variedData') ? utils.cookie.get('variedData') : null }
 > const { code, result } = await request('POST', '/tdcs/taskcenter/taskCenterSignIn', data, headers)
 > ```
-> 注意它的 `headers` 只有 `Content-Type` —— `CsrfToken` 是全局 `request()` 封装自动加的。
+> 它那边的 `headers` 只有 `Content-Type`（`CsrfToken` 由全局 `request()` 封装加）。
 
 ### 返回码语义
 
@@ -129,13 +164,13 @@ CsrfToken: <window.csrftoken>
 > ⚠️ **`/ams/taskcenter/completeTask` 是个陷阱**：它出现在**小程序包**里
 > （`m.mpPromisePost(service.openApiDomain + "/ams/taskcenter/completeTask", a, {CsrfToken:e})`），
 > 参数长这样 `{taskPortal:"4", taskCenterId, taskId, subTaskId, completeType}`。
-> 我在挖签到的时候先在包里 grep 到了它，一度以为这就是签到接口。
-> **它不是** —— 它是「做任务」的（浏览商详页 / 分享 / 小游戏）。
-> 真正的签到在 H5 里，接口是 `/tdcs/taskcenter/taskCenterSignIn`。
-> （顺带：那里面 `taskCenterId` 的实际取值就是 `activityCode` —— 见 `sign_in_interactive.js` 里
-> `` link += `&taskId=${taskCode}&taskListCode=${taskListCode}&subTaskCode…&taskCenterId=${activityCode}` ``。）
+> 我在挖签到的时候先在包里 grep 到了它，一度以为这就是签到接口。**它不是** ——
+> 它是「做任务」的（浏览商详页 / 分享 / 小游戏）。真正的签到在 H5 里，
+> 接口是 `/tdcs/taskcenter/taskCenterSignIn`。
+> （顺带：那个 `taskCenterId` 的实际取值就是 `activityCode` —— 见 `sign_in_interactive.js` 里
+> `` link += `&taskId=${taskCode}&taskListCode=…&taskCenterId=${activityCode}` ``。）
 
-## 五、`activityCode` 每期会换 —— 但零人工
+## 五、`activityCode` 每期会换 —— 但零人工（纯 HTTP 提取）
 
 `activityCode`（如 `QDHDz5SM67T65XPOBMBBQ1`）**不在 URL 上**，是页面 HTML 里内联的组件配置：
 
@@ -151,14 +186,23 @@ CsrfToken: <window.csrftoken>
 </div>
 ```
 
-所以取它的判据是 **`.sign-in-style4[data-activity-code]`** —— 属性名稳定、值随档期变，
-现场读即可。**不需要配在 `brands.json` 里**（这点比 OPPO 的 `oppo_activity` 还省事，
-那边还得写一次发现逻辑，这边 H5 自己就带着）。
+所以引擎就一句正则：
 
-> ⚠️ 注意 `.sign-in-style4` 的 `.main-btn` **在 HTML 里写死文字是「签到」**，
-> 但 JS 在**已签状态**下会把它改成「领更多积分」—— 所以**别按文案判断今天签没签**，
-> 要用 `queryTaskCenterInfo` 的 `signInToday`（服务端背书）。同理 `.continuous-days`
-> 那个 `SPAN`（「已签到 1 天」）也是运行时渲染的，别拿它当判据。
+```python
+HONOR_ACTIVITY_RE = re.compile(r'data-activity-code="([^"]+)"')
+# GET https://www.honor.com/cn/msale/mp/jobcenter.html   → 在这个 HTML 上 search
+```
+
+**实测要点**：
+- **不需要 cookie、不需要登录、不需要打开 H5** —— `jobcenter.html` 是公开页。
+- **`?version=` 可以省**：带与不带拿到的 HTML 同字节（48747），`activityCode` 一样。
+  所以这一层也不依赖小程序下发的版本号 —— 纯算。
+- 换档期后**什么都不用改**，下次跑就自动是新 code。
+
+> ⚠️ 反之，两个**不能**拿来判状态的坑：
+> 1. `.main-btn` 在 HTML 里写死文字是「签到」，运行时（已签状态）JS 会把它改成
+>    「领更多积分」—— **按文案判断今天签没签必然错**，要用 `signInToday`。
+> 2. `.continuous-days` 那个 `SPAN`（「已签到 1 天」）也是运行时渲染的，同理别当判据。
 
 ## 六、首次登录（`wxhonor.py login`）
 
@@ -186,6 +230,9 @@ CsrfToken: <window.csrftoken>
 >    **别在中间插别的命令**。
 > 2. 首次没点掉、又短时间重试，会**疑似被限流**（点登录入口不弹框），隔几分钟即恢复。
 
+> 💡 登录之后就不需要它了：`ident` 只要能读到 cookie 就行。
+> cookie 只要微信没退出登录就一直有效（`hasLogin` 里带时间戳）。
+
 ## 七、我在这条线上犯过的错（按时间顺序）
 
 1. **以为荣耀 = 华为的小号，先去啃了华为商城。** 结论：华为商城小程序**根本没有签到**
@@ -194,20 +241,16 @@ CsrfToken: <window.csrftoken>
    别信搜索引擎的「华为商城小程序有每日签到」（那说的是 App）。
 2. **以为签到在「我的」菜单里。** 翻遍了（订单 / 拼团 / 售后 / 优惠券 / 积分 / 地址 / 消息），
    只有「我的积分」→ 会员积分页 → 「积分规则」H5 里写着签到在别处。
-   → 真入口是小程序**首页中间那块的「全部任务 / 赚积分」**，或者**直接 navigateTo 任务中心页**
-   （`/packageActivity/pages/login4Qxmp/login4Qxmp`）—— 后者更可靠，也不用找按钮。
 3. **以为签到请求走小程序逻辑层的 `wx.request`。** 装了 `wxnet.py` 去拦，**一条都没拦到**。
    → 因为**签到在 H5 里发**。小程序侧那些 `/ams/taskcenter/completeTask` 是**任务**用的。
    这是全篇最关键的一次纠偏。
-4. **按「元素最多的 ctx」找 H5**（`find_dom_ctx`）→ 必然选到残留的搜索页。
-   → 正解：**先说要找什么**（`find_ctx_with([...])`），再看哪个 ctx 有。这个坑 README 第六节也写了，
-   我还是又踩了一次 —— 因为它伪装成「H5 内容不在 DOM 里」。
-5. **`wxreg` 的坐标换算坑**（详见下节）：同一个判据换 ctx 结论就变，害我连点空两次，
-   一度以为是按钮在视口外。
-6. **面板彻底打不开**（点侧边栏「小程序」毫无反应，WMPF 进程健康）。
-   → 发现 `open_via_souyisou` 其实把**搜一搜结果页**开出来了，只是被主窗口压着 ——
-   `xdotool windowmove <主窗口> 0 1080` 把它移出屏 → 结果页露出来 → 点第一张卡片 →
-   小程序就打开了（CDP 复核 appId 一致）。**不用重启微信。**
+4. **第一版实现是「attach H5 → 在页面内 fetch」。** 能用，但它把「打开那个 H5」变成了硬依赖 ——
+   而 H5 只有在用户点了「全部任务 / 赚积分」之后才会存在。
+   → 后来发现 **`activityCode` 能纯 HTTP 从 HTML 提、cookie 能 browser 级读**，
+   于是整条链路撤掉界面依赖，改成纯 HTTP。**同样的接口，架构干净一截。**
+5. **按「元素最多的 ctx」找 H5**（`find_dom_ctx`）→ 必然选到残留搜索页。
+   → 正解：**先说要找什么**（`find_ctx_with([...])`），再看哪个 ctx 有。
+6. **`wxreg` 的坐标换算坑**（详见下节）：同一个判据换 ctx 结论就变，害我连点空两次。
 
 ### ⚠️ 附带发现的项目级隐患：`wxreg` 算错了「页面原点」
 
@@ -219,8 +262,7 @@ CsrfToken: <window.csrftoken>
 | 6 | 首页 | 765 | **45** | ✅ 恰好 = `safeArea.top` |
 | 11 | 我的 | 709 | **101** | ❌ 44 标题栏 + **55** tabBar |
 
-**同一判据换个 ctx 结论就变** —— 这就是我连点空两次的原因（点低了 55px）。
-正确做法：
+**同一判据换个 ctx 结论就变** —— 这就是我连点空两次的原因（点低了 55px）。正确做法：
 
 ```python
 页面原点 = 窗口原点(screenX/screenY) + 逻辑层 safeArea.top      # 44
@@ -230,61 +272,55 @@ CsrfToken: <window.csrftoken>
 
 ## 八、可自动化程度
 
-| 环节 | 是否自动 |
-|---|---|
-| 打开荣耀商城小程序 | ✅ 引擎自动（`open_target.py` 按 appId 复核） |
-| 跳到任务中心页 | ✅ 逻辑层 `wx.navigateTo`（而且**不用点任何按钮**） |
-| 找到 H5 / attach | ✅ 按 URL 特征找 target + `attachToTarget(flatten)` |
-| 取 `activityCode` | ✅ 读 DOM 属性（零人工、每期自动） |
-| 首次手机号授权 | ✅ `wxhonor.py login`（**但前提是手机上能收到那次授权 —— 不需要，微信手机号授权是静默的**） |
-| 每日签到 | ✅ 全自动（幂等，已签不发请求） |
-| 风控 / 验证码 | ❌ 无法自动过 —— 报 `RISK` 并退出，不重试 |
+| 环节 | 是否自动 | 备注 |
+|---|---|---|
+| 打开荣耀商城小程序 | ✅ | 引擎自动（`open_target.py` 按 appId 复核） |
+| 取 cookie（`euid`/`encryptRtNew`/`CSRF-TOKEN`） | ✅ | **CDP 读 cookie jar，不碰界面、不开 H5** |
+| 提 `activityCode` | ✅ | **纯 HTTP 拉 HTML 再正则**，换档期零人工 |
+| 查档期 / 签到 | ✅ | **纯 HTTP 两个 POST** |
+| 首次手机号授权 | ✅ | `wxhonor.py login`（一辈子一次；微信手机号授权是**静默**的，不用你收短信） |
+| 风控 / 验证码 | ❌ | 无法自动过 —— 报 `RISK` 并退出，不重试 |
+
+> 实测耗时：**32 秒**（含引擎侧投递脚本 + 开小程序的固定开销）。
+> 其中与荣耀本身相关的只有「读一次 cookie + 1 个 GET + 2 个 POST」。
 
 ## 九、复现步骤
 
 ```bash
-# ① 容器内（微信实例）—— 单独看 H5 / 查状态 / 签到
-python3 wxhonor.py h5          # 打开（或复用）任务中心 H5，打印它的 webview target
-python3 wxhonor.py info        # 只读：activityCode / 档期 / 连续天数 / 今天签没签
-python3 wxhonor.py signin      # 真签（幂等：已签直接报 415，不发签到请求）
-python3 wxhonor.py signin --json   # 同上，但额外打印机器可读的 HONOR_JSON= 一行（引擎用）
+# ① 容器内（微信实例）—— 只取身份 / 首次授权
+python3 wxhonor.py ident      # 读 .honor.com 的 cookie jar → 打印 HONOR_IDENT={...}
+python3 wxhonor.py status     # 当前在哪一页 / 隐私弹窗在不在 / 登录态
+python3 wxhonor.py login      # 首次：点「点击账号登录」并抓微信原生「允许」框
 
-# ② 宿主机 —— 走引擎（它会自动投递 wxhonor.py 到容器）
+# ② 宿主机 —— 走引擎（纯 HTTP，自动投递 wxhonor.py 到容器）
 WOC_INSTANCE=woc-wx-xxxx python3 wxsign.py honor
-
-# ③ 首次登录（每个微信账号一辈子一次）
-#    容器内跑；它会点「点击账号登录」并抓微信原生「允许」框
-python3 wxhonor.py login
 ```
 
 ### 实测输出（2026-09-28）
 
-```
-$ python3 wxhonor.py info
-[honor] H5 = https://www.honor.com/cn/msale/mp/jobcenter.html?version=9
-[honor] activityCode = QDHDz5SM67T65XPOBMBBQ1
-[honor] 档期结束     = 2026-09-30 23:59:59+0800    已连续签到 = 1/5 天
-[honor] 累计积分     = 8    今日可得 = 8    今天已签 = True
-[honor] → 今日已签到（幂等，不发签到请求）
-```
+**任务中心 H5 完全没打开**的情况下（已 `navigateBack` 退掉页面、`Target.getTargets` 里
+`jobcenter` 出现次数 = 0）：
 
 ```
 $ WOC_INSTANCE=woc-wx-2ada0225ca python3 wxsign.py honor
 ===== 荣耀商城（honor） appid=wx06a8d8c84a18be25 =====
   [ensure] 荣耀商城 → rc=0 (已就绪)
-     [honor] H5 = https://www.honor.com/cn/msale/mp/jobcenter.html?version=9
-     [honor] activityCode = QDHDz5SM67T65XPOBMBBQ1
-     [honor] 档期结束     = 2026-09-30 23:59:59+0800    已连续签到 = 1/5 天
-     [honor] 累计积分     = 8    今日可得 = 8    今天已签 = True
-     [honor] → 今日已签到（幂等，不发签到请求）
+     [honor] appId=wx06a8d8c84a18be25  取自 https://servicewechat.com/wx06a8d8c84a18be25/118/page-frame.html
+     [honor] cookie 23 条：euid=有  encryptRtNew=有  CSRF-TOKEN=有  variedData=2141 字节
+     [honor] 登录态：已登录 ✅   账号 190****7634 / uid 8550086500223209739
+  [ident] 账号 190****7634 / uid 8550086500223209739
+  [act] activityCode = QDHDz5SM67T65XPOBMBBQ1
+  [info] 档期至 2026-09-30 23:59:59+0800；连续 1/5 天；累计 8 分；今天已签=True
 RESULT honor code=415 msg=今日已签到（连续 1/5 天，累计 8 分）
 
 ========== 汇总 ==========
   ✅ 荣耀商城 415
 成功 1 / 失败 0
+
+总耗时: 32 秒
 ```
 
 > ⚠️ **上面没有一条是「未签 → 成功」的完整记录**：接入当天恰好已签。
-> 服务端对签到请求回的是正确的业务码（`task.center.today.aready.signin` / numCode 3027），
+> 服务端对签到请求回的是**正确的业务码**（`task.center.today.aready.signin` / numCode 3027），
 > 说明参数、认证、链路都对 —— 但**首次真签到成功后请回来把这一段补上**，
 > 并把 `brands.json` 里该条目的 `verified` 改成 `true`。

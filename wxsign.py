@@ -1915,21 +1915,46 @@ def do_sign_mx(brand, env):
     return mx_lottery.run(mode=mode, instance=INSTANCE, ctmp=CTMP, node=node, log=log)
 
 
-# ── 荣耀商城（honor）：第 8 个后端 ────────────────────────────────────────────
-def honor_sign(brand, wait=300):
-    """在微信容器里跑 `wxhonor.py signin --json`，返回它吐出的 dict（失败 None）。
+# ── 荣耀商城（honor）：第 8 个后端 —— **全链路纯 HTTP** ───────────────────────
+# 与其余 7 个后端最大的差别：荣耀的签到**不在小程序里**，在**任务中心 H5**。
+# 所以它既不能「读 storage 拿 token」，也不必「驱动 H5 点按钮」——
+# 而「不驱动任何界面」这件事是靠一个关键事实做到的（2026-09-28 实测）：
+#
+#   ① `activityCode`（每期会变的那个）能从 **H5 的 HTML** 里直接提出来
+#      （内联的组件属性 `data-activity-code`）—— 一次普通 GET，不要 cookie、不用开页面。
+#   ② 凭证全在 `.honor.com` 的 **cookie** 里（`euid` / `encryptRtNew` / `CSRF-TOKEN`），
+#      而 `Network.getAllCookies` 是 **browser 级**命令 —— attach 到**任意** target
+#      （哪怕只是小程序的 `page-frame.html`）就能读到整份 cookie jar
+#      → **不用打开那个 H5 就能取身份**（wxhonor.py ident）。
+#   ③ 剩下的就是两个 POST，纯 HTTP（下面的 honor_post）。
+#
+# ⚠️ 上一版实现是「attach 任务中心 H5 → 在页面内 fetch」，能用但依赖打开 H5。
+#    改纯 HTTP 后不但更干净，且 `activityCode` 自动跟随档期，**零人工**。
+#    实测 CsrfToken 其实可带可不带（cookie 里的就是它），这里仍带上以保真。
+HONOR_BASE = "https://openapi-cn.c.honor.com"
+_HONOR_HOST = HONOR_BASE.split("//", 1)[1]
+_HONOR_CONN = [None]
+# 承载签到组件的 H5。**不带 `?version=`** 也能拿到当前的页面内容（实测两者同字节），
+# 所以不依赖小程序下发的版本号 —— 这一层也是纯算的。
+HONOR_H5_URL = "https://www.honor.com/cn/msale/mp/jobcenter.html"
+# 页面 HTML 里内联的组件配置：<div class="J_mod sign-in-style4 …" data-activity-code="…">
+HONOR_ACTIVITY_RE = re.compile(r'data-activity-code="([^"]+)"')
 
-    与 oppo_ident 同一个套路：**容器内**执行（要 CDP + 窗口），宿主机读它打印的
-    `HONOR_JSON=` 一行。荣耀这边不需要 xdotool（签到不发鼠标事件 —— 全在 H5 里
-    发 fetch），所以比 OPPO 还干净。
+
+def honor_ident(brand, wait=200):
+    """在微信容器里跑 `wxhonor.py ident`，拿 `.honor.com` 的 cookie jar。
+
+    与 oppo_ident 同一个套路（**容器内**执行，宿主机读它打印的 `HONOR_IDENT=` 一行）。
+    差别是：OPPO 读的是 storage 里的 session，荣耀读的是 **CDP 的 cookie jar** ——
+    但两者都**不驱动界面**（荣耀连 H5 都不用打开）。
     """
     if not INSTANCE:
-        log("  [honor] 未设 WOC_INSTANCE → 起不了会话")
+        log("  [honor] 未设 WOC_INSTANCE → 取不到 cookie")
         return None
     ensure_helpers()
     try:
         p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
-                            cpath(CTMP, "wxhonor.py"), "signin", "--json"],
+                            cpath(CTMP, "wxhonor.py"), "ident"],
                            capture_output=True, text=True, timeout=wait)
     except Exception as e:                                  # noqa: BLE001
         log("  [honor] 执行异常：%s" % e)
@@ -1937,62 +1962,150 @@ def honor_sign(brand, wait=300):
     out = (p.stdout or "") + (p.stderr or "")
     got = None
     for line in out.splitlines():
-        if line.startswith("HONOR_JSON="):
+        if line.startswith("HONOR_IDENT="):
             try:
-                got = json.loads(line[len("HONOR_JSON="):])
+                got = json.loads(line[len("HONOR_IDENT="):])
             except ValueError:
                 pass
         elif line.strip():
             log("     " + line.strip()[:180])
     if not got:
-        log("  [honor] 没拿到结果（wxhonor.py rc=%s）" % p.returncode)
+        log("  [honor] 没拿到 ident（wxhonor.py rc=%s）" % p.returncode)
     return got
 
 
-def do_sign_honor(brand, env):
-    """荣耀商城「签到领积分」。返回 (是否成功, 业务码, 说明)。
+def honor_activity_code(brand, env):
+    """纯 HTTP 拉任务中心 H5 的 HTML，正则提 `activityCode`；失败返回 ""。
 
-    ⚠️ 与其余 7 个后端的**根本差别**：签到**不在小程序原生页，在 H5 里**。
-    小程序页面 `login4Qxmp`（标题「任务页面」）用 web-view 承载
-    `www.honor.com/cn/msale/mp/jobcenter.html`，签到逻辑全在那份 H5 里
-    （`sign_in_interactive.js`）。所以「打开小程序就能签」这句话在这里**不成立** ——
-    必须先 navigateTo 那个页面，再 attach 它的 webview target。
-
-    链路（细节与非猜测的来源见 wxhonor.py 的 docstring）：
-        wxhonor.py（容器内）→ 逻辑层 navigateTo 任务中心页 → 等 H5 target 出现
-        → attachToTarget(flatten) → 在页面内 fetch：
-            POST {openapiDomain}/tdcs/taskcenter/queryTaskCenterInfo   查今天签没签
-            POST {openapiDomain}/tdcs/taskcenter/taskCenterSignIn      签到
-    认证是 `.honor.com` 的 cookie（euid / encryptRtNew / CSRF-TOKEN），
-    **由页面自己带** —— 我们一个 cookie 都不碰，也不碰华为/荣耀账号密码。
-
-    `activityCode` 每期会变，但**零人工**：它是页面 HTML 里内联的组件属性
-    `.sign-in-style4[data-activity-code]`，现场读（所以 brands.json 里不用配）。
-
-    返回码：200 成功 / 415 今日已签（服务端 signInToday，幂等，不重复发请求）/
-            NOH5 连不上 H5（小程序没开 / hook 没挂）/ RISK 风控或需验证码（**不重试**）。
+    ⚠️ **不需要登录、不需要 cookie** —— jobcenter.html 是公开页。
+    这就是「每期换档期也零人工」的解法：属性名稳定（`data-activity-code`），
+    值随档期变，现场读。（比 OPPO 那边还要写一段发现逻辑更省事。）
     """
-    r = honor_sign(brand)
-    if not r:
-        return False, "NOH5", "连不上任务中心 H5（荣耀商城开着吗？hook 通吗？）"
-    if r.get("__exc__"):
-        return False, "ERRJS", "H5 里执行异常：%s" % str(r["__exc__"])[:160]
-    if r.get("err"):
-        return False, "NOH5", "H5 里没找到签到组件（%s）" % str(r["err"])[:120]
+    url = env.get("HONOR_H5_URL") or brand.get("honor_h5") or HONOR_H5_URL
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.honor.com/",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
+            html = r.read().decode("utf-8", "replace")
+    except Exception as e:                                  # noqa: BLE001
+        log("  [act] 拉 H5 失败：%s" % e)
+        return ""
+    m = HONOR_ACTIVITY_RE.search(html)
+    if not m:
+        log("  [act] HTML 里没有 data-activity-code（%d 字节；页面改版了？）" % len(html))
+        return ""
+    return m.group(1)
 
-    days = "%s/%s" % (r.get("continuousSignIn"), r.get("signInCycle"))
-    if r.get("signInToday") is True or r.get("alreadySigned"):
-        return True, "415", "今日已签到（连续 %s 天，累计 %s 分）" % (days, r.get("accumulatePoints"))
 
-    code = str(r.get("signCode") or "")
-    msg = str(r.get("signMsg") or "")
+def honor_post(path, body, ident, extra=None, retries=2):
+    """纯 HTTP POST。复用连接（理由同 _oppo_once：临时端口耗尽）。
+
+    传输层失败按 `_transport` 记（业务码在 body 的 `code` 里）；
+    只对**传输层**重试，业务码一律不重发。
+    """
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+        "Origin": "https://www.honor.com",
+        "Referer": "https://www.honor.com/cn/msale/mp/jobcenter.html",
+        "Cookie": ident.get("cookie", ""),
+    }
+    if ident.get("csrf"):
+        headers["CsrfToken"] = ident["csrf"]
+    headers.update(extra or {})
+    payload = json.dumps(body).encode()
+    last = {"_transport": 1, "msg": "未发出"}
+    for attempt in range(retries + 1):
+        try:
+            conn = _HONOR_CONN[0]
+            if conn is None:
+                conn = http.client.HTTPSConnection(_HONOR_HOST, timeout=20, context=_SSL)
+                _HONOR_CONN[0] = conn
+            conn.request("POST", path, body=payload, headers=headers)
+            r = conn.getresponse()
+            raw = r.read().decode(errors="replace")
+            try:
+                return json.loads(raw)
+            except ValueError:
+                last = {"_transport": 1, "msg": "HTTP %s 且非 JSON（前 160 字：%s）"
+                                                % (r.status, raw[:160])}
+        except Exception as e:                              # noqa: BLE001
+            _HONOR_CONN[0] = None
+            last = {"_transport": 1, "msg": "传输失败：%s" % e}
+        if attempt < retries:
+            time.sleep(1.5 * (attempt + 1))
+    return last
+
+
+def do_sign_honor(brand, env):
+    """荣耀商城「签到领积分」。返回 (是否成功, 业务码, 说明)。**全链路纯 HTTP。**
+
+    ⚠️ 与其余 7 个后端最大的差别：**签到不在小程序原生页，在任务中心 H5**
+    （小程序本身没有签到 —— 整包 grep 零命中）。但**不吃亏**：实测下来
+    这条链路的每一环都能纯算，连那个 H5 都不用打开：
+
+        ① cookie（euid/encryptRtNew/CSRF-TOKEN）← CDP 读 cookie jar，不碰界面
+        ② activityCode                       ← 纯 HTTP 拉 H5 的 HTML 再正则
+        ③ queryTaskCenterInfo / taskCenterSignIn ← 纯 HTTP POST
+
+    返回码：200 成功 / 415 今日已签（`signInToday`，幂等，不发签到请求）/
+            NOIDENT 取不到 cookie / NOLOGIN cookie 里没有登录凭证（要先 login）/
+            NOACT 提不出 activityCode / NETFAIL 传输失败 / RISK 风控（**不重试**）。
+    """
+    # ① 身份
+    ident = honor_ident(brand)
+    if not ident or not ident.get("ok"):
+        return False, "NOIDENT", "拿不到荣耀 cookie（荣耀商城开着吗？hook 通吗？）"
+    if not ident.get("has_login"):
+        return False, "NOLOGIN", ("cookie 里没有 euid/encryptRtNew → 这个微信还没绑荣耀账号；"
+                                  "先跑一次 `wxhonor.py login`（一辈子一次）")
+    log("  [ident] 账号 %s / uid %s" % (ident.get("user") or "?", ident.get("uid") or "?"))
+
+    # ② 活动 code（每期变，零人工）
+    ac = env.get("HONOR_ACTIVITY") or brand.get("honor_activity") or honor_activity_code(brand, env)
+    if not ac:
+        return False, "NOACT", "提不出 activityCode（H5 页面改版了？）"
+    log("  [act] activityCode = %s" % ac)
+    tp = str(env.get("HONOR_TASKPORTAL") or brand.get("honor_taskportal") or "4")
+
+    # ③ 幂等：查档期 / 进度
+    info = honor_post("/tdcs/taskcenter/queryTaskCenterInfo",
+                      {"activityCode": ac, "taskPortal": tp, "beCode": "CN"}, ident)
+    if info.get("_transport"):
+        return False, "NETFAIL", "查任务中心失败：%s" % str(info.get("msg"))[:120]
+    if str(info.get("code")) != "0":
+        return False, "FAIL", "查任务中心 code=%s（cookie 失效了？）" % info.get("code")
+    res = info.get("result") or {}
+    si = res.get("signInInfo") or {}
+    days = "%s/%s" % (si.get("continuousSignIn"), si.get("signInCycle"))
+    log("  [info] 档期至 %s；连续 %s 天；累计 %s 分；今天已签=%s"
+        % (res.get("endTime"), days, res.get("accumulatePoints"), si.get("signInToday")))
+    if si.get("signInToday") is True:
+        return True, "415", "今日已签到（连续 %s 天，累计 %s 分）" % (days, res.get("accumulatePoints"))
+
+    # ④ 签到
+    body = {
+        "activityCode": ac,
+        "taskPortal": tp,
+        "agent": UA,
+        "oas_refer": "https://www.honor.com/",
+        "variedData": (ident.get("jar") or {}).get("variedData"),
+    }
+    rr = honor_post("/tdcs/taskcenter/taskCenterSignIn", body, ident)
+    if rr.get("_transport"):
+        return False, "NETFAIL", "签到请求失败：%s" % str(rr.get("msg"))[:120]
+    code = str(rr.get("code") or "")
+    msg = str(rr.get("msg") or "")
     if code == "0":
-        res = r.get("signResult") if isinstance(r.get("signResult"), dict) else {}
-        pt = res.get("earnPoint")
-        return True, "200", "签到成功，+%s 积分（累计 %s）" % (pt, r.get("accumulatePoints"))
+        r2 = rr.get("result") if isinstance(rr.get("result"), dict) else {}
+        return True, "200", "签到成功，+%s 积分（连续 %s 天）" % (r2.get("earnPoint"), days)
     if "aready.signin" in code:
         return True, "415", "今日已签到（服务端判定，连续 %s 天）" % days
-
     low = (code + " " + msg).lower()
     if any(k in low for k in ("risk", "verify", "captcha", "geetest", "frequent", "风控", "验证")):
         return False, "RISK", "疑似风控/需验证码，不重试：%s" % (code or msg)[:120]

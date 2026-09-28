@@ -287,15 +287,27 @@ def cmd_login():
     ⚠️ 必须一气呵成：那个授权框是**微信原生**的（不在小程序 DOM 里），而且
       **会自动超时消失**（实测弹出来约半分钟不理会就没了）。实测它还**有延迟**：
       点完登录入口后不是立刻出现，所以这一轮要等得久一点（最多 ~24s）。
+
+    ⚠️ 登录凭证只活 **3 天**（`euid`/`encryptRtNew` 的 expires = 登录时刻 + 3 天，
+      不滑动），所以这个命令**不是「一辈子一次」** —— 引擎在凭证过期时会自动再跑它
+      （见 wxsign.py 的 `do_sign_honor`）。
+    ⚠️ 它**会先自己切到「我的」页**：登录入口只在那页上，引擎带着过期 cookie 进来时
+      小程序往往停在首页。
     """
     ws = _ws()
     ctx = pick_ctx(ws, ("[class*=u-login]", "[class*=login]"))
-    if not ctx:
-        print("[honor] 找不到登录入口所在的渲染面")
-        return 1
-    d = wxdom.rect_of(ws, ctx, LOGIN_WORDS)
+    d = wxdom.rect_of(ws, ctx, LOGIN_WORDS) if ctx else None
     if not d or not d["items"]:
-        print("[honor] 没有「%s」这类登录入口 → 可能已经登录" % "/".join(LOGIN_WORDS))
+        # 不在「我的」页（或该页还没渲染出登录入口）→ 切过去再找一次
+        print("[honor] 没看到登录入口 → 先切到「我的」页再找")
+        if cmd_personal() != 0:
+            return 1
+        time.sleep(4.0)
+        ws = _ws()
+        ctx = pick_ctx(ws, ("[class*=u-login]", "[class*=login]"))
+        d = wxdom.rect_of(ws, ctx, LOGIN_WORDS) if ctx else None
+    if not d or not d["items"]:
+        print("[honor] 还是没有「%s」这类登录入口 → 可能已经登录" % "/".join(LOGIN_WORDS))
         return 1
     btn = d["items"][0]                     # rect_of 已按面积升序：最小的是按钮本身
     ox, oy, dpr, note = origin(ws, ctx)
@@ -393,6 +405,10 @@ def cmd_tap():
 # `python3 wxhonor.py ident` → 打印一行 `HONOR_IDENT={...}`，引擎解析后用纯 HTTP 签到。
 
 HONOR_DOMAIN = "honor.com"
+# 登录凭证。实测 `expires` = **登录时刻 + 3 天**，且**不随请求滑动**
+# （2026-09-28：登录后半小时内发了十几次业务请求，expires 一直钉在登录时间 + 3 天）。
+# 所以引擎靠 `expires_in` 判断「要不要重新登录」—— 别等接口报错才发现。
+CRIT_COOKIES = ("euid", "encryptRtNew")
 _ID = [9000]
 
 
@@ -461,6 +477,7 @@ def cmd_ident():
     r = _cdp_wait(ws, wid, timeout=15.0, sid=sid)
     cookies = (((r or {}).get("result")) or {}).get("cookies") or []
     jar = {}
+    exps = {}
     for c in cookies:
         if not (c.get("domain") or "").endswith(HONOR_DOMAIN):
             continue
@@ -470,7 +487,10 @@ def cmd_ident():
         if n in jar and len(c.get("path") or "") < jar[n][0]:
             continue                      # 同名多条时取 path 更具体的那条
         jar[n] = (len(c.get("path") or ""), v)
+        exps[n] = c.get("expires")
     jar = {k: v for k, (_, v) in jar.items()}
+    crit = [e for k, e in exps.items()
+            if k in CRIT_COOKIES and isinstance(e, (int, float)) and e > 0]
     out = {
         "ok": True,
         "appid": APPID,
@@ -479,6 +499,8 @@ def cmd_ident():
         "jar": jar,
         "csrf": jar.get("CSRF-TOKEN", ""),
         "has_login": bool(jar.get("euid")) and bool(jar.get("encryptRtNew")),
+        # 登录凭证还剩多少秒（None = 拿不到过期时间）。引擎用它决定要不要先重新登录。
+        "expires_in": (int(min(crit) - time.time()) if crit else None),
         "uid": jar.get("uid", ""),
         "user": jar.get("user", ""),
     }
@@ -489,9 +511,14 @@ def cmd_ident():
         "有" if jar.get("encryptRtNew") else "**无**",
         "有" if jar.get("CSRF-TOKEN") else "**无**",
         ("%d 字节" % len(jar.get("variedData", ""))) if jar.get("variedData") else "**无**"))
-    print("[honor] 登录态：%s%s" % (
+    ei = out["expires_in"]
+    ttl = ""
+    if ei is not None:
+        ttl = ("；凭证还剩 %.1f 天" % (ei / 86400.0)) if ei > 0 else "；**凭证已过期**"
+    print("[honor] 登录态：%s%s%s" % (
         "已登录 ✅" if out["has_login"] else "**未登录**（先跑 wxhonor.py login）",
-        "   账号 %s / uid %s" % (out["user"], out["uid"]) if out["user"] else ""))
+        "   账号 %s / uid %s" % (out["user"], out["uid"]) if out["user"] else "",
+        ttl))
     print("HONOR_IDENT=" + json.dumps(out, ensure_ascii=False))
     return 0
 

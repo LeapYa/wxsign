@@ -1974,6 +1974,36 @@ def honor_ident(brand, wait=200):
     return got
 
 
+def honor_relogin(brand, wait=280):
+    """在容器里跑 `wxhonor.py login` —— 凭证过期后**自动重新登录**（尽力自愈）。
+
+    ⚠️ 这一步与「取 cookie」的区别：它是**唯一**需要驱动界面的环节 ——
+       要模拟点「点击账号登录」，再抓那个**微信原生**的手机号授权框（「允许」）点掉。
+       · 好处：全程自动，不需要人；微信手机号授权是**静默**的，不用你收短信。
+       · 风险：那个框**并非 100% 出现**（有 1~2s 延迟、约半分钟生存窗口，
+         短时间反复触发还可能被限流）。所以这是「尽力自愈」，不是保证 ——
+         失败时上层会退回 `NOLOGIN` 并在日志里写明要人工跑哪条命令。
+    """
+    if not INSTANCE:
+        log("  [relogin] 未设 WOC_INSTANCE → 跑不了")
+        return False
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxhonor.py"), "login"],
+                           capture_output=True, text=True, timeout=wait)
+    except Exception as e:                                  # noqa: BLE001
+        log("  [relogin] 执行异常：%s" % e)
+        return False
+    ok = False
+    for line in ((p.stdout or "") + (p.stderr or "")).splitlines():
+        if line.strip():
+            log("     " + line.strip()[:180])
+        if "已点「允许」" in line:
+            ok = True                     # wxhonor.py 自己也会复查弹窗有没有关掉
+    return ok
+
+
 def honor_activity_code(brand, env):
     """纯 HTTP 拉任务中心 H5 的 HTML，正则提 `activityCode`；失败返回 ""。
 
@@ -2061,10 +2091,25 @@ def do_sign_honor(brand, env):
     ident = honor_ident(brand)
     if not ident or not ident.get("ok"):
         return False, "NOIDENT", "拿不到荣耀 cookie（荣耀商城开着吗？hook 通吗？）"
-    if not ident.get("has_login"):
-        return False, "NOLOGIN", ("cookie 里没有 euid/encryptRtNew → 这个微信还没绑荣耀账号；"
-                                  "先跑一次 `wxhonor.py login`（一辈子一次）")
-    log("  [ident] 账号 %s / uid %s" % (ident.get("user") or "?", ident.get("uid") or "?"))
+
+    # ①b 凭证缺失 / 已过期 → **自动重新登录一次**。
+    #     实测 `euid`/`encryptRtNew` 的 expires = 登录时刻 + 3 天、**不随请求滑动**，
+    #     所以这个后端不是「登录一次就永久」—— 不处理的话第 4 天起会静默全线失败。
+    ei = ident.get("expires_in")
+    if (not ident.get("has_login")) or (ei is not None and ei <= 0):
+        why = ("没有登录凭证" if not ident.get("has_login")
+               else "凭证已过期 %.1f 小时" % (-ei / 3600.0))
+        log("  [ident] %s → 自动重新登录一次（走微信手机号授权）" % why)
+        if honor_relogin(brand):
+            ident = honor_ident(brand) or ident
+        if (not ident.get("has_login")) or ((ident.get("expires_in") or 0) <= 0):
+            return False, "NOLOGIN", (
+                "凭证%s，自动重新登录没成功（多半是微信那个「允许」框没弹出来 / 没点中）。"
+                "人工跑一次：容器内 `python3 wxhonor.py login`" % why)
+        log("  [ident] 重新登录成功")
+    log("  [ident] 账号 %s / uid %s；凭证还剩 %.1f 天" % (
+        ident.get("user") or "?", ident.get("uid") or "?",
+        (ident.get("expires_in") or 0) / 86400.0))
 
     # ② 活动 code（每期变，零人工）
     ac = env.get("HONOR_ACTIVITY") or brand.get("honor_activity") or honor_activity_code(brand, env)
@@ -2074,12 +2119,23 @@ def do_sign_honor(brand, env):
     tp = str(env.get("HONOR_TASKPORTAL") or brand.get("honor_taskportal") or "4")
 
     # ③ 幂等：查档期 / 进度
-    info = honor_post("/tdcs/taskcenter/queryTaskCenterInfo",
-                      {"activityCode": ac, "taskPortal": tp, "beCode": "CN"}, ident)
+    def _query(ident_):
+        return honor_post("/tdcs/taskcenter/queryTaskCenterInfo",
+                          {"activityCode": ac, "taskPortal": tp, "beCode": "CN"}, ident_)
+
+    info = _query(ident)
+    if str(info.get("code")) != "0" and not info.get("_transport"):
+        # 凭证看着没过期、服务端却不认（被踢下线 / 提前失效）→ 也补一次重登录再试
+        log("  [info] 查任务中心回 code=%s → 自动重新登录后重试一次" % info.get("code"))
+        if honor_relogin(brand):
+            ident2 = honor_ident(brand)
+            if ident2 and ident2.get("has_login"):
+                ident = ident2
+                info = _query(ident)
     if info.get("_transport"):
         return False, "NETFAIL", "查任务中心失败：%s" % str(info.get("msg"))[:120]
     if str(info.get("code")) != "0":
-        return False, "FAIL", "查任务中心 code=%s（cookie 失效了？）" % info.get("code")
+        return False, "FAIL", "查任务中心 code=%s（凭证失效且自动重登录没成功）" % info.get("code")
     res = info.get("result") or {}
     si = res.get("signInInfo") or {}
     days = "%s/%s" % (si.get("continuousSignIn"), si.get("signInCycle"))

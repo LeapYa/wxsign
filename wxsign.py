@@ -1974,6 +1974,35 @@ def honor_ident(brand, wait=200):
     return got
 
 
+def honor_sso(brand, wait=160):
+    """跑 `wxhonor.py sso` —— 借**华为账号 SID** 让业务 cookie 自动补回来。
+
+    ⭐ 这是凭证失效时的**首选**自愈路径，因为它**不需要任何弹窗 / 点击**：
+       荣耀有两套会话 —— `id1.cloud.huawei.com` 的 `sid`（华为账号，很持久）
+       与 `.honor.com` 的 `euid`/`encryptRtNew`（业务，只活 3 天）。
+       只要 SID 还在，打开一次 honor.com 的页面就会自动补发一套新的业务 cookie。
+    ⚠️ SID 也没了才需要退回 `honor_relogin()`（那一步才要点微信原生「允许」框）。
+    """
+    if not INSTANCE:
+        log("  [sso] 未设 WOC_INSTANCE → 跑不了")
+        return False
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxhonor.py"), "sso"],
+                           capture_output=True, text=True, timeout=wait)
+    except Exception as e:                                  # noqa: BLE001
+        log("  [sso] 执行异常：%s" % e)
+        return False
+    ok = False
+    for line in ((p.stdout or "") + (p.stderr or "")).splitlines():
+        if line.strip():
+            log("     " + line.strip()[:180])
+        if "SSO 成功" in line:
+            ok = True
+    return ok
+
+
 def honor_relogin(brand, wait=280):
     """在容器里跑 `wxhonor.py login` —— 凭证过期后**自动重新登录**（尽力自愈）。
 
@@ -2099,14 +2128,19 @@ def do_sign_honor(brand, env):
     if (not ident.get("has_login")) or (ei is not None and ei <= 0):
         why = ("没有登录凭证" if not ident.get("has_login")
                else "凭证已过期 %.1f 小时" % (-ei / 3600.0))
-        log("  [ident] %s → 自动重新登录一次（走微信手机号授权）" % why)
-        if honor_relogin(brand):
+        log("  [ident] %s → 先试 **SSO**：打开 honor.com 页面，借华为账号 SID 自动补 cookie"
+            "（不点按钮、不用弹窗）" % why)
+        if honor_sso(brand):
             ident = honor_ident(brand) or ident
         if (not ident.get("has_login")) or ((ident.get("expires_in") or 0) <= 0):
+            log("  [sso] 没补上 → 退回 login（这一步要点微信原生「允许」框）")
+            if honor_relogin(brand):
+                ident = honor_ident(brand) or ident
+        if (not ident.get("has_login")) or ((ident.get("expires_in") or 0) <= 0):
             return False, "NOLOGIN", (
-                "凭证%s，自动重新登录没成功（多半是微信那个「允许」框没弹出来 / 没点中）。"
+                "凭证%s；SSO 与自动重登录都没救回来（多半是华为账号 SID 也失效了）。"
                 "人工跑一次：容器内 `python3 wxhonor.py login`" % why)
-        log("  [ident] 重新登录成功")
+        log("  [ident] 凭证已恢复")
     log("  [ident] 账号 %s / uid %s；凭证还剩 %.1f 天" % (
         ident.get("user") or "?", ident.get("uid") or "?",
         (ident.get("expires_in") or 0) / 86400.0))

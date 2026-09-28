@@ -449,35 +449,30 @@ def pick_miniapp_target(ws):
     return None
 
 
-def cmd_ident():
-    """读 `.honor.com` 的 cookie jar → 打印 `HONOR_IDENT={...}`。
+def read_jar():
+    """读 `.honor.com` 的 cookie jar。
 
-    输出：`{"ok":true, "appid":…, "target":…, "cookie":"k=v; k=v; …", "jar":{…},
-            "csrf":…, "has_login":bool, "uid":…, "user":…}`
-
-    引擎把 `cookie` 直接当 `Cookie:` 头用 —— 签到全流程纯 HTTP
-    （见 wxsign.py 的 `do_sign_honor`）。
+    返回 `{"ok":True, "target":…, "jar":{name:value}, "exps":{name:expires}}`；
+    失败返回 `{"ok":False, "err":…}`。
     """
+    out = {"ok": False}
     ws = wxcdp.WS(timeout=25)
     _cdp_send(ws, "Target.setDiscoverTargets", {"discover": True})
     time.sleep(1.0)
     t = pick_miniapp_target(ws)
     if not t:
-        print("[honor] 没找到小程序 target（荣耀商城开着吗？hook 通吗？）")
-        print("HONOR_IDENT=" + json.dumps({"ok": False, "err": "no-miniapp-target"}))
-        return 1
+        out["err"] = "no-miniapp-target"
+        return out
     wid = _cdp_send(ws, "Target.attachToTarget", {"targetId": t["targetId"], "flatten": True})
     sid = (((_cdp_wait(ws, wid) or {}).get("result")) or {}).get("sessionId")
     if not sid:
-        print("[honor] attachToTarget 失败")
-        print("HONOR_IDENT=" + json.dumps({"ok": False, "err": "attach-failed"}))
-        return 1
+        out["err"] = "attach-failed"
+        return out
     # 🔑 browser 级命令 —— 返回的是**整份** cookie jar（所有域名），与 attach 到谁无关
     wid = _cdp_send(ws, "Network.getAllCookies", {}, sid=sid)
     r = _cdp_wait(ws, wid, timeout=15.0, sid=sid)
     cookies = (((r or {}).get("result")) or {}).get("cookies") or []
-    jar = {}
-    exps = {}
+    jar, exps = {}, {}
     for c in cookies:
         if not (c.get("domain") or "").endswith(HONOR_DOMAIN):
             continue
@@ -488,23 +483,43 @@ def cmd_ident():
             continue                      # 同名多条时取 path 更具体的那条
         jar[n] = (len(c.get("path") or ""), v)
         exps[n] = c.get("expires")
-    jar = {k: v for k, (_, v) in jar.items()}
-    crit = [e for k, e in exps.items()
+    out.update({"ok": True, "target": (t.get("url") or "")[:120],
+                "jar": {k: v for k, (_, v) in jar.items()}, "exps": exps})
+    return out
+
+
+def _summarize(jar, exps):
+    """把 cookie jar 压成引擎要的那几个字段。"""
+    crit = [e for k, e in (exps or {}).items()
             if k in CRIT_COOKIES and isinstance(e, (int, float)) and e > 0]
-    out = {
-        "ok": True,
-        "appid": APPID,
-        "target": (t.get("url") or "")[:120],
+    return {
         "cookie": "; ".join("%s=%s" % (k, v) for k, v in jar.items()),
         "jar": jar,
         "csrf": jar.get("CSRF-TOKEN", ""),
         "has_login": bool(jar.get("euid")) and bool(jar.get("encryptRtNew")),
-        # 登录凭证还剩多少秒（None = 拿不到过期时间）。引擎用它决定要不要先重新登录。
+        # 登录凭证还剩多少秒（None = 拿不到过期时间）。引擎用它决定要不要先续期。
         "expires_in": (int(min(crit) - time.time()) if crit else None),
         "uid": jar.get("uid", ""),
         "user": jar.get("user", ""),
     }
-    print("[honor] appId=%s  取自 %s" % (APPID, out["target"][:70]))
+
+
+def cmd_ident():
+    """读 `.honor.com` 的 cookie jar → 打印 `HONOR_IDENT={...}`。
+
+    输出：`{"ok":true, "appid":…, "target":…, "cookie":"k=v; k=v; …", "jar":{…},
+            "csrf":…, "has_login":bool, "expires_in":秒|null, "uid":…, "user":…}`
+
+    引擎把 `cookie` 直接当 `Cookie:` 头用 —— 签到全流程纯 HTTP（见 wxsign.py）。
+    """
+    r = read_jar()
+    if not r.get("ok"):
+        print("[honor] 读不到 cookie：%s（荣耀商城开着吗？hook 通吗？）" % r.get("err"))
+        print("HONOR_IDENT=" + json.dumps({"ok": False, "err": r.get("err")}))
+        return 1
+    jar = r["jar"]
+    out = dict(_summarize(jar, r["exps"]), ok=True, appid=APPID, target=r["target"])
+    print("[honor] appId=%s  取自 %s" % (APPID, r["target"][:70]))
     print("[honor] cookie %d 条：euid=%s  encryptRtNew=%s  CSRF-TOKEN=%s  variedData=%s" % (
         len(jar),
         "有" if jar.get("euid") else "**无**",
@@ -516,18 +531,82 @@ def cmd_ident():
     if ei is not None:
         ttl = ("；凭证还剩 %.1f 天" % (ei / 86400.0)) if ei > 0 else "；**凭证已过期**"
     print("[honor] 登录态：%s%s%s" % (
-        "已登录 ✅" if out["has_login"] else "**未登录**（先跑 wxhonor.py login）",
+        "已登录 ✅" if out["has_login"] else "**未登录**",
         "   账号 %s / uid %s" % (out["user"], out["uid"]) if out["user"] else "",
         ttl))
     print("HONOR_IDENT=" + json.dumps(out, ensure_ascii=False))
     return 0
 
 
+def cmd_sso(open_wait=20.0):
+    """让 `.honor.com` 的 cookie 借 **华为账号 SID** 自动补回来 —— **不需要任何弹窗**。
+
+    ⭐ 原理（2026-09-28 实测）：荣耀这边有**两套会话**，别搞混 ——
+
+        · **华为账号会话**：`id1.cloud.huawei.com` 的 `sid` / `hwid_cas_sid`（很持久。
+          它才是「你是谁」的根，也是小程序「我的」页显示已登录的依据）
+        · **业务会话**：`.honor.com` 的 `euid` / `encryptRtNew`（**只活 3 天**，签到用它）
+
+    只要 SID 还在，**打开一次 honor.com 的页面**（任务中心 H5 一加载就会调 `queryUserInfo`）
+    → 服务端发现「本人已登录、但业务会话没了」→ **自动下发一套新的 `.honor.com` cookie**。
+    实测：把 `.honor.com` 的 6 个登录 cookie 全删掉后再打开一次，
+    `euid` / `encryptRtNew` / `CSRF-TOKEN` **全部回来（且是新值）**。
+
+    ✅ 所以这是**比 `login` 可靠得多**的自愈路径：不点按钮、不依赖微信原生弹窗、
+       不碰 xdotool —— 只要一句逻辑层 `navigateTo` + 等它加载。
+    ⚠️ 前提是 **SID 也还活着**。SID 都没了才需要 `login`（那一步要点「允许」框，见 cmd_login）。
+    """
+    ws = _ws()
+    probe = ("(function(){try{return (typeof wx!=='undefined'&&typeof wx.navigateTo==='function')"
+             "?(wx.getAccountInfoSync().miniProgram.appId+'|'+(getCurrentPages().slice(-1)[0]||{}).route)"
+             ":'no'}catch(e){return 'ERR'}})()")
+    hit = None
+    for ctx, v in _broadcast_pick(ws, probe, timeout=15.0):
+        if isinstance(v, str) and v.startswith("wx"):
+            app, _, route = v.partition("|")
+            if app != APPID:
+                print("[honor] ⚠️ 当前小程序 appId=%s ≠ 荣耀商城 %s" % (app, APPID))
+                return 1
+            hit = (ctx, route)
+            break
+    if not hit:
+        print("[honor] 找不到逻辑层 ctx（荣耀商城没开着？）")
+        return 1
+    ctx, route = hit
+    print("[honor] 逻辑层 ctx=%d route=%s" % (ctx, route or "-"))
+    if not (route or "").startswith("packageActivity/pages/login4Qxmp"):
+        expr = "wx.navigateTo({url:'%s'})||'ok'" % TASK_PAGE
+        ws.send({"id": 8600, "method": "Runtime.evaluate",
+                 "params": {"expression": expr, "contextId": ctx, "returnByValue": True}})
+        print("[honor] → navigateTo 任务中心（目的不是看页面，是让 honor.com 域发请求触发 SSO）")
+    else:
+        print("[honor] 已在任务中心页（H5 在 onShow 时会自己请求）")
+    print("[honor] 等 %ds 让 H5 加载 + SSO 下发 cookie…" % int(open_wait))
+    time.sleep(open_wait)
+
+    r = read_jar()
+    if not r.get("ok"):
+        print("[honor] 读 cookie 失败：%s" % r.get("err"))
+        return 1
+    s = _summarize(r["jar"], r["exps"])
+    print("[honor] 复查：euid=%s  encryptRtNew=%s  CSRF-TOKEN=%s" % (
+        "有" if r["jar"].get("euid") else "**无**",
+        "有" if r["jar"].get("encryptRtNew") else "**无**",
+        "有" if r["jar"].get("CSRF-TOKEN") else "**无**"))
+    if s["has_login"] and (s["expires_in"] is None or s["expires_in"] > 0):
+        print("[honor] SSO 成功 ✅ 业务 cookie 已恢复（账号 %s，还剩 %.1f 天）" % (
+            s["user"] or "?", (s["expires_in"] or 0) / 86400.0))
+        print("HONOR_IDENT=" + json.dumps(dict(s, ok=True, appid=APPID), ensure_ascii=False))
+        return 0
+    print("[honor] SSO 没能恢复 cookie（SID 可能也没了 → 退回 wxhonor.py login）")
+    return 1
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     fn = {"status": cmd_status, "origin": cmd_origin, "agree": cmd_agree,
           "login": cmd_login, "personal": cmd_personal, "tap": cmd_tap,
-          "ident": cmd_ident}.get(cmd)
+          "ident": cmd_ident, "sso": cmd_sso}.get(cmd)
     if not fn:
         print(__doc__)
         return 2

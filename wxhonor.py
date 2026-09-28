@@ -56,14 +56,18 @@
     python3 wxhonor.py personal # 逻辑层 wx.switchTab 跳到「我的」页
     python3 wxhonor.py tap <文案>  # 按文案点（现取坐标）
 """
+import http.client
 import json
+import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, "/tmp")
 import wxcdp
 import wxdom
+import wxnet            # 复用它的 find_logic_ctx / eval_in（逻辑层求值）
 import wxqm_auth          # 复用它的 find_allow_btn（微信原生授权框的唯一判据）
 import wxreg
 
@@ -602,11 +606,121 @@ def cmd_sso(open_wait=20.0):
     return 1
 
 
+def cmd_wxlogin():
+    """⭐ **纯 API 登录**：用 `wx.login` 的 code 换一整套 `.honor.com` cookie。**零 UI。**
+
+    这是本后端**最优**的续期路径（2026-09-28 实测）—— 不点按钮、不用弹窗、不开页面。
+
+    链路（来自包内 `mpUtils` 的请求拦截器，不是猜的）：
+
+        wx.login()  →  code
+        POST /mcp/account/wxQuickLogin
+             {code, timeout:1e4, type:"wxMiniProgram", country:"CN", portal:4,
+              lang:"zh-CN", iv:"", encryptedData:"", userName:"", headImgUrl:"", loginUrl:""}
+          → 响应 **Set-Cookie**：euid / uid / user / hasphone / hasmail / __ukmc / rush_* / HShop-AB
+          → 响应 **body** 里的 `refreshToken`（305 字符）**就是** cookie 里的 `encryptRtNew`
+
+    实测（只带 code，`iv`/`encryptedData` 都空）：`{"code":"0","msg":"login success"}`，
+    拿到的凭证直接能调 `queryTaskCenterInfo`（HTTP 200）。
+
+    ⚠️ **只带 code 能通，是因为它靠微信 unionId 认人** —— 所以接口叫「快捷登录」，
+       前提是这个微信**以前绑定过**荣耀账号。没绑定过它会失败，那一步绕不开
+       `getPhoneNumber`（手机号授权，见 `cmd_login`）。
+    ⚠️ 包内同一条链路还有**另一种**用法：把 `getPhoneNumber` 拿到的
+       `iv` / `encryptedData` 一起带上 → 一次性完成「注册 + 登录」。
+       那条我们不做（它必须用户点按钮触发，见 README）。
+    """
+    ws = _ws()
+    expr = ("(function(){try{return (typeof wx!=='undefined'&&typeof wx.login==='function')"
+            "?wx.getAccountInfoSync().miniProgram.appId:'no'}catch(e){return 'ERR'}})()")
+    ctx = 0
+    for c, v in _broadcast_pick(ws, expr, timeout=15.0):
+        if isinstance(v, str) and v == APPID:
+            ctx = c
+            break
+    if not ctx:
+        print("[honor] 找不到荣耀商城的逻辑层 ctx（小程序开着吗？）")
+        print("HONOR_IDENT=" + json.dumps({"ok": False, "err": "no-logic-ctx"}))
+        return 1
+    print("[honor] 逻辑层 ctx=%d" % ctx)
+
+    # ① wx.login → code（**纯 API，静默**）
+    code_expr = ("(function(){return new Promise(function(res){"
+                 "wx.login({success:function(r){res(r.code||'')},"
+                 "fail:function(){res('')}})})})()")
+    code = wxnet.eval_in(ws, ctx, code_expr, wait=15)[0]
+    if not code or not isinstance(code, str) or len(code) < 8:
+        print("[honor] wx.login 没拿到 code：%s" % str(code)[:80])
+        print("HONOR_IDENT=" + json.dumps({"ok": False, "err": "no-code"}))
+        return 1
+    print("[honor] wx.login code = %s（%d 字符）" % (code[:16] + "…", len(code)))
+
+    # ② CsrfToken（storage 的 ct；包内会在登录前清掉再重取一次，我们直接用现有的）
+    ct = wxnet.eval_in(ws, ctx, "wx.getStorageSync('ct')||''", wait=8)[0] or ""
+
+    # ③ 纯 HTTP 调 wxQuickLogin
+    payload = {
+        "code": code, "timeout": 10000, "type": "wxMiniProgram", "country": "CN",
+        "portal": 4, "lang": "zh-CN", "iv": "", "encryptedData": "",
+        "userName": "", "headImgUrl": "", "loginUrl": "",
+    }
+    url = "https://openapi-cn.c.honor.com/mcp/account/wxQuickLogin"
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json", "CsrfToken": str(ct),
+                 "User-Agent": ("Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"),
+                 "Origin": "https://www.honor.com", "Referer": "https://www.honor.com/"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            set_cookies = r.headers.get_all("Set-Cookie") or []
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:                                  # noqa: BLE001
+        print("[honor] wxQuickLogin 请求失败：%s" % e)
+        print("HONOR_IDENT=" + json.dumps({"ok": False, "err": "login-http-fail"}))
+        return 1
+    print("[honor] wxQuickLogin → code=%s msg=%s（Set-Cookie %d 条）"
+          % (data.get("code"), data.get("msg"), len(set_cookies)))
+
+    # ④ 拼 cookie：Set-Cookie 里的 + refreshToken → encryptRtNew + 浏览器里的 variedData
+    jar = {}
+    for s in set_cookies:
+        kv = s.split(";")[0]
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k in ("code", "type"):        # 登录过程的临时 cookie，不带
+                continue
+            jar[k] = v
+    if data.get("refreshToken"):
+        jar["encryptRtNew"] = data["refreshToken"]
+    if data.get("euid"):
+        jar["euid"] = data["euid"]
+
+    # variedData（设备指纹）只在浏览器 cookie 里有 —— 从那里补
+    rj = read_jar()
+    if rj.get("ok"):
+        for k in ("variedData",):
+            if not jar.get(k) and rj["jar"].get(k):
+                jar[k] = rj["jar"][k]
+
+    out = dict(_summarize(jar, {}), ok=True, appid=APPID,
+               target=url, source="wxQuickLogin(纯API)")
+    print("[honor] 拼出 %d 个 cookie：%s" % (
+        len(jar), ", ".join("%s(%d)" % (k, len(v)) for k, v in jar.items())))
+    if out["has_login"]:
+        print("[honor] 纯 API 登录成功 ✅ 账号 %s / uid %s" % (out["user"] or "?", out["uid"] or "?"))
+    else:
+        print("[honor] ⚠️ 缺 euid/encryptRtNew —— 可能这个微信没绑定过荣耀账号")
+    print("HONOR_IDENT=" + json.dumps(out, ensure_ascii=False))
+    return 0 if out["has_login"] else 1
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     fn = {"status": cmd_status, "origin": cmd_origin, "agree": cmd_agree,
           "login": cmd_login, "personal": cmd_personal, "tap": cmd_tap,
-          "ident": cmd_ident, "sso": cmd_sso}.get(cmd)
+          "ident": cmd_ident, "sso": cmd_sso, "wxlogin": cmd_wxlogin}.get(cmd)
     if not fn:
         print(__doc__)
         return 2

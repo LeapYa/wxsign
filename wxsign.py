@@ -1974,6 +1974,54 @@ def honor_ident(brand, wait=200):
     return got
 
 
+def _ident_ok(i):
+    """凭证可用吗？—— `has_login` 为真，且 `expires_in` **不是明确的负数**。
+
+    ⚠️ `expires_in` 可能是 `None`（拿不到过期时间，例如纯 API 登录拿到的 Set-Cookie
+       是会话 cookie、没有 Max-Age）—— 那**不算过期**，别写成 `(x or 0) <= 0` 那样会把
+       它误判成失效（写错过一次：纯 API 登录明明成功了，却被判成「没救回来」）。
+    """
+    if not (i or {}).get("has_login"):
+        return False
+    ei = (i or {}).get("expires_in")
+    return not (isinstance(ei, (int, float)) and ei <= 0)
+
+
+def honor_wxlogin(brand, wait=150):
+    """跑 `wxhonor.py wxlogin` —— ⭐ **纯 API 登录**（`wx.login` 的 code → 换 cookie），**零 UI**。
+
+    这是凭证失效时的**首选**路径：不点按钮、不开页面、不碰弹窗 ——
+    一次 `wx.login` + 一次 POST 就换回**全新**的一套 `.honor.com` cookie
+    （含 `euid` / `encryptRtNew`）。返回的 `HONOR_IDENT` 已经是**拼好可直接用**的
+    cookie jar（与 `honor_ident` 同格式），所以上层可以整份替换掉旧 ident。
+
+    ⚠️ 前提是这个微信**以前绑定过**荣耀账号（接口靠微信 unionId 认人，所以叫「快捷登录」）。
+       没绑过它会失败 → 上层退 SSO / login。
+    """
+    if not INSTANCE:
+        log("  [wxlogin] 未设 WOC_INSTANCE → 跑不了")
+        return None
+    ensure_helpers()
+    try:
+        p = subprocess.run(["docker", "exec", "-e", "DISPLAY=:1", INSTANCE, CPY,
+                            cpath(CTMP, "wxhonor.py"), "wxlogin"],
+                           capture_output=True, text=True, timeout=wait)
+    except Exception as e:                                  # noqa: BLE001
+        log("  [wxlogin] 执行异常：%s" % e)
+        return None
+    out = (p.stdout or "") + (p.stderr or "")
+    got = None
+    for line in out.splitlines():
+        if line.startswith("HONOR_IDENT="):
+            try:
+                got = json.loads(line[len("HONOR_IDENT="):])
+            except ValueError:
+                pass
+        elif line.strip():
+            log("     " + line.strip()[:180])
+    return got
+
+
 def honor_sso(brand, wait=160):
     """跑 `wxhonor.py sso` —— 借**华为账号 SID** 让业务 cookie 自动补回来。
 
@@ -2125,25 +2173,34 @@ def do_sign_honor(brand, env):
     #     实测 `euid`/`encryptRtNew` 的 expires = 登录时刻 + 3 天、**不随请求滑动**，
     #     所以这个后端不是「登录一次就永久」—— 不处理的话第 4 天起会静默全线失败。
     ei = ident.get("expires_in")
-    if (not ident.get("has_login")) or (ei is not None and ei <= 0):
+    if not _ident_ok(ident):
         why = ("没有登录凭证" if not ident.get("has_login")
-               else "凭证已过期 %.1f 小时" % (-ei / 3600.0))
-        log("  [ident] %s → 先试 **SSO**：打开 honor.com 页面，借华为账号 SID 自动补 cookie"
-            "（不点按钮、不用弹窗）" % why)
-        if honor_sso(brand):
-            ident = honor_ident(brand) or ident
-        if (not ident.get("has_login")) or ((ident.get("expires_in") or 0) <= 0):
-            log("  [sso] 没补上 → 退回 login（这一步要点微信原生「允许」框）")
+               else "凭证已过期 %.1f 小时" % (-(ei or 0) / 3600.0))
+        # ① 纯 API 登录 —— 首选：wx.login 的 code → 换一套全新 cookie，零 UI
+        log("  [ident] %s → ① 先试 **纯 API 登录**（wx.login 的 code → 换 cookie，零 UI）" % why)
+        got = honor_wxlogin(brand)
+        if got and _ident_ok(got):
+            ident = got
+        # ② SSO —— 打开 honor.com 页面，借华为账号 SID 补 cookie
+        if not _ident_ok(ident):
+            log("  [wxlogin] 没成 → ② 退回 **SSO**（打开 honor.com 页面，借华为账号 SID）")
+            if honor_sso(brand):
+                ident = honor_ident(brand) or ident
+        # ③ login —— 点「点击账号登录」+ 抓微信原生「允许」框（要手机号授权）
+        if not _ident_ok(ident):
+            log("  [sso] 也没成 → ③ 退回 **login**（要点微信原生「允许」框）")
             if honor_relogin(brand):
                 ident = honor_ident(brand) or ident
-        if (not ident.get("has_login")) or ((ident.get("expires_in") or 0) <= 0):
+        if not _ident_ok(ident):
             return False, "NOLOGIN", (
-                "凭证%s；SSO 与自动重登录都没救回来（多半是华为账号 SID 也失效了）。"
-                "人工跑一次：容器内 `python3 wxhonor.py login`" % why)
+                "凭证%s；纯 API 登录 / SSO / 自动登录三级都没救回来。"
+                "人工跑一次：容器内 `python3 wxhonor.py wxlogin`（先试这个，它不用弹窗）" % why)
         log("  [ident] 凭证已恢复")
-    log("  [ident] 账号 %s / uid %s；凭证还剩 %.1f 天" % (
+    _ei = ident.get("expires_in")
+    log("  [ident] 账号 %s / uid %s；凭证%s" % (
         ident.get("user") or "?", ident.get("uid") or "?",
-        (ident.get("expires_in") or 0) / 86400.0))
+        ("还剩 %.1f 天" % (_ei / 86400.0)) if isinstance(_ei, (int, float))
+        else "来源=%s（拿不到过期时间）" % (ident.get("source") or "cookie jar")))
 
     # ② 活动 code（每期变，零人工）
     ac = env.get("HONOR_ACTIVITY") or brand.get("honor_activity") or honor_activity_code(brand, env)
@@ -2160,12 +2217,14 @@ def do_sign_honor(brand, env):
     info = _query(ident)
     if str(info.get("code")) != "0" and not info.get("_transport"):
         # 凭证看着没过期、服务端却不认（被踢下线 / 提前失效）→ 也补一次重登录再试
-        log("  [info] 查任务中心回 code=%s → 自动重新登录后重试一次" % info.get("code"))
-        if honor_relogin(brand):
+        log("  [info] 查任务中心回 code=%s → 先试纯 API 登录再重试一次" % info.get("code"))
+        ident2 = honor_wxlogin(brand)
+        if not (ident2 and _ident_ok(ident2)):
+            honor_relogin(brand)
             ident2 = honor_ident(brand)
-            if ident2 and ident2.get("has_login"):
-                ident = ident2
-                info = _query(ident)
+        if ident2 and _ident_ok(ident2):
+            ident = ident2
+            info = _query(ident)
     if info.get("_transport"):
         return False, "NETFAIL", "查任务中心失败：%s" % str(info.get("msg"))[:120]
     if str(info.get("code")) != "0":

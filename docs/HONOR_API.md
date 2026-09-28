@@ -235,7 +235,64 @@ HONOR_ACTIVITY_RE = re.compile(r'data-activity-code="([^"]+)"')
 >    「领更多积分」—— **按文案判断今天签没签必然错**，要用 `signInToday`。
 > 2. `.continuous-days` 那个 `SPAN`（「已签到 1 天」）也是运行时渲染的，同理别当判据。
 
-## 六、登录与续期（`wxhonor.py login`）
+## 六、登录与续期
+
+### ⭐⭐⭐ 最优路径：**纯 API 登录**（`wx.login` 的 code → 换 cookie）—— 零 UI
+
+**这一条几乎把「登录」这个词的复杂度降到零**：不用点按钮、不用弹窗、不用开页面。
+
+包内 `mpUtils` 的请求拦截器里明写着（不是猜的）：
+
+```js
+if (-1 == n.url.indexOf("mcp/account/wxQuickLogin")) { t.next = 5; break }
+return t.next = 3, getApp().globalData.mpUtils.requestWXLoginCode();   // = wx.login()
+case 3:
+  n.data.code = t.sent;                                                  // ← code 塞进请求体
+...
+mpPromisePost(openApiDomain + "/mcp/account/wxQuickLogin", e, {CsrfToken: t})
+  → t.data.unionId / t.data.refreshToken
+```
+
+**实测（只带 code，`iv` / `encryptedData` 都留空）**：
+
+```http
+POST https://openapi-cn.c.honor.com/mcp/account/wxQuickLogin
+Content-Type: application/json
+CsrfToken: <storage 里的 ct>
+Origin: https://www.honor.com
+
+{"code":"<wx.login 的 code>","timeout":10000,"type":"wxMiniProgram","country":"CN",
+ "portal":4,"lang":"zh-CN","iv":"","encryptedData":"","userName":"","headImgUrl":"","loginUrl":""}
+
+→ 200  {"code":"0","msg":"login success",
+        "euid":"7ce15ea8…",
+        "openId":"ogZ9B5QvKGnm5nfmhkWTH88MVI-8",
+        "refreshToken":"secvmall00012ETMsDgAAAaDmVOvU…"（305 字符）}
+   Set-Cookie（22 条）：euid / uid / user / hasphone / hasmail / __ukmc / rush_* / HShop-AB …
+```
+
+**关键对应关系**：响应 body 里的 **`refreshToken`（305 字符）就是 cookie 里的 `encryptRtNew`**
+（格式完全一样，都是 `secvmall00012ETMsDgAAAaDm…`）。拼起来就是一套可用凭证：
+
+```
+cookie = Set-Cookie 的（euid / uid / user / hasphone / hasmail / __ukmc / rush_* / HShop-AB）
+       + encryptRtNew = <body 的 refreshToken>
+       + variedData   = <浏览器 cookie 里的设备指纹>
+```
+
+**实测：这套 cookie 直接能调 `queryTaskCenterInfo`（HTTP 200 + 正常数据）** —— 也就是**能签到**。
+
+> ⚠️ **前提**：只带 `code` 能通，是因为接口靠**微信 unionId** 认人（所以它叫「快捷登录」）——
+> 这个微信**以前绑定过**荣耀账号。**没绑定过**会失败，那一步绕不开 `getPhoneNumber`。
+>
+> 💡 包内同一条链路还有**另一种**用法：把 `getPhoneNumber` 拿到的 `iv` / `encryptedData`
+> 一起带上 → 一次性完成「注册 + 登录」。**那条我们不做** —— 微信强制
+> `getPhoneNumber` 必须由用户点击事件触发（见下），做不到纯 API。
+>
+> 📌 **一句话**：**已绑定的账号，登录完全不需要界面**；只有「首次把这个微信绑到荣耀账号」
+> 才需要一次手机号授权。
+
+## 六·补、UI 登录（`wxhonor.py login`）—— 只作兜底
 
 **微信手机号授权 = 自动注册 / 登录荣耀账号**（包内文案原文）：
 
@@ -262,37 +319,38 @@ HONOR_ACTIVITY_RE = re.compile(r'data-activity-code="([^"]+)"')
 | 微信原生「允许」框 | **像素判据**（逐行扫绿色、按 x 中心聚类、宽 100~260 高 28~80） |
 | 页面坐标 → 屏幕坐标 | **窗口原点 + 逻辑层 `safeArea.top`**（⚠️ 不是 `outerHeight-innerHeight`，见第七节） |
 
-### ⭐⭐ 引擎怎么处理过期：**三级自愈**（`do_sign_honor`）
+### ⭐⭐ 引擎怎么处理凭证失效：**四级自愈**（`do_sign_honor`）
 
 ```
 ① 读 cookie 时顺带算 expires_in（关键 cookie 的最小剩余秒数）
 ② has_login==False 或 expires_in<=0 →
-     先试 **SSO**：逻辑层 navigateTo 任务中心 → 让 honor.com 域发请求
-                  → 服务端借**华为账号 SID** 自动补发一套新的业务 cookie
-                  ✅ 不点按钮、不依赖任何弹窗、不碰 xdotool
-③ SSO 没补上 → 才退回 `wxhonor.py login`（这一步要点微信原生「允许」框）
-④ 都不行 → 报 NOLOGIN（并在日志里给出人工命令）
-⑤ 另外：接口回非 0（凭证被提前失效）→ 也补一次 SSO + 重试一次
+     ① **纯 API 登录**：wx.login() → code → POST /mcp/account/wxQuickLogin
+        → 换回**全新一套** cookie（euid / encryptRtNew / …）
+        ✅ **零 UI、零弹窗、零页面** —— 最快最纯，首选
+     ② **SSO**：逻辑层 navigateTo 任务中心 → 让 honor.com 域发请求
+        → 服务端借**华为账号 SID** 自动补发新 cookie
+        ✅ 零弹窗，但要等 H5 加载（~20s）
+     ③ **login**：点「点击账号登录」+ 抓**微信原生「允许」框**（手机号授权）
+        ⚠️ 唯一需要弹窗的一级，只在 ①② 都失败时才走到
+     ④ 都不行 → 报 NOLOGIN（给出人工命令）
+③ 另外：接口回非 0（凭证被提前失效）→ 也补一次 ① + 重试一次
 ```
 
-**实测**（2026-09-28，把 `.honor.com` 的 7 个登录 cookie 全删掉模拟到期后跑引擎）：
+**实测（把 `.honor.com` 的 7 个登录 cookie 全删掉模拟到期）**：
 
 ```
-[ident] 没有登录凭证 → 先试 **SSO**：打开 honor.com 页面，借华为账号 SID 自动补 cookie（不点按钮、不用弹窗）
-  [honor] 逻辑层 ctx=3 route=pages/webview/webview
-  [honor] → navigateTo 任务中心（目的不是看页面，是让 honor.com 域发请求触发 SSO）
-  [honor] 等 20s 让 H5 加载 + SSO 下发 cookie…
-  [honor] 复查：euid=有  encryptRtNew=有  CSRF-TOKEN=有
-  [honor] SSO 成功 ✅ 业务 cookie 已恢复（账号 190****7634，还剩 3.0 天）
-  [ident] 凭证已恢复
-  [act] activityCode = QDHDz5SM67T65XPOBMBBQ1
-  [info] 档期至 2026-09-30 23:59:59+0800；连续 1/5 天；累计 8 分；今天已签=True
+[ident] 没有登录凭证 → ① 先试 **纯 API 登录**（wx.login 的 code → 换 cookie，零 UI）
+  [honor] wx.login code = 0f1CIU2w3DKuO73L…（32 字符）
+  [honor] wxQuickLogin → code=0 msg=login success（Set-Cookie 22 条）
+  [honor] 拼出 11 个 cookie：… euid(67), encryptRtNew(305), variedData(1655)
+  [honor] 纯 API 登录成功 ✅ 账号 190****7634 / uid 8550086500223209739
+[ident] 凭证已恢复
+[act] activityCode = QDHDz5SM67T65XPOBMBBQ1
 RESULT honor code=415 msg=今日已签到（连续 1/5 天，累计 8 分）
 ```
 
-> ✅ **所以这条链路最脆弱的环节其实不是「弹窗」。** 唯一需要弹窗的 `login`
-> 只在**连华为账号 SID 都没了**的时候才会走到 —— 那基本等于「这个微信从来没绑过荣耀账号」。
-> 日常的 3 天到期，SSO 会无声无息地补回来。
+> ✅ **所以「3 天过期」这件事已经彻底不成问题** —— 第一级就是纯 API 登录，
+> 几秒钟搞定，且**不依赖任何界面**。后两级（SSO / login）只是兜底。
 
 > ⚠️ **`login` 是整条链路里唯一需要「界面」的地方**（上面那条 SSO 路径不需要），
 > 它依赖那个**微信原生手机号授权框**出现并被点中。实测：

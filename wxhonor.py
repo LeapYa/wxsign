@@ -34,7 +34,7 @@
 签到在**任务中心 H5**（`www.honor.com/cn/msale/mp/jobcenter.html`），
 由小程序页面 `packageActivity/pages/login4Qxmp/login4Qxmp`（标题「任务页面」）用 web-view 承载。
 
-但**签到不需要打开那个 H5**（2026-09-28 实测，全链路纯 HTTP）：
+但**签到不需要打开那个 H5**（2026-09-28 实测，整条链路不驱动界面）：
   · **`activityCode`（每期会变的那个）** —— 一次普通 GET 拿 H5 的 HTML，
     正则提 `data-activity-code` 就行。**不需要 cookie、不需要打开页面。**
   · **凭证全在 `.honor.com` 的 cookie 里**：`euid` / `encryptRtNew` / `CSRF-TOKEN`。

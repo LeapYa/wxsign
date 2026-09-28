@@ -238,7 +238,39 @@ header Authorization: <token>     crm7-mpId: <mpId>     [csl-GC-Shardingkey: <gc
 | `oppo` | OPPO 商城 `msec.opposhop.cn`（H5 侧 `hd.opposhop.cn/api`） | `NEWOPPOSID` + `openid` 请求头 | `wxoppo.py` 读 storage 的 `logininfo`（`encryptedSession` / `openId`） |
 | `pindao` | 奈雪点单 `tm-api.pin-dao.cn`（品道自研） | `Authorization: Bearer <accessToken>` | `wxnaixue.py` 读 `getApp().globalData.accessToken`（JWT，120 天） |
 | `duiba` | 蜜雪冰城「雪王币抽奖」`76177-activity.dexfu.cn`（兑吧） | `Authorization: Bearer <accessToken>` + **JS-challenge token** | `wxmx.py` 读 `globalData.accessToken`，再换兑吧免密登录 URL |
-| `honor` | 荣耀商城 `openapi-cn.c.honor.com`（**签到在任务中心 H5**，不是小程序原生页） | `.honor.com` 的 cookie（`euid` + `encryptRtNew` + `CSRF-TOKEN`） | **全链路纯 HTTP**：`activityCode` 从 H5 的 HTML 里正则提、cookie 走 CDP 读 cookie jar（browser 级命令，**不用开 H5**）、签到是两个纯 HTTP POST |
+| `honor` | 荣耀商城 `openapi-cn.c.honor.com`（**签到在任务中心 H5**，不是小程序原生页） | `.honor.com` 的 cookie（`euid` + `encryptRtNew` + `CSRF-TOKEN`） | ① `wx.login` 的 code → `wxQuickLogin` 换 cookie（**与 `eingdong`/`weizulin` 同一模式**）② `activityCode` 从 H5 的 HTML 里正则提（普通 GET）③ 签到是两个纯 HTTP POST |
+
+> **⭐ 八家的「身份从哪来」只有两种模式，而且都不点界面**（这一点常被误解，值得说清）：
+>
+> | 模式 | 谁去换 code | 哪几家 |
+> |---|---|---|
+> | **A. 我们自己用 `wx.login` 的 code 换** | 引擎 | 吾享（`wxrefresh.js`）· 易东 · 微租林 · **荣耀** |
+> | **B. 小程序自己换好，我们读现成的** | 小程序自己（启动时静默登录） | 企迈 · OPPO · 奈雪 · 蜜雪 |
+>
+> ⚠️ **两种模式的前提都是「目标小程序必须开着」** —— `wx.login()` 产出的 code 与 appId **绑死**，
+> 只能由**那个小程序的运行时**产生，服务端无法自举（`wxrefresh.js` 里就写着这句）。
+> 所以「纯 API」**不等于「脱离小程序」**，它的准确含义是**「不模拟点击/弹窗」**。
+>
+> 两种模式的取舍：**A** 更主动（不依赖小程序启动时那次静默登录），代价是 code 一用一次、约 5 分钟过期；
+> **B** 更省事（读 storage / 请求头是幂等的，重跑一次就行），代价是要等小程序自己跑完那次静默登录。
+>
+> 📌 **B 其实也能改成 A** —— 包里那些「code 换会话」的接口都在（实测）：
+> 企迈 `/account-center/oauth/mini-app-login`、OPPO `ssoLogin`（`/api/bind-login/pre-auth`，
+> `{loginType:"wechat", code}` → 换回 `data.encryptedSession`，**正是 `wxoppo.py` 读的那个值**）、
+> 奈雪 `silentLogin()`（`wx.login`）、蜜雪 `/v2/app/loginByAuthCode`。
+> **但收益很小**（B 更简单可靠），所以**没改**。
+>
+> ⚠️ **教训（我差点写错这里）**：**别拿 `wx.login` 当 grep 模式** —— 打包压缩会把 `wx`
+> 重命名成单字母（OPPO 源码里是 `e.login({success:e=>{e.code?…ssoLogin(…)}})`），
+> `wx\.login` 会**漏掉**、看起来像「它不用微信登录」。要用 `\.login\(` 这类宽松 pattern。
+>
+> 🎯 **所以「首次要手机号授权」的原因八家也都一样**：服务端**不认未绑定的 code**
+> （OPPO 的 `ssoLogin` 未绑定时返回失败 → 退到 `mobileLogin`；荣耀的 `wxQuickLogin` 同理）。
+> 而微信**强制 `getPhoneNumber` 必须由用户点击事件触发** —— 这才是**唯一**必须走 UI 的地方。
+>
+> 🎯 **荣耀真正特殊的只有一条：它的会话只活 3 天**（见第七节第 5 条）。所以它是唯一
+> 需要「凭证失效自愈」的后端 —— 而其余七家在拿到 `NOTOKEN` 时是**直接报失败**的：
+> 企迈 →「需在小程序里过一次手机号授权」、OPPO / 奈雪 →「重开小程序让它重抓」。
 
 非吾享后端多一个**首次接入**的动作（每个品牌一辈子一次）：
 
@@ -375,7 +407,11 @@ GET  …/project/2924/luck/draw.do?token=…       → 抽奖
 >    `mx_lottery.run()` 一律先查 `remainFreeTimes`，>0 才抽；等于 0 直接回 `415`
 >    （语义与「今日已签到」同义，引擎算完成）。**别绕过这条保护。**
 
-**荣耀商城**（`荣耀商城`）：**唯一一个「签到不在小程序里」的后端，也是唯一一个纯 HTTP 的**。
+**荣耀商城**（`荣耀商城`）：**唯一一个「签到不在小程序里」的后端** —— 其余七家的签到都在
+小程序自己的接口上，荣耀的在**任务中心 H5**。
+（⚠️ 但**别误读成「只有它是纯 HTTP / 只有它不驱动界面」** —— 那一点八家**完全一样**：
+日常签到时**没有任何一家的取凭证需要点界面**（见上文第五节的「八家的身份从哪来」对照）。
+荣耀真正特殊的只有一条：**它的会话只活 3 天**，所以只有它需要「过期自愈」。）
 荣耀商城小程序本身（卖手机那个）**没有签到** —— 整包 grep「签到/打卡/赚积分/每日任务」零命中，
 tabBar 也只有 首页/分类/我的。签到本体在**任务中心 H5**
 （`www.honor.com/cn/msale/mp/jobcenter.html`），由小程序页面 `login4Qxmp`（标题「任务页面」）

@@ -106,6 +106,32 @@ Network.getAllCookies    （带上那个 sessionId）    → **整份** cookie j
 > 但值是 Chromium 的 **`v10` AES-GCM 密文**（解它要 keyring key）—— 不值得。
 > 走 CDP 读出来是**明文**，一步到位。
 
+### ⭐ 反向也一样：`wxlogin` 换来的 cookie 会**写回浏览器**（2026-09-28 补）
+
+`Network.setCookies` 与 `getAllCookies` **对称** —— 同样作用在**浏览器级** cookie store 上。
+所以 `wxhonor.py wxlogin` 拿到新 cookie 后会直接写回（`write_jar()`），好处很实在：
+
+| | 不写回（原来） | 写回（现在） |
+|---|---|---|
+| 下次 `ident` | 读到「未登录」→ 又要走一遍自愈（多一次 `wx.login` + 一次 POST） | **直接读到登录态** |
+| 依赖 | 逻辑层必须可用（hook 通、`wx.login` 能用） | **只要 CDP 连得上**（完全不碰逻辑层） |
+| 引擎耗时 | ~60 秒 | **~33 秒**（实测） |
+
+实测对照（同一天、同一账号）：
+
+```
+写回前 ident：  cookie 16 条：euid=**无**  encryptRtNew=**无**   → 登录态：**未登录**
+跑 wxlogin：    wxQuickLogin → code=0 msg=login success（Set-Cookie 22 条）
+                已写回浏览器 10 个 cookie ✅
+写回后 ident：  cookie 22 条：euid=有  encryptRtNew=有            → 已登录 ✅ 凭证还剩 3.0 天
+```
+
+> ⚠️ 两个细节：
+> 1. **登录过程的临时 cookie（`code` / `type`）不写回** —— 它们是 `wxQuickLogin` 自己的中间态，落地没意义。
+> 2. `euid`（httpOnly）与 `encryptRtNew` **不在 `Set-Cookie` 里**（在响应 body 里），
+>    写回时按实测的 **3 天 TTL** 单独补；其余 cookie 的属性（`Domain` / `Path` / `Secure` /
+>    `HttpOnly` / `Max-Age` / `SameSite`）从 `Set-Cookie` 原样解析，尽量还原服务端意图。
+
 ### ⭐ `CsrfToken` 就是 cookie 里的 `CSRF-TOKEN`
 
 H5 的 `window.csrftoken` 与 cookie 的 `CSRF-TOKEN` **实测完全相同**
@@ -293,6 +319,9 @@ cookie = Set-Cookie 的（euid / uid / user / hasphone / hasmail / __ukmc / rush
 >
 > 📌 **一句话**：**已绑定的账号，登录完全不需要界面**；只有「首次把这个微信绑到荣耀账号」
 > 才需要一次手机号授权。
+>
+> ⭐ 而且换来的 cookie 会**写回浏览器**（`Network.setCookies`，见第三节）—— 所以 3 天
+> 有效期内 `ident` 直接就读到登录态，**连 `wx.login` 都不用调**（引擎从 60 秒降到 33 秒）。
 
 ## 六·补、UI 登录（`wxhonor.py login`）—— 只作兜底
 
@@ -407,19 +436,20 @@ RESULT honor code=415 msg=今日已签到（连续 1/5 天，累计 8 分）
 | 环节 | 是否自动 | 备注 |
 |---|---|---|
 | 打开荣耀商城小程序 | ✅ | 引擎自动（`open_target.py` 按 appId 复核） |
-| 取 cookie（`euid`/`encryptRtNew`/`CSRF-TOKEN`） | ✅ | **CDP 读 cookie jar，不碰界面、不开 H5** |
+| 取 cookie（`euid`/`encryptRtNew`/`CSRF-TOKEN`） | ✅ | **CDP 读 cookie jar，不碰界面、不开 H5**；写回后 3 天有效期内直接可读（见第三节） |
 | 提 `activityCode` | ✅ | **纯 HTTP 拉 HTML 再正则**，换档期零人工 |
 | 查档期 / 签到 | ✅ | **纯 HTTP 两个 POST** |
 | 首次绑定账号（微信手机号授权） | ✅ | `wxhonor.py login`；授权是**静默**的，不用收短信 |
-| **凭证过期后续期**（每 3 天） | ✅ | **SSO 自动**：打开一次 honor.com 页面，借华为账号 SID 补发新 cookie（**零弹窗、零点击**） |
-| 华为账号 SID 也没了 | 🟡 **自动，但不保证** | 才需要 `login`（点「允许」框）。属于兜底，实测尚未走到 |
+| **凭证过期后续期**（每 3 天） | ✅ | **四级自愈**（见第六节）：① **纯 API 登录**（`wx.login` code → 新 cookie，**零 UI**，并写回浏览器）→ ② SSO（打开一次 honor.com 页面借 SID，零弹窗）→ ③ `login`（点「允许」框）→ ④ 报 `NOLOGIN` |
+| 连华为账号 SID 都没了 | 🟡 **自动，但不保证** | 才需要第 ③ 级 `login`。属于兜底，实测尚未走到 |
 | 风控 / 验证码 | ❌ | 无法自动过 —— 报 `RISK` 并退出，不重试 |
 
-> **一句话**：**日常完全不需要人**。3 天到期由 SSO 无声补回；
-> 只有「连华为账号 SID 都没了」（≈ 从没绑过荣耀账号）才需要 `login` 那一步。
+> **一句话**：**日常完全不需要人、也不需要界面**。3 天到期由第 ① 级**纯 API 登录**无声换回
+> （连页面都不用开）；只有「连华为账号 SID 都没了」（≈ 从没绑过荣耀账号）才需要第 ③ 级 `login`。
 > 真失败也不会静默 —— 报 `NOLOGIN` 并给出命令。
 
-> 实测耗时：**32 秒**（含引擎侧投递脚本 + 开小程序的固定开销）。
+> 实测耗时：**33 秒**（cookie 有效时，含引擎侧投递脚本 + 开小程序的固定开销）；
+> cookie 失效、要走第 ① 级自愈时约 **60 秒**。
 > 其中与荣耀本身相关的只有「读一次 cookie + 1 个 GET + 2 个 POST」。
 
 ## 九、复现步骤
@@ -457,6 +487,9 @@ RESULT honor code=415 msg=今日已签到（连续 1/5 天，累计 8 分）
 
 总耗时: 32 秒
 ```
+
+> （这是**当时的原文**。后来加了「写回浏览器」优化，cookie 有效时降到 **33 秒稳定**、
+> 且不再需要逻辑层；cookie 失效走第 ① 级自愈时约 60 秒。）
 
 > ⚠️ **上面没有一条是「未签 → `code=0`」的完整记录** —— 原因**不是「恰好已签」**，
 > 而是**接入当天我在界面里手工点掉了那次签到**（账号上的 8 积分就是那一下来的）。

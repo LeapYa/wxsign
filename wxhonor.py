@@ -43,20 +43,31 @@
     → **不需要打开 H5 就能取身份**。
   · 剩下就是两个 POST（纯 HTTP），见 `wxsign.py` 的 `do_sign_honor`。
 
-所以本模块只干两件事：
-  ① `ident` —— 从 CDP 读 `.honor.com` 的 cookie jar（交给引擎纯 HTTP 用）
-  ② 首次接入的**一次性**授权（`login`）+ 排障用的 UI 工具（`status/agree/personal/tap`）
+所以本模块干三件事：
+  ① **取身份**：`ident` 从 CDP 读 `.honor.com` 的 cookie jar（交给引擎纯 HTTP 用）
+  ② **续期**（凭证只活 3 天）：`wxlogin` 纯 API 换新 cookie（零 UI，并**写回浏览器**）；
+     `sso` 借华为账号 SID 补 cookie（打开一次 honor.com 页面，零弹窗）
+  ③ 首次接入的**一次性**授权（`login`）+ 排障用的 UI 工具（`status/agree/personal/tap`）
+
+⭐ 为什么要「写回浏览器」：`wxQuickLogin` 换来的 cookie 若只留在内存里（拼给引擎抛出去就完），
+   浏览器自己的 cookie jar **仍然是空的** → 下次 `ident` 又读到「未登录」、又白跑一遍自愈。
+   `wxlogin` 现在用 CDP `Network.setCookies` 把它写回去（与 `read_jar` 对称，都是
+   **browser 级** cookie store）→ 3 天有效期内 `ident` 直接读到登录态，
+   **完全不必驱动逻辑层**（只要 CDP 连得上就行，不要求 hook / `wx.login` 可用）。
 
 ## 四、用法（容器内跑）
     python3 wxhonor.py ident    # 【引擎用】读 cookie jar → 打印 HONOR_IDENT={...}
+    python3 wxhonor.py wxlogin  # ⭐ 纯 API 登录：wx.login 的 code → 换 cookie（零 UI + 写回浏览器）
+    python3 wxhonor.py sso      # 借华为账号 SID 补 cookie（打开一次 honor.com 页面，零弹窗）
     python3 wxhonor.py status   # 当前在哪一页 / 隐私弹窗在不在 / 登录态
     python3 wxhonor.py origin   # 打印页面原点与它的推导过程
     python3 wxhonor.py agree    # 点掉隐私声明的「同意」（加 --dry 只看不点）
-    python3 wxhonor.py login    # 点「点击账号登录」，触发微信手机号授权（一辈子一次）
+    python3 wxhonor.py login    # 点「点击账号登录」，触发微信手机号授权（只作兜底）
     python3 wxhonor.py personal # 逻辑层 wx.switchTab 跳到「我的」页
     python3 wxhonor.py tap <文案>  # 按文案点（现取坐标）
 """
 import http.client
+from http.cookies import SimpleCookie
 import json
 import ssl
 import subprocess
@@ -492,6 +503,78 @@ def read_jar():
     return out
 
 
+# 荣耀业务 cookie 的实测寿命 = 登录时刻 + 3 天（**不滑动续期**）。
+# `wxQuickLogin` 响应头里的 Max-Age 也是这个量级；而 body 里的 euid / refreshToken
+# 不带属性，写回浏览器时按这个 TTL 补。
+HONOR_TTL = 3 * 86400
+
+
+def _parse_set_cookie(line, default_domain="." + HONOR_DOMAIN):
+    """一条 `Set-Cookie` → CDP `Network.setCookies` 要的对象；登录过程的临时 cookie 返回 None。"""
+    c = SimpleCookie()
+    try:
+        c.load(line)
+    except Exception:                                       # noqa: BLE001
+        return None
+    if not c:
+        return None
+    name = next(iter(c))
+    if name in ("code", "type"):        # wxQuickLogin 的登录过程临时 cookie，不该落地
+        return None
+    m = c[name]
+    out = {
+        "name": name,
+        "value": m.value,
+        "domain": (m["domain"] or default_domain),
+        "path": (m["path"] or "/"),
+        "secure": bool(m["secure"]),
+        "httpOnly": bool(m["httponly"]),
+    }
+    ma = m["max-age"]
+    if ma:
+        try:
+            out["expires"] = int(time.time()) + int(ma)
+        except (TypeError, ValueError):
+            pass
+    ss = (m["samesite"] or "").lower()
+    if ss in ("strict", "lax", "none"):
+        out["sameSite"] = ss.capitalize()
+    return out
+
+
+def write_jar(cookies):
+    """把一批 cookie **写回浏览器的 cookie store**（CDP `Network.setCookies`）。
+
+    为什么必须有这一步（2026-09-28 补）：
+      不写回的话，`wx.login` 换来的这套 cookie 只活在**本次进程的内存里**（拼给引擎用），
+      浏览器自己的 cookie jar 里**仍然是空的** → 下一次跑引擎时 `honor_ident` 又读到
+      「未登录」，于是**又要重走一遍自愈**（多一次 `wx.login` + 一次 POST，约 10 秒）。
+      写回之后，3 天有效期内 `honor_ident` 直接就读到登录态 ——
+      **完全不必驱动逻辑层**（少一层依赖：只要 CDP 连得上就行，不要求 hook / wx.login 可用）。
+
+    ⚠️ 与 `read_jar` 对称：`Network.setCookies` 同样作用在**浏览器级** cookie store 上，
+       所以 attach 到哪个 target 都一样（这里是随便挑一个小程序的 page target）。
+
+    返回 `(写入条数, 错误信息或 None)`。
+    """
+    ws = wxcdp.WS(timeout=25)
+    _cdp_send(ws, "Target.setDiscoverTargets", {"discover": True})
+    time.sleep(1.0)
+    t = pick_miniapp_target(ws)
+    if not t:
+        return 0, "no-miniapp-target"
+    wid = _cdp_send(ws, "Target.attachToTarget", {"targetId": t["targetId"], "flatten": True})
+    sid = (((_cdp_wait(ws, wid) or {}).get("result")) or {}).get("sessionId")
+    if not sid:
+        return 0, "attach-failed"
+    wid = _cdp_send(ws, "Network.setCookies", {"cookies": cookies}, sid=sid)
+    r = _cdp_wait(ws, wid, timeout=15.0, sid=sid)
+    err = ((r or {}).get("error") or {}).get("message")
+    if err:
+        return 0, err
+    return len(cookies), None
+
+
 def _summarize(jar, exps):
     """把 cookie jar 压成引擎要的那几个字段。"""
     crit = [e for k, e in (exps or {}).items()
@@ -708,6 +791,31 @@ def cmd_wxlogin():
                target=url, source="wxQuickLogin(纯API)")
     print("[honor] 拼出 %d 个 cookie：%s" % (
         len(jar), ", ".join("%s(%d)" % (k, len(v)) for k, v in jar.items())))
+
+    # ⑤ **写回浏览器** —— 否则下次 `honor_ident` 又读到「未登录」、白跑一遍自愈
+    if out["has_login"]:
+        objs, seen = [], set()
+        for line in set_cookies:
+            o = _parse_set_cookie(line)
+            if o and o["name"] not in seen:
+                seen.add(o["name"])
+                objs.append(o)
+        now = int(time.time())
+        for nm, val, ho in (("euid", data.get("euid"), True),
+                            ("encryptRtNew", data.get("refreshToken"), False)):
+            if val and nm not in seen:        # body 里那两个不在 Set-Cookie 里，单独补
+                seen.add(nm)
+                objs.append({"name": nm, "value": val, "domain": "." + HONOR_DOMAIN,
+                             "path": "/", "secure": True, "httpOnly": ho,
+                             "expires": now + HONOR_TTL})
+        n, err = write_jar(objs)
+        if err:
+            print("[honor] ⚠️ 写回浏览器失败（%s）—— 不影响本次签到，但下次还会重走一遍自愈" % err)
+        else:
+            print("[honor] 已写回浏览器 %d 个 cookie ✅"
+                  "（下次 ident 直接读到登录态，不必再换 code）" % n)
+        out["written"] = n
+
     if out["has_login"]:
         print("[honor] 纯 API 登录成功 ✅ 账号 %s / uid %s" % (out["user"] or "?", out["uid"] or "?"))
     else:

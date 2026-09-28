@@ -452,7 +452,9 @@ tabBar 也只有 首页/分类/我的。签到本体在**任务中心 H5**
 > ① ⭐ **纯 API（首选）** —— `wx.login()` 的 code → `POST /mcp/account/wxQuickLogin`
 >    → 换回整套 `.honor.com` cookie（响应头带 `euid` / `uid` / `user`…，
 >    **body 里的 `refreshToken`（305 字符）就是 cookie 里的 `encryptRtNew`**）。
->    **零 UI、零弹窗、零页面。** 前提是这个微信**以前绑定过**荣耀账号。
+>    **零 UI、零弹窗、零页面**；而且换来的 cookie 会**写回浏览器**（`Network.setCookies`）
+>    → 3 天有效期内 `ident` 直接读到登录态，连 `wx.login` 都不用调。
+>    前提是这个微信**以前绑定过**荣耀账号。
 > ② **UI 登录（只在首次绑定 / 兜底）** —— 点「点击账号登录」→ 微信手机号授权
 >    （**授权即自动注册/登录荣耀账号**，包内文案："将申请获取您的微信手机号用于绑定登录或注册荣耀账号"）
 >    → 点微信原生「允许」框。`wxhonor.py login` 全自动、零硬编码坐标（先切「我的」页 →
@@ -861,7 +863,7 @@ python3 wxapkg.py files <appId>                   # 列页面/模块路径
      `NOLOGIN` = 凭证失效，**且四级自愈全都没救回来**。
      ⚠️ 这个后端的凭证**只活 3 天**（登录时刻 + 3 天，不滑动续期），但引擎是**四级自愈**：
      ① **纯 API 登录**（`wx.login` 的 code → `/mcp/account/wxQuickLogin` → 换回全新一套 cookie，
-     **零 UI、零弹窗**）；② SSO（打开 honor.com 页面，借华为账号 SID 补 cookie，也零弹窗）；
+     **零 UI、零弹窗**，并**写回浏览器** —— 下次直接可读）；② SSO（打开 honor.com 页面，借华为账号 SID 补 cookie，也零弹窗）；
      ③ `login`（点微信原生「允许」框，**唯一要弹窗的一级**）；④ 都不行才报 `NOLOGIN`。
      → 走到 `NOLOGIN` 基本等于**这个微信从没绑定过荣耀账号**（那才需要一次手机号授权）。
      人工兜底：容器内 `python3 wxhonor.py wxlogin`（先试这个，它不用弹窗）；

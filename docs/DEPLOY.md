@@ -150,7 +150,7 @@ bash wmpf/check_wmpf.sh $WX
 （`addresses.11459.recovered.json` / `addresses.14664.recovered.json`），可直接对照。
 
 > 上游自带的那三份**没有**放进本仓库 —— 它们是上游 WMPFDebugger 的文件副本，
-> 版权不归本项目（见 [README 第九节](../README.md#关于授权源码公开但不是开源)）。要用就装上游。
+> 版权不归本项目（见 [README 第九节](../README.md#关于授权)）。要用就装上游。
 
 #### 微信升级了、上游还没适配 —— 四条路
 

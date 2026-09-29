@@ -88,8 +88,17 @@ if __name__ == "__main__" and (not TARGET or not KEYWORD):
 # 比例坐标（1280x1024 实测）
 R_RAIL_X = 0.026                    # 侧边栏图标列的横坐标（按钮 y 由像素扫描算出来）
 R_RAIL_COL = (14, 52)               # 侧边栏图标列的像素范围（找按钮用）
-R_PANEL_MAGNIFIER = (0.974, 0.0625)  # 面板内容区右上角搜索（放大镜）；按钮框比字形大，
-                                     # 所以这个点虽然偏右 23px 仍然落在按钮上（实测）
+# ⚠️⚠️ 2026-09-28 实测定案：**纵向原来写错 25px，面板搜索其实从未执行过**。
+#    旧值 `(0.974, 0.0625)` = 面板相对 (1167, **42**) —— 而放大镜字形中心在 **(1170, 67)**，
+#    于是那一下点在放大镜**上方的空白**上：没有聚焦任何输入框 →
+#    `type_text(关键词)` 的字无处可去、紧跟的 `key("Return")` 也没反应 →
+#    面板仍停在**首页**，而 `find_cards()` 照样能在首页的**推荐网格**里找到"卡片" →
+#    于是"点卡片 → 开错了 → 关掉 → 再点下一张"，一直点到**目标恰好也在推荐网格里**为止。
+#    **症状极具欺骗性**：日志一路 `找到 N 张卡片`、偶尔还 `打开成功`，
+#    完全看不出"搜索根本没发生"（实测：搜「过桥缘游戏中心」却在点辣可可/呷哺呷哺/大董会员商城）。
+#    → 真正的判据是**面板标签条变成「<关键词>_搜索」**，不是"找到了几张卡片"。
+#    正确值：放大镜字形实测包围盒 x1164..1178 / y60..74（面板 1198x673 @0,0，4 倍放大裁图量的）。
+R_PANEL_MAGNIFIER = (0.977, 0.0995)  # 面板内容区右上角搜索（放大镜）**字形中心**
 # 「小程序」标签页的紫色图标出现在这条标签条里（扫整条，可能有多个标签）：
 R_TABSTRIP = (0.05, 0.45, 0.004, 0.038)      # x0f,x1f,y0f,y1f
 
@@ -287,6 +296,11 @@ def bring_on_screen(W, H):
 
     判据：**可见面积不足自身一半**就算跑到屏幕外了。
     ⚠️ 只搬位置，**不做 resize**（尺寸不归这里管 —— 见 `ensure_main_fullscreen` 的历史教训）。
+       （2026-09-28 记录：曾经想靠"把主窗口收窄"来避免遮挡，**那是错的** ——
+        面板 1198x673 远宽于屏幕一半，收窄后照样重叠，「遮一半也是遮」。
+        正解见 `hide_main()`：用 `windowunmap` 把主窗口**整块移出屏幕**，彻底消灭重叠。
+        ⚠️ 另注：未映射（unmap）的窗口**不在 `windows()`（--onlyvisible）列表里**，
+          所以这里**永远不会**去动一个被 hide_main 卸掉的窗口 —— 恢复要用 `show_main()`。）
 
     为什么必须有这一步（2026-09-27 实测，两个看似无关的症状同一个根因）：
     `wxreg._move_wechat_away()` 会用 `windowmove` 把「盖住小程序的窗口」推到 `x = 屏宽+10`。
@@ -367,6 +381,222 @@ def ensure_main_fullscreen(W, H):
     return True
 
 
+def set_above(wid, on=True):
+    """给窗口加上/去掉 `_NET_WM_STATE_ABOVE`（EWMH 的「升层」）—— 发 **client message**。
+
+    ⭐ **这是"面板被主窗口遮"的正解**（2026-09-28 实测；前面试错的三种办法记录在 `hide_main` 里）：
+
+      · 微信主窗口带着 `_KDE_NET_WM_WINDOW_TYPE_OVERRIDE` 类型，而 openbox 认这个 atom
+        （它在 `_NET_SUPPORTED` 里）→ 于是**不当常规窗口管它**：
+        压不住、挪不开（被 EWMH 夹在 `X=1152`，仍留 46px 压住面板放大镜）、
+        **连 `windowminimize` 都不生效**。抢焦点那套对它完全无效。
+      · 而 `_NET_WM_STATE_ABOVE` 走的是**另一套机制**：把窗口放进比 NORMAL 更高的层，
+        **跟"谁抢到焦点"毫无关系** —— 主窗口再怎么 raise 也压不过 ABOVE 层。
+      · 实测：发出 client message 后，`_NET_CLIENT_LIST_STACKING` 立刻从
+        `[面板, 主窗口]` 变成 `[主窗口, 面板]`，面板重新可见、可点。
+
+    ⚠️ **必须发 client message**（`XSendEvent` 到 root）。只用
+       `xprop -set _NET_WM_STATE` **不行** —— 那只改属性，WM **收不到通知**（实测无效）。
+    ⚠️ **只对面板/搜一搜这类窗口用**（判据：`win_class()` 为空的微信自己的窗口）。
+       对**主窗口**千万别用 —— 主窗口也进 ABOVE 层的话，就变成它永远压面板了。
+    """
+    try:
+        import ctypes
+    except ImportError:
+        return False
+    try:
+        x11 = ctypes.CDLL("libX11.so.6")
+    except OSError:
+        return False
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    dp = x11.XOpenDisplay(None)
+    if not dp:
+        return False
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+
+    class _CM(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                    ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                    ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                    ("format", ctypes.c_int), ("data", ctypes.c_long * 5)]
+
+    class _EV(ctypes.Union):
+        _fields_ = [("xclient", _CM), ("pad", ctypes.c_long * 24)]
+
+    ev = _EV()
+    ev.xclient.type = 33                                   # ClientMessage
+    ev.xclient.send_event = 1
+    ev.xclient.display = dp
+    ev.xclient.window = int(wid)
+    ev.xclient.message_type = x11.XInternAtom(dp, b"_NET_WM_STATE", 0)
+    ev.xclient.format = 32
+    ev.xclient.data[0] = 1 if on else 0                    # 1=add 0=remove
+    ev.xclient.data[1] = x11.XInternAtom(dp, b"_NET_WM_STATE_ABOVE", 0)
+    ev.xclient.data[2] = 0
+    ev.xclient.data[3] = 1                                 # source: application
+    x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                               ctypes.c_long, ctypes.POINTER(_EV)]
+    x11.XSendEvent(dp, x11.XDefaultRootWindow(dp), 0, 0x180000, ctypes.byref(ev))
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XFlush(dp)
+    return True
+
+
+def _main_window_ids():
+    """所有「主窗口」候选的 id（**含未映射的**），按 WM_CLASS + 标题两条路一起找。
+
+    ⚠️ **必须两条路都走**（2026-09-28 实测，代价是整批卡死）：
+       单靠 `xdotool search --name '^微信$'` 会**偶发返回空**（那一刻窗口状态不稳）——
+       于是 `show_main()` 静默地什么都没做（返回空列表、连日志都不打一行），
+       紧接着 `find_main_window()` 返回 None → `open_panel` 判「找不到微信主窗口」→
+       **整个品牌放弃**。日志里上一行还写着"主窗口已放回屏幕"，极具欺骗性。
+
+       `xdotool search --class wechat` 是**纯 ASCII 的 WM_CLASS 查询**，
+       不经过中文标题的正则匹配 → 作为**主路**，标题那条作备份。
+
+    ⚠️ 判据仍用 `is_main_window()`（WM_CLASS 含 wechat **且** 标题 ==「微信」）：
+       朋友圈窗口的 WM_CLASS 也是 wechat，只有标题能把它排除掉（见 `is_main_window`）。
+    """
+    ids = []
+    for cmd in ("search --class wechat", "search --name '^微信$'"):
+        for wid in run("DISPLAY=%s xdotool %s 2>/dev/null" % (DISPLAY, cmd)).split():
+            if wid not in ids:
+                ids.append(wid)
+    return [w for w in ids if is_main_window(w)]
+
+
+def show_main(W, H):
+    """`hide_main()` 的反操作：把主窗口**放回屏幕**并置前。
+
+    ⚠️ 必须用 `xdotool search --name`（**不带 `--onlyvisible`**）去找 ——
+       `hide_main()` 用 `windowunmap` 把它卸掉之后，它就**不在可见窗口列表里**了，
+       `find_main_window()` 返回 None，于是「找不到主窗口 → 整个流程放弃」。
+       判据用 `xwininfo` 的 `Map State: IsUnMapped`，不是"在不在可见列表里"。
+    """
+    out = []
+    for wid in _main_window_ids():
+        st = run("DISPLAY=%s xwininfo -id %s 2>/dev/null" % (DISPLAY, wid))
+        if "IsUnMapped" in st:
+            run("DISPLAY=%s xdotool windowmap %s" % (DISPLAY, wid))
+            out.append(wid)
+    if not out:
+        return []
+    time.sleep(1.0)                       # 等 openbox/微信把窗口真正摆好
+    for wid in out:
+        run("DISPLAY=%s xdotool windowactivate %s" % (DISPLAY, wid))
+    # ⚠️ **必须确认它真的出现在了"可见窗口列表"里再返回**（2026-09-28 实测踩到）：
+    #    `xdotool windowmap` 是异步的 —— openbox 还要一点时间把 frame map 上，
+    #    紧接着调 `find_main_window()`（按 `--onlyvisible` 找）会**返回 None**
+    #    → 上层 `open_panel` 判"找不到微信主窗口"→ `return None` →
+    #    整个品牌放弃（日志就一行 `[reopen] 找不到微信主窗口`，具有极强欺骗性：
+    #    上一行明明刚打印过"主窗口已放回屏幕"）。
+    #    实测：映射后立刻查是 None，等一会儿再查就有了。
+    for _ in range(10):
+        vis = {w for w, _ in windows()}
+        if all(w in vis for w in out):
+            break
+        time.sleep(0.4)
+    else:
+        print("[reopen] ⚠️ 主窗口 windowmap 后一直没进可见列表（%s）" % "、".join(out))
+    time.sleep(0.4)
+    print("[reopen] 主窗口已放回屏幕（%s）" % "、".join(out))
+    return out
+
+
+def hide_main(main, W, H):
+    """把主窗口**整块卸出屏幕**（`xdotool windowunmap`）—— 面板/小程序窗口再也不会被它遮。
+
+    ⭐ 为什么最终是 `windowunmap`（2026-09-28，四轮弯路换来的结论）：
+
+      · **"把主窗口缩小"没用**：面板 **1198x673** 比屏幕一半还宽，缩了照样重叠
+        ——「遮一半也是遮」，脚本的点按照样落到错的窗口上。
+      · **"把面板抬上来"也没用**：`xdotool windowraise` 对 openbox **reparent 之后**的窗口
+        只改 client 在**自己 frame 内**的层级，**动不了 frame 之间的堆叠顺序**；
+        `windowactivate --sync` 也压不住。结果是两个进程互相抢栈顶 ——
+        正是「微信一直在抢、一直在置顶、一直遮窗口」。
+      · **"把主窗口挪出屏幕"也不够**：openbox 按 EWMH **夹住**窗口、硬留一块可见
+        ——实测最多挪到 `X=1152`（屏宽 1280），而面板宽 1198，
+        `1152..1198` 这 46px 正好压住面板右上角的放大镜 → 每次点击都被安全阀拦掉。
+      · **`windowminimize` 完全无效**：主窗口带着 `_KDE_NET_WM_WINDOW_TYPE_OVERRIDE`，
+        openbox 认这个 atom、不当常规窗口管它 —— 实测 `windowminimize` 之后
+        `_NET_WM_STATE` **始终为空**，窗口纹丝不动。
+      · **`windowunmap` 有效且干净**：它是**直接 X 请求**，不走窗口管理器、不需要任何配合。
+        实测：执行后 `Map State: IsUnMapped`，整块屏幕**瞬间只剩小程序面板** ——
+        聊天列表、侧边栏、聊天输入框全部消失。
+
+    ✅ **可恢复**：`show_main()` 会 `windowmap` 放回来。
+       ⚠️ **别用 `bring_on_screen()` 恢复** —— 它按"几何是否跑出屏幕"判，而 unmap 不改几何，
+          所以它永远不动这个窗口（这个坑 2026-09-28 踩过）。
+    ⚠️ **别对面板用** —— 面板 unmap 掉就彻底没得操作了。
+    """
+    st = run("DISPLAY=%s xwininfo -id %s 2>/dev/null" % (DISPLAY, main))
+    if "IsUnMapped" in st:
+        return True                                   # 已经在屏幕外了
+    g = geo(main)
+    x = g.get("X", "?")
+    run("DISPLAY=%s xdotool windowunmap %s" % (DISPLAY, main))
+    time.sleep(0.8)
+    st2 = run("DISPLAY=%s xwininfo -id %s 2>/dev/null" % (DISPLAY, main))
+    if "IsUnMapped" not in st2:
+        print("[reopen] ⚠️ 主窗口 unmap 没生效（%s）" % main)
+        return False
+    print("[reopen] 主窗口已移出屏幕（原 X=%s → IsUnMapped）→ 它彻底不遮面板/小程序" % x)
+    return True
+
+
+def focus_window(wid, activate=True):
+    """把**键盘输入焦点**真的交给 `wid` 并**校验**，返回是否成功。
+
+    ⭐ 为什么必须单独做这么一步（2026-09-28 实锤了它的破坏力）：
+
+      `xdotool type` / `xdotool key` 用 XTEST，字符发给**当前有键盘焦点的窗口**，
+      **不是**"屏幕上最靠前的窗口"。而 `windowactivate` 走 EWMH，对 openbox
+      **不管理**的窗口（小程序面板没有 WM_CLASS、主窗口带 OVERRIDE 类型）**可能不生效**：
+
+        → 视觉上小程序面板在最前、键盘焦点却还留在**主窗口的聊天输入框**上；
+        → `panel_search_once()` 的 `type_text(关键词)` 把关键词打进**聊天框**；
+        → 紧跟的 `key("Return")` 把它**当聊天消息发了出去**（好友收到一串乱码，
+          而面板搜索框一直是空的）—— 这正是「一直在给聊天框发消息」的真身。
+
+      → 所以：**打字之前**必须确认焦点，打字之后**按回车之前**还要再确认一次。
+    """
+    if activate:
+        for _ in range(3):
+            run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
+            run("DISPLAY=%s xdotool windowfocus --sync %s" % (DISPLAY, wid))
+            time.sleep(0.4)
+            if _focus_is(wid):
+                return True
+        return False
+    # ⚠️ 纯校验也要**重试几次**：`xdotool type` 之后键盘焦点会瞬时抖一下
+    #    （实测过：紧跟着那一次 getwindowfocus 报的不是面板，过几百毫秒又回来了）。
+    #    不重试就会白跑一整轮（辣可可那次多花了一轮）。重试只是**读**，不改变任何状态，
+    #    所以对安全性没有影响 —— 安全性靠的是"确认不了就不按回车"这条不变式。
+    for _ in range(4):
+        if _focus_is(wid):
+            return True
+        time.sleep(0.45)
+    return False
+
+
+def _focus_is(wid):
+    """当前键盘焦点是不是 `wid`（拿不到或不是都算否；认窗口管理器 frame 也算对）"""
+    cur = run("DISPLAY=%s xdotool getwindowfocus 2>/dev/null" % DISPLAY).strip()
+    if not cur:
+        return False
+    if cur == str(wid):
+        return True
+    # `getwindowfocus` 有可能报 openbox 的 frame 窗口 —— 往下走一层看客户窗口
+    for line in run("DISPLAY=%s xwininfo -id %s -tree 2>/dev/null" % (DISPLAY, cur)).splitlines()[1:]:
+        m = re.match(r"\s+(0x[0-9a-fA-F]+)\b", line)
+        if m and str(int(m.group(1), 16)) == str(wid):
+            return True
+    return False
+
 def raise_window(wid):
     """把窗口提到最前。windowactivate 走 EWMH（要窗口管理器配合），windowraise 走
     XRaiseWindow，两个都发一遍最稳 —— 有别的窗口挡着时，点侧边栏/面板都会落到别人身上
@@ -380,16 +610,39 @@ def raise_window(wid):
     手工验证：加 `--sync` 之后 `top_window()` 立刻从主窗口变回面板。
     所以这里改成「反复抬 + 每次校验」，抬不起来就如实返回 False（让调用方别继续瞎点）。
     """
+    # ⚠️ 2026-09-28 历史：这里曾经对"没有 WM_CLASS 的窗口（面板/搜一搜）"调 `set_above()`
+    #    把它升到 `_NET_WM_STATE_ABOVE` 层来压过主窗口。**现在撤掉了**：
+    #      · 主窗口改用 `hide_main()`（`windowunmap`）**整块移出屏幕**之后，
+    #        需要面板的时候它本来就是屏幕上唯一的窗口，不需要跟谁抢层级；
+    #      · 而 ABOVE 层的副作用很硬：**主窗口再也 raise 不到面板上面** →
+    #        `ensure_chat_tab()` / `do_search()` 这些"必须让主窗口在最前"的路径会静默失效，
+    #        连 `open_panel` 里点侧边栏前的 `raise_window(main)` 也会判失败直接放弃；
+    #      · 更坏的是点侧边栏会点到面板上 —— 面板那个「小程序」按钮是**切换**语义，
+    #        一点就把面板关掉。
+    #    `set_above()` 函数保留备查，但**不再有任何调用点**。
     for _ in range(3):
         run("DISPLAY=%s xdotool windowactivate --sync %s" % (DISPLAY, wid))
         run("DISPLAY=%s xdotool windowraise %s" % (DISPLAY, wid))
         time.sleep(0.6)
-        top = top_window(WANT_W, WANT_H)
+        # ⚠️ 校验点必须取**这个窗口自己**的几何中心，**不能**取屏幕中心。
+        #    屏幕中心只有在「主窗口满屏」时才恰好落在主窗口里；而主窗口现在被
+        #    主窗口还可能被 `hide_main()` 挪出屏幕，屏幕中心落到了**面板**上，
+        #    于是 `raise_window(main)` **永远**判「抬不起来」
+        #    → `open_panel` 直接放弃点侧边栏，而且 6 轮里反复 raise 主窗口
+        #      = 用户看到的「两个窗口一直在抢 / 主窗口一直在置顶」（2026-09-28 踩到）。
+        #    各验各的中心，两个窗口才都能被正确抬起来、互不干扰。
+        g = geo(wid)
+        try:
+            cx = int(g["X"]) + int(g["WIDTH"]) // 2
+            cy = int(g["Y"]) + int(g["HEIGHT"]) // 2
+        except (KeyError, ValueError, TypeError):
+            cx, cy = WANT_W // 2, WANT_H // 2
+        top = win_under(cx, cy)
         if top is None:
             # ⚠️ **认不出顶上是谁 ≠ 没抬起来**。
-            #    `top_window()` 依赖「那个窗口在我们按标题筛的列表里」，而
+            #    `win_under()` 依赖「那个窗口在我们按标题筛的列表里」，而
             #    **硬清运行时之后微信重建的窗口是无名的**（面板/运行时的窗口都叫不出名字），
-            #    `win_under()` 于是返回 None。若把它当失败，会连锁成
+            #    于是返回 None。若把它当失败，会连锁成
             #    「主窗口抬不起来 → 不点侧边栏 → 面板永远打不开」的**假死**
             #    （实测踩到：硬清一次之后 open_panel 直接放弃）。
             #    所以这里**乐观放行** —— 真被别的窗口挡着时，后面 `click_expect`
@@ -397,8 +650,21 @@ def raise_window(wid):
             return True
         if str(top) == str(wid):
             return True
-    print("[reopen] ⚠️ 抬不起窗口 %s（顶上始终是 %s）"
-          % (wid, top_window(WANT_W, WANT_H)))
+        # ⭐ **自愈**（2026-09-28 实测必需）：压着的是**主窗口**时，把主窗口卸出屏幕再抬一次。
+        #    为什么必须自愈：主窗口**会自己回来**（微信是 Qt 应用，被 unmap 之后可能重新 map
+        #    自己；实测过桥缘那一轮就是"卸掉 → 又回来 → 压住面板"），而
+        #    `windowactivate/windowraise` 对 openbox **动不了 frame 之间的堆叠顺序**
+        #    （见 `hide_main` 的说明）→ 面板永远抬不起来 → 卡片点击被
+        #    `click_expect` 的安全阀全部拦掉，症状是「找到 N 张卡片但一张都点不动」。
+        #    ⚠️ 两个前提，缺一个就会把"要抬主窗口"这件事本身搞坏：
+        #      ① `wid` **不是**主窗口（否则我们会把自己要抬的窗口卸掉）；
+        #      ② 顶上那个**是**主窗口（别的窗口不归这里管，交给调用方）。
+        if not is_main_window(wid) and is_main_window(top):
+            print("[reopen] 主窗口压着 %s → 先把它卸出屏幕再抬" % wid)
+            hide_main(top, WANT_W, WANT_H)
+            continue
+    print("[reopen] ⚠️ 抬不起窗口 %s（它自己的中心 %d,%d 上始终是 %s）"
+          % (wid, cx, cy, win_under(cx, cy)))
     return False
 
 
@@ -651,24 +917,28 @@ def close_window(wid, W=None, H=None, kind=None):
     不能用 `xdotool windowclose`：后者销毁了 X 窗口但微信内部状态不复位，
     之后这个小程序（面板则是整个面板）就再也点不开了，只能重启微信。
 
-    三道防线，任一不满足就不点：
-      ① **身份**：WM_CLASS 含 wechat（主窗口）⇒ 那是整个微信的关闭键，拒不关闭；
-      ② **结构**：标题叫「微信」的窗口（主窗口恰好也叫这个名！）只有
-         `kind="panel"` 且顶部图标确实是小程序的紫色图标时才许关；
-      ③ **位置**：按窗口自身几何算按钮坐标 + 那一小块里得真有字形，
+    两道防线，任一不满足就不点：
+      ① **身份**：主窗口（`is_main_window()`：WM_CLASS 含 wechat **且**标题是「微信」）
+         ⇒ 那是整个微信的关闭键，拒不关闭。这一条已经足够精确 ——
+         面板 / 搜一搜 / 视频号**都没有 WM_CLASS**；朋友圈虽有 WM_CLASS 但标题不是「微信」。
+      ② **位置**：按窗口自身几何算按钮坐标 + 那一小块里得真有字形，
          算不出/验不过 ⇒ 不点。
     点完**复核窗口是否真的消失**；没消失就**不再补第二下**
     （连点才是「多点一次把微信关掉」的来源），直接报失败交给外层。
-    `kind` 只该填 "panel"（面板）或 "miniapp"（小程序窗口）。"""
+    `kind` 只该填 "panel"（面板）或 "miniapp"（小程序窗口）。
+
+    ⚠️ 2026-09-28 删掉了原中间那道防线（「标题是『微信』的窗口必须 `kind="panel"` 且
+       `has_miniapp_tab()` 为真才许关」）：`has_miniapp_tab()` 是**抓屏**判据，被别的窗口
+       盖住时恒为假 → 「标签页不对的面板容器窗口」既不是主窗口、又过不了这道判据 →
+       **谁也关不掉**，于是一直压在主窗口上面（实测：主窗口抬不起来 → 后续侧边栏点击
+       全部落在它身上 =「点了没反应」）。主窗口的保护由 ① 单独负责。
+    """
     if W is None:
         W, H = size()
     if is_main_window(wid) or str(wid) == str(find_main_window()):
         print("[reopen] ⛔ %s 是微信主窗口 → 拒不关闭" % wid)
         return False
     raise_window(wid)          # 提到最前：像素判据要看得到它，点击也要鼠标底下是它
-    if title_of(wid) == "微信" and not (kind == "panel" and has_miniapp_tab(wid, W, H)):
-        print("[reopen] ⛔ 窗口 %s 标题是「微信」但确认不了是小程序面板 → 拒不关闭" % wid)
-        return False
     pt = close_point(wid, W, H, kind)
     if not pt:
         print("[reopen] ⚠️ 拿不到 %s 的关闭按钮位置 → 不点（宁可不关）" % wid)
@@ -845,35 +1115,6 @@ def has_miniapp_tab(wid, W, H):
     return blue >= 5
 
 
-def reload_panel(W, H):
-    """把面板的 webview 重载一次（Ctrl+R），成功返回面板窗口 id。
-
-    为什么需要这一步（实测踩过一整轮）：小程序面板是个 **Chromium 页面**，
-    它会掉成「没有连接到网络 / 重新加载」的错误页 —— 此时窗口还在、标签条里的
-    「小程序」紫色图标也在，但页面是空的、**一个小程序运行时都没有**
-    （CDP 侧的表现是 `[enum] 有 wx 的上下文=[]`）。
-    而这时候点侧边栏只会把它**切换关闭**，于是外部看到的就是
-    「面板打不开 rc=3」→ 之前一路升级到「硬清运行时 / 重启微信」，全都没必要。
-
-    ⚠️ 判据要落在**行为**上：`has_miniapp_tab()` 只证明标签条有那个图标，
-       证明不了页面是活的。所以这里以「重载后能拿到面板窗口」为准，
-       真正的可用性由后续 `[enum]` 有没有上下文来判。
-    """
-    cands = [wid for wid, t in windows()
-             if (t or "").strip() == "微信" and str(wid) != str(find_main_window())]
-    if not cands:
-        print("[reopen] 没有标题为「微信」的副窗口可重载")
-        return None
-    for wid in cands:
-        raise_window(wid)
-        key("ctrl+r", 5.0)
-        if has_miniapp_tab(wid, W, H):
-            print("[reopen] 面板重载成功（Ctrl+R）→ 窗口 %s" % wid)
-            return wid
-    print("[reopen] Ctrl+R 重载后仍未确认面板")
-    return None
-
-
 def close_stray_wechat_windows(main, W, H):
     """关掉**误开的微信窗口**（搜一搜 / 视频号 / **朋友圈** / 误开的小程序等）。
 
@@ -950,44 +1191,59 @@ def open_panel(W, H):
     ⚠️ 实测：已经有搜一搜/视频号这类窗口时，点侧边栏「小程序」**不会新开窗口**，
        而是往同一个窗口里加一个「小程序」标签 —— 所以判据是「标签条里有紫色图标」，
        不是「窗口是不是新出现的」。"""
-    main = find_main_window()
-    if not main:
-        print("[reopen] 找不到微信主窗口")
-        return None
+    # ① 旧面板还开着就关掉重开，不复用（它停在上一品牌的搜索结果页）。
+    show_panel(W, H)                   # 上一轮 hide_panel() 卸掉了，先放回屏幕
+    cands = [w for w, t in windows()
+             if not win_class(w) and (t or "").strip() == "微信"]
+    # ⭐ 双保险：`show_panel()` 内部已经轮询确认过了，这里再给一小段余量。
+    #    宁可多等 2 秒，也不要因为"没看见面板"就去**点侧边栏** ——
+    #    那一下是**切换**语义，会把面板彻底关掉，代价远大于等待。
+    if not cands:
+        for _ in range(6):
+            if [w for w, t in windows() if not win_class(w) and (t or "").strip() == "微信"]:
+                break
+            time.sleep(0.4)
+        cands = [w for w, t in windows()
+                 if not win_class(w) and (t or "").strip() == "微信"]
+    if cands:
+        # ⭐ `has_miniapp_tab()` 是**抓屏**判据，要求面板真的是屏幕上看得见的东西。
+        #    主窗口此刻可能还映射着（上一轮 clean 结束时会把它放回来）→ 先把它卸掉。
+        #    2026-09-28：旧代码这里是 `raise_window(wid)`，但 `windowraise/windowactivate`
+        #    对 openbox reparent 之后的窗口**动不了 frame 之间的堆叠顺序** →
+        #    抓到的还是主窗口 → 判**假否** → 一路走到点侧边栏 → 把面板关掉 / 点出意外窗口。
+        m0 = find_main_window()
+        if m0:
+            hide_main(m0, W, H)
+        for wid in cands:
+            if has_miniapp_tab(wid, W, H):
+                print("[reopen] 旧面板停在上一品牌搜索页（窗口 %s）→ 关掉重开" % wid)
+                if not close_window(wid, W, H, kind="panel"):
+                    # 关不掉也不能去点侧边栏：那是「切换关闭」语义
+                    print("[reopen] ⚠️ 旧面板关不掉 → 放弃")
+                    return None
 
-    # ⭐ 先把跑到屏幕外的窗口（主窗口/面板）搬回来。面板一旦被 `windowmove` 推到屏幕外，
-    #    `top_window()`（取**屏幕中心**最上层窗口）就再也认不出它 → 会把「面板其实开着」
-    #    误判成「面板打不开」；再点侧边栏又因为微信认为「面板已开」而**毫无反应**。
+    # ② 面板不在 → 需要主窗口去点侧边栏。先把它放回屏幕（上一轮可能被卸掉了）。
+    show_main(W, H)
     bring_on_screen(W, H)
+    # ⚠️ 取主窗口要**重试几次**：`windowmap` 之后 openbox 需要一点时间把 frame map 上，
+    #    紧接着 `find_main_window()`（按 `--onlyvisible` 找）可能还是 None →
+    #    旧写法直接 `return None` 就是"上一行刚说'已放回屏幕'，这一行说'找不到'"（2026-09-28 实测）。
+    main = None
+    for _ in range(10):
+        main = find_main_window()
+        if main:
+            break
+        time.sleep(0.5)
+    if not main:
+        print("[reopen] 找不到微信主窗口（等 5s 仍没有；候选=%s）" % _main_window_ids())
+        return None
 
     # ⚠️ 这里**不要**再把主窗口拉全屏了（旧代码调 `ensure_main_fullscreen`）。
     #    侧边栏检测已经改成按主窗口实际几何扫描（见 `_rail_scan_geom`），
     #    窗口多大都找得着；强行拉全屏反而会让 openbox frame 变成整屏尺寸、
     #    首次点击被 frame 吃掉（要连点两次）。详见 `find_rail_buttons` 的说明。
 
-    # ⭐ 面板**已经开着就直接复用，绝不点侧边栏**（2026-09-25 踩到，代价很重）。
-    #    侧边栏那个「小程序」按钮是**切换**语义：面板开着时点它 = **把它关掉**；
-    #    关掉之后微信内部「面板已打开」的状态又不复位，于是再点又变成「开」——
-    #    实测点了两次、状态全乱。更糟的是那一刻**主窗口在最前**（面板还在窗口列表里，
-    #    只是没被抬起来），两次点击都落在**主窗口的侧边栏**上乱点，
-    #    最后弹出了「退出登录？确定 / 取消」确认框 —— 鼠标就悬在「确定」上，
-    #    真点下去立刻掉登录（要手机确认、拖久了只能扫码）。
-    #    所以：先找面板、找到就用；找不到才去点侧边栏。
-    for wid, t in windows():
-        if str(wid) == str(main):
-            continue
-        if win_class(wid) or (t or "").strip() != "微信":
-            continue
-        # ⚠️ 必须**先把它抬到最前、再判** —— `has_miniapp_tab()` 是**抓屏**判据，
-        #    面板被别的窗口盖着时抓到的就是别人，会给出**假否**。
-        #    实测踩到：`clean_leftovers()` 为了扫主窗口上的弹窗会把**主窗口**抬到最前，
-        #    紧接着 open_panel 在这里判 → has_miniapp_tab 假否 → 一路走到点侧边栏 → rc=3，
-        #    日志表现为「面板打不开」，而面板其实好着（手工验证 top_window=面板、
-        #    has_miniapp_tab=True）。
-        raise_window(wid)
-        if has_miniapp_tab(wid, W, H):
-            print("[reopen] 面板已经开着（窗口 %s）→ 直接复用，不点侧边栏" % wid)
-            return wid
+    # 走到这里时面板必然已不在（① 已关掉），点侧边栏是纯粹的「开」语义。
 
     # ⚠️ 2026-09-26 实测定案：**不能只点「顶部组最后一个」**（旧写法 `y = top[-1]`）。
     #    那个写法的前提是「小程序图标恰好是顶部组最后一个」—— 实测**不成立**：
@@ -1024,7 +1280,7 @@ def open_panel(W, H):
         #      窗口高 674 时顶部组 8 个、面板 = 402（最后一个）；
         #      窗口高 640 时 8 个、面板 = 546（倒数第二）、搜一搜 = 594（最后一个）。
         #    宁可试不到（放弃这个号）也**不要乱点**：点朋友圈/收藏这类按钮毫无收益、
-        #    只会污染窗口栈。试完这 3 个还不行 → 交给下面的 Ctrl+R / 放弃。
+        #    只会污染窗口栈。试完这些还不行 → 交给 `open_via_panel` 第 2 轮（关掉重开）/ 放弃。
         cands = list(reversed(top[1:]))[:3]
         for n, y in enumerate(cands, 1):
             # ⚠️ **每轮开始前先关掉上一轮误开的窗口**（如搜一搜/视频号）—— 它们是
@@ -1032,57 +1288,200 @@ def open_panel(W, H):
             #    `top_window` 永远返回它 → 全部尝试都判否（实测踩到：点错一次开成
             #    搜一搜，之后试遍所有图标都没反应）。
             close_stray_wechat_windows(main, W, H)
+            # ⭐ 上一轮点完侧边栏就把主窗口卸出屏幕了 → 先放回来再点侧边栏，
+            #    否则 `raise_window(main)` 必失败（**未映射的窗口不在 `windows()` 列表里**）。
+            show_main(W, H)
+            bring_on_screen(W, H)
             if not raise_window(main):
                 return None
             print("[reopen] 第%d轮·试第%d个侧边栏按钮 y=%d" % (attempt, n, y))
             if not click_rail(main, y, 2.5, "（侧边栏·试小程序）"):
                 return None
+            # ⭐ 点完侧边栏**立刻把主窗口整块卸出屏幕**（`windowunmap`）—— 面板马上要出来了，
+            #    而它 1198x673，主窗口只要还在屏幕上就会和它重叠。
+            #    实测：这一步之后抓屏只剩面板，后面「点放大镜 → 打字 → 回车」全部落在面板上，
+            #    **不可能**再出现"字打进聊天框、回车把关键词当消息发出去"的事故。
+            time.sleep(1.0)
+            hide_main(main, W, H)
             for _ in range(4):
                 time.sleep(1.2)
-                wid = top_window(W, H)
-                if not wid or str(wid) == str(main):
+                # ⚠️ 不能只看 `top_window`：上面可能压着一个杂窗（认不出的微信浮层）
+                #    → 一票否决掉后面真正的面板；而 `has_miniapp_tab()` 是**抓屏**判据，
+                #    被盖住时恒为假。所以逐个候选：先把其余浮层卸出屏幕、把它**单独**
+                #    留在屏幕上，再判。
+                cand = [w for w, t in windows()
+                        if not win_class(w) and (t or "").strip() == "微信"
+                        and str(w) != str(main)]
+                if not cand:
                     continue
-                if win_class(wid) or title_of(wid) != "微信":
-                    break                        # 顶上不是微信自己的窗口，另说
-                if has_miniapp_tab(wid, W, H):
-                    print("[reopen] 面板就位（窗口 %s，侧边栏 y=%d）" % (wid, y))
-                    return wid
-                break                            # 这个图标开的不是小程序面板，换下一个
-    # 点侧边栏判不出来 —— 先把**面板 webview 自己**救一次（Ctrl+R），最便宜且常有奇效。
-    print("[reopen] 侧边栏判不出来 → 试 Ctrl+R 重载面板 webview")
-    wid = reload_panel(W, H)
-    if wid:
-        return wid
-    print("[reopen] 没能确认小程序面板 → 不继续（不乱点）")
+                for wid in cand:
+                    for other in cand:
+                        if other != wid:
+                            run("DISPLAY=%s xdotool windowunmap %s" % (DISPLAY, other))
+                    if has_miniapp_tab(wid, W, H):
+                        print("[reopen] 面板就位（窗口 %s，侧边栏 y=%d）" % (wid, y))
+                        return wid
+                break                            # 都不像面板 → 换下一个按钮
+    print("[reopen] 没能确认小程序面板 → 放弃（交给 open_via_panel 第 2 轮重开）")
     return None
+
+
+def _panel_ids():
+    """所有「微信自己的浮层窗口」的 id（含**未映射**的）。
+
+    判据：标题 ==「微信」且 **没有 WM_CLASS** —— 小程序面板 / 搜一搜 / 视频号
+    共用这一类窗口（只是标签不同），都符合这一条。
+    ⚠️ 不能只看标题：主窗口标题也是「微信」（但它有 WM_CLASS=wechat）。
+    ⚠️ 也不能只看可见性：本函数要能看见**被 `hide_panel()` 卸掉的那个**。
+    """
+    out = []
+    for wid in run("DISPLAY=%s xdotool search --name '^微信$' 2>/dev/null" % DISPLAY).split():
+        if not win_class(wid):
+            out.append(wid)
+    return out
+
+
+def hide_panel(W, H):
+    """把**小程序面板整块卸出屏幕**（`windowunmap`）—— 和主窗口用同一个原语。
+
+    ⭐ 为什么必须有（2026-09-28 用户直接指出）：面板是 **1198x673** 的大窗口，
+       而小程序视图只有 ~410x776 且**居右下**。小程序一开出来，面板就**盖在它上面** ——
+       ① 人眼"找不到小程序"；② 脚本的抓屏判据（`find_target_window` 之外的任何
+       `grab()`）拿到的还是面板；③ 面板上还留着"<关键词>_搜索"标签，很容易被当成
+       "小程序没打开"。用户原话：「**老是突然覆盖小程序，导致找不到小程序**」。
+
+    → 正确顺序：**开完小程序立刻把面板卸掉**，让屏幕上只剩小程序。
+       下一步（签到）全程不需要面板；下一个品牌要用时 `open_panel()` 会
+       `show_panel()` 把它放回来。
+
+    ✅ 可恢复：`show_panel()`（`windowmap`）。几何不变。
+    ⚠️ 判定必须包含**未映射**的窗口 —— 所以用 `_panel_ids()` 而不是 `windows()`。
+    """
+    out = []
+    for wid in _panel_ids():
+        st = run("DISPLAY=%s xwininfo -id %s 2>/dev/null" % (DISPLAY, wid))
+        if "IsUnMapped" in st:
+            continue
+        run("DISPLAY=%s xdotool windowunmap %s" % (DISPLAY, wid))
+        out.append(wid)
+    if out:
+        time.sleep(0.6)
+        print("[reopen] 小程序面板已移出屏幕（%s）→ 它不再盖住刚打开的小程序" % "、".join(out))
+    return out
+
+
+def show_panel(W, H):
+    """`hide_panel()` 的反操作：把面板放回屏幕。
+
+    ⚠️ **必须在 `open_panel()` 判「面板在不在」之前调**（2026-09-28 实测踩到）：
+       面板被 unmap 之后不在 `windows()`（`--onlyvisible`）里 → 复用判定会说"没有面板"
+       → 转去点侧边栏 → 而侧边栏那个按钮是**切换**语义 → **把面板彻底关掉**，状态更乱。
+    """
+    out = []
+    for wid in _panel_ids():
+        st = run("DISPLAY=%s xwininfo -id %s 2>/dev/null" % (DISPLAY, wid))
+        if "IsUnMapped" not in st:
+            continue
+        run("DISPLAY=%s xdotool windowmap %s" % (DISPLAY, wid))
+        out.append(wid)
+    if out:
+        time.sleep(0.8)
+        for wid in out:
+            run("DISPLAY=%s xdotool windowactivate %s" % (DISPLAY, wid))
+        # ⚠️ **必须确认它真的进了"可见窗口列表"再返回**（2026-09-28 实测，见下面的数字）：
+        #    `xdotool windowmap` 是异步的 —— 我们发完它，openbox 还要把 frame map 上去。
+        #    实测：从 `windowmap` 到 `windows()`（`--onlyvisible`）能看见它，**≈0.85s**，
+        #    而上面那句 `sleep(0.8)` 只给 0.8s —— **余量只剩 50ms**，
+        #    跑批负载高时随时会破。破了之后 `open_panel()` 紧接着的 `windows()` 会**看不到面板**
+        #    → 判「没有面板」→ 转去**点侧边栏** → 而侧边栏那个按钮是**切换**语义
+        #    → **把面板彻底关掉**，状态更乱（这就是 §45 里那个坑的另一种触发方式）。
+        #    所以这里必须**轮询到真的可见为止**，不能只靠一个固定 sleep。
+        #    （和 `show_main()` 完全对称 —— 那一边是同样的原因，同样的修法。）
+        for _ in range(12):
+            vis = {w for w, _ in windows()}
+            if all(w in vis for w in out):
+                break
+            time.sleep(0.4)
+        else:
+            print("[reopen] ⚠️ 面板 windowmap 后一直没进可见列表（%s）" % "、".join(out))
+        print("[reopen] 小程序面板已放回屏幕（%s）" % "、".join(out))
+    return out
+
+
+def close_stray_miniapps(W, H, keep_title=""):
+    """关掉**所有盖在面板上的无关小程序窗口**（目标那个不算）。
+
+    ⭐ 为什么必须有这一步（2026-09-28 过桥缘实测，连卡两个品牌）：
+
+      · **上一轮跑批遗留的小程序窗口会盖在面板上面** —— 实测 `蛇蛇来闯关`（937x570）、
+        `荣耀商城`（1022x810）两个窗口压在面板（1198x673）上。后果是
+        ① `panel_search_once` **按屏幕算出的卡片坐标全部落在它们身上** →
+           `click_expect` 的安全阀把**每一张卡片都拒掉**，日志一片
+           `⛔ (x,y) 底下是窗口 <stray>，不是预期目标 <panel> → 不点`，
+           最后报「找到 N 张卡片但一张都没点」；
+        ② 而 `panel_search_once` 内部"关掉开错的小程序"那段是**按 `baseline` 跳过**的
+           —— 它只关「本次新开出来的」，**遗留的老窗口永远关不掉** → 一路阻塞到整批跑完。
+
+      · 为什么放在**最前面**（在 `raise_window()` 之前）：
+        那些函数自己也会被压在下面的窗口骗到（找错目标、抬不起来），必须先清场。
+
+    ⚠️ 判据是"**标题不是「微信」且不是目标**"：
+       微信自己的窗口（主窗口 / 面板 / 搜一搜 / 视频号）标题都叫「微信」，一律不动 ——
+       这是本项目最贵的一条教训（见 §6/§19 的说明）。
+    ⚠️ `close_window()` 关不掉的（实测 `荣耀商城` 就是点两次都没反应的），
+       直接 **`windowunmap` 卸出屏幕** —— 这些是不要的窗口，而 unmap 是直接 X 请求、
+       不跟窗口管理器讨价还价（见 `hide_main`），**一定能生效**。
+    """
+    bad = []
+    for wid, t in windows():
+        t = (t or "").strip()
+        if not t or t == "微信":
+            continue
+        if keep_title and t == keep_title:
+            continue
+        if is_main_window(wid):
+            continue
+        bad.append((wid, t))
+    for wid, t in bad:
+        print("[reopen] 面板上盖着无关的小程序 %s（%s）→ 先关掉" % (t, wid))
+        if close_window(wid, W, H, kind="miniapp"):
+            time.sleep(1.0)
+            continue
+        print("[reopen]   ⚠️ 关不掉 → 直接卸出屏幕（windowunmap）")
+        run("DISPLAY=%s xdotool windowunmap %s" % (DISPLAY, wid))
+        time.sleep(0.8)
+    return bad
 
 
 def panel_search_once(W, H, panel):
     """在面板里：放大镜 → 输入 → **回车**（实测：回车就会进搜索页）→
     搜索结果页里逐张卡片点，用窗口标题验证；**开错了就关掉继续试下一张**。
     成功返回 True。"""
-    # ⭐ 每次搜索前先把面板 webview 重载一次 —— 这不是保守，是**必需**。
-    #    实测（2026-09-25）踩了一整轮：面板停在「绿茵_搜索」标签、搜索框里**残留着
-    #    上一次的关键词**，而 `type_text` 是把字符**追加**进去、不是替换 ——
-    #    于是搜出来的是「绿茵<新关键词>」的混合结果，逐张卡片试开全是同族的错号
-    #    （实测开出「绿茵约战」「绿茵聚落」，两个都关不掉）→ 窗口越堆越多、整批卡死。
-    #    重载一次同时解决三件事：① 清掉残留搜索词；② 清掉累积的「xxx_搜索」标签
-    #    （标签一多，放大镜/卡片位置都会漂）；③ 顺带治好 webview 掉成
-    #    「没有连接到网络」的错误页（那次也是靠 Ctrl+R 救回来的）。
-    rp = reload_panel(W, H)
-    if rp:
-        panel = rp
+    close_stray_miniapps(W, H, keep_title=TARGET)
     raise_window(panel)
     if str(top_window(W, H)) != str(panel):
         print("[reopen] 面板不在最前（有别的窗口挡着）→ 不输入，退出")
         return False
     if not click_in(panel, R_PANEL_MAGNIFIER[0], R_PANEL_MAGNIFIER[1], 1.5, "（面板放大镜）"):
         return False
-    # 双保险：万一重载没生效、或者点放大镜没真正聚焦，先全选清空再输。
-    # （重载后搜索框本该是空的，这一步是零成本的兜底。）
+    # ⚠️ 打字**之前**确认**键盘焦点**真的在面板上 —— 这是保命的一步。
+    #    字符进哪个窗口由**键盘焦点**决定，不是"谁在最前"（见 `focus_window` 的说明）。
+    #    2026-09-28 实测事故：面板视觉在最前、焦点却留在主窗口的聊天输入框 →
+    #    关键词被打进聊天框，紧接着的回车**把它当消息发给了好友**。
+    if not focus_window(panel):
+        print("[reopen] ⚠️ 键盘焦点拿不到面板 → 一个字都不输入（免得打进聊天框）")
+        return False
+    # 双保险：万一点放大镜没真正聚焦，先全选清空再输。
+    # （全新面板的搜索框本该是空的，这一步是零成本的兜底。）
     key("ctrl+a", 0.3)
     key("Delete", 0.5)
     type_text(KEYWORD)
+    # ⚠️ 打字之后、**按回车之前**再确认一次焦点。上面那次校验之后焦点仍可能被
+    #    微信自己的窗口生命周期抢走；这一回车按下去，焦点不对就是"把关键词发出去"。
+    #    这里用 activate=False 的**纯校验**，避免 `windowactivate` 把面板内的输入框顶掉。
+    if not focus_window(panel, activate=False):
+        print("[reopen] ⚠️ 打字后键盘焦点已不在面板 → **不按回车**（免得把关键词当消息发出去）")
+        return False
     print("[reopen] 面板搜索框回车")
     key("Return", 6.0)                      # 面板搜索：回车进「关键词_搜索」结果页
     time.sleep(2)
@@ -1110,6 +1509,10 @@ def panel_search_once(W, H, panel):
             if wid:
                 print("[reopen] 打开成功：%s" % title)
                 png(W, H, "reopen_done.png")
+                # ⭐ **开完立刻把面板卸出屏幕** —— 否则它（1198x673）会一直盖在
+                #    小程序视图（~410x776、居右下）上面，「找不到小程序」就是这么来的。
+                #    后面签到全程不需要面板；下个品牌 `open_panel()` 会 `show_panel()` 放回来。
+                hide_panel(W, H)
                 return True
             for wid_, title_ in windows():
                 if wid_ in baseline or title_.strip() == TARGET:
@@ -1121,9 +1524,20 @@ def panel_search_once(W, H, panel):
                     print("[reopen] 新窗口 %s 标题也是「微信」（微信自己的窗口），不动它" % wid_)
                     continue
                 print("[reopen] 开错了（%s），关掉" % title_)
+                # ⭐ 关之前**先把它抬到最前** —— 否则它的关闭按钮会被**面板**压住：
+                #    实测日志 `⛔ (816,158) 底下是窗口 <面板>，不是预期目标 <刚开的小程序>
+                #    → 不点（关闭按钮）`，于是这个错窗口**关不掉**、一直盖在那儿
+                #    （接着就会连锁成"卡片坐标全落在它身上"）。2026-09-28 过桥缘实测。
+                raise_window(wid_)
                 if not close_window(wid_, W, H, kind="miniapp"):
-                    return False             # 关不掉说明状态异常，交给外层重来
-                break                        # 关掉后重新截图定位再继续
+                    # ⚠️ 关不掉（✕ 字形探测不准）**不要 return False** —— 那样整个品牌白跑。
+                    #    直接把它**卸出屏幕**：反正它是不要的窗口，而 unmap 是直接 X 请求、
+                    #    一定生效（见 `hide_main`）。留着它的话，后面**每一张卡片**的点击
+                    #    都会被 `click_expect` 的安全阀拒掉（"底下是它，不是面板"）。
+                    print("[reopen] ⚠️ 关不掉 → 直接卸出屏幕（windowunmap）")
+                    run("DISPLAY=%s xdotool windowunmap %s" % (DISPLAY, wid_))
+                    time.sleep(0.8)
+                break                        # 关掉/移走后重新截图定位再继续
         if not progress:
             break                            # 所有卡片都试过了
         time.sleep(3)
@@ -1275,6 +1689,11 @@ def do_search(W, H, box, goto_net=False):
         print("[reopen] 主窗口不在最前（有别的窗口挡着）→ 不输入，退出这条路径")
         return False
     if not click_expect(main, bx, by, 0.6, "（全局搜索框）"):
+        return False
+    # ⚠️ 点完框再确认**键盘焦点**在主窗口：`type_text` 的字发往**有焦点**的窗口，
+    #    焦点不对就会落到上一次的窗口（最坏是聊天输入框）—— 老注释警告的正是这个坑。
+    if not focus_window(main):
+        print("[reopen] ⚠️ 键盘焦点拿不到主窗口 → 不输入（免得打进聊天框）")
         return False
     key("ctrl+a"); key("Delete")
     type_text(KEYWORD)

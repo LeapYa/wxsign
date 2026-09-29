@@ -327,6 +327,14 @@ def main():
     #    后面的关闭动作全部点空（面板尤其容易中招）。
     restore_on_screen(W, H)
 
+    # ⭐ 主窗口可能被**上一轮**的 `hide_main()`（windowunmap）卸在屏幕外 —— 先放回来。
+    #    为什么必须放回来（2026-09-28）：
+    #      · `clear_modals()` 要按 WM_CLASS 在**主窗口**上扫「退出登录？」这类模态框，
+    #        主窗口不在时它会直接 "找不到微信主窗口，跳过弹窗遣散" → 弹窗留着吞掉后面所有点击；
+    #      · 下面的 `find_main_window()` 也会返回 None → 每个目标前的 `hide_main(让位)` 变成空操作。
+    #    放回来之后，循环里**每个目标处理前**都会再 `hide_main()` 让位，所以不会挡着谁。
+    R.show_main(W, H)
+
     if clear_modals(W, H):
         print("[clean] 上面遣散了模态弹窗（它会吞掉之后所有点击）")
 
@@ -336,15 +344,40 @@ def main():
         return 0
     print("[clean] 发现 %d 个残留窗口" % len(targets))
     bad = 0
+    main = R.find_main_window()
     for wid, title in targets:
         t = (title or "").strip()
         print("[clean] 处理 %s（%s）" % (title, wid))
+        # ⭐ 先让**主窗口**让位 —— 否则它会盖住目标窗口的 ✕，`close_window` 里的安全阀
+        #    （"鼠标底下是不是预期窗口"）会把**每一次点击都拒掉**，面板于是永远关不掉
+        #    （2026-09-28 实测：日志一片 `⛔ (…) 底下是窗口 <主窗口> → 不点`，
+        #      残留越积越多，后面整批品牌都打不开面板）。
+        #    用 `windowunmap`（直接 X 请求，不走 WM）—— 实测 `windowminimize` 对主窗口
+        #    **完全无效**（它带 `_KDE_NET_WM_WINDOW_TYPE_OVERRIDE`，openbox 不当常规窗口管），
+        #    而"挪出屏"会被 openbox 按 EWMH 夹住、硬留 46px 压住面板右上角的放大镜。
+        #    ⚠️ 只对"不是主窗口自己"的目标这么做。
+        if main and str(wid) != str(main):
+            R.hide_main(main, W, H)
         dismiss_popups(wid, W, H)            # 第一遍：也可能是悬浮提示，先试关
         # ⚠️ 2026-09-27：**按身份选关闭方式**（旧实现一律 kind="miniapp"）。
         #    标题叫「微信」的是**面板 / 搜一搜 / 视频号**这类微信自己的窗口，必须走
         #    kind="panel" —— `close_window` 有防线：标题「微信」的窗口只有 panel 才许关
         #    （否则它可能是主窗口）。一律用 miniapp 的老写法会**静默拒关面板**。
         kind = "panel" if t == "微信" else "miniapp"
+        # ⭐ 2026-09-28：**面板（标题「微信」、无 WM_CLASS）不点 ✕ 了，直接 `windowunmap` 卸出屏幕**。
+        #    两个理由：
+        #      ① ✕ 那套"字形探测 + 语义锚点"在面板上**命中率很低** —— 实测反复
+        #         `探测没给出可信字形` → `没关掉` → `bad += 1` → 调用方判"有残留"→ **中止整批**；
+        #      ② 用户要的就是"**把面板像主窗口一样先隐藏**"（它会盖住刚打开的小程序），
+        #         而 unmap 是直接 X 请求、**一定生效**（见 wxopen.hide_main 的说明）。
+        #    ⚠️ unmap 之后它**不在 `windows()`（--onlyvisible）里** → 下一轮 `leftover()` 也不会
+        #       再把它算成残留（这正是我们要的）；要用时 `wxopen.show_panel()` 放回来，
+        #       几何不变、微信内部"面板已打开"的状态也不变（区别于 `windowclose`）。
+        if kind == "panel":
+            R.run("DISPLAY=%s xdotool windowunmap %s" % (R.DISPLAY, wid))
+            print("[clean] 面板已卸出屏幕（windowunmap，不点 ✕）")
+            time.sleep(0.8)
+            continue
         if R.close_window(wid, W, H, kind=kind):
             time.sleep(1)
             continue
@@ -355,8 +388,13 @@ def main():
             # 面板中心是推荐卡片/推广位，点下去可能又开出一个无关的小程序。
             R.click(int(W * 0.5), int(H * 0.5), 0.8)
         if not R.close_window(wid, W, H, kind=kind):
-            print("[clean] ⚠️ 还是没关掉 %s（不硬杀、不补点，避免误伤）" % title)
-            bad += 1
+            # ⭐ 兜底：✕ 点不准就**直接卸出屏幕**。它同样会从 `windows()` 里消失
+            #    （不再算残留），而且不会再盖住别的小程序/面板。
+            #    代价：微信内部的渲染层可能还活着（不会立刻回收内存），
+            #    所以**不计入 bad**（bad 的语义是"这个窗口还在挡路"）。
+            print("[clean] ⚠️ ✕ 没关掉 %s → 直接卸出屏幕（windowunmap）" % title)
+            R.run("DISPLAY=%s xdotool windowunmap %s" % (R.DISPLAY, wid))
+            time.sleep(0.8)
         time.sleep(1)
     left = [t for w, t in R.windows() if leftover(w, t)]
     if left and "--restart-runtime" in sys.argv:

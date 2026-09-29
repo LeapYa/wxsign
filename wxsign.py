@@ -65,7 +65,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.environ.get("WXSIGN_HOME", HERE)
 # 同一个目录在宿主机与容器里的挂载点不同（青龙一般是 /ql/data/scripts/... ↔ /work/...），
 # 所以「容器内路径」单独一个变量；不设则与 HOME 相同。
-HOME_C = os.environ.get("WXSIGN_HOME_CONTAINER", HOME)
+# ⚠️ 这里**不能**直接用环境变量的值 —— Git Bash(MSYS) 在启动 Windows 程序时会把它
+#    当 POSIX 路径**转换**（实测 `/work/wxsign` → `C:/Users/.../PortableGit/versions/1.2.0/work/wxsign`，
+#    MSYS 把自己的根当成 `/`），那个值传进容器后 `cd` 必然失败（症状 `[token] 刷新 rc=2`）。
+#    所以延迟到首次用到时、**在容器里实测探测** —— 见 `home_c()`。
+HOME_C = None
 # 微信实例容器里放辅助脚本的目录（reopen_miniapp.py / wxclean.py）
 CTMP = os.environ.get("WXSIGN_CTMP", "/tmp")
 
@@ -83,6 +87,42 @@ ENV_DIR = os.path.join(HOME, "brands")
 HOOK = os.environ.get("WOC_HOOK", "woc-hook")
 INSTANCE = os.environ.get("WOC_INSTANCE", "")
 CPY = os.environ.get("WXSIGN_PYTHON", "python3")
+
+
+def _detect_home_c():
+    """探测仓库在 **hook 容器里**的路径（给容器内的 `cd` / `ENVFILE=` 用）。
+
+    ⚠️ 为什么不能只信 `WXSIGN_HOME_CONTAINER`：Git Bash(MSYS) 在启动 Windows 程序时，
+       会把环境变量里**看起来像 POSIX 路径**的值转换掉 —— 实测 `/work/wxsign` 变成
+       `C:/Users/<user>/.workbuddy/binaries/PortableGit/versions/1.2.0/work/wxsign`
+       （MSYS 把 PortableGit 的根当成 `/`）。这个值传进容器后 `cd` 必然失败，
+       症状是 `[token] 刷新 rc=2` + `cd: can't cd to C:/Users/.../work/wxsign`。
+       → 所以环境变量只当**候选**，真正可信的是**在容器里实测**（`test -f wxrefresh.js`）。
+    """
+    hint = (os.environ.get("WXSIGN_HOME_CONTAINER") or "").strip()
+    cands = []
+    if hint and not re.match(r"^[A-Za-z]:", hint) and "\\" not in hint:
+        cands.append(hint)                  # 只接受"看着像 POSIX 路径"的提示
+    for d in ("/work/wxsign", "/ql/data/scripts/wxsign", "/wxsign"):
+        if d not in cands:
+            cands.append(d)
+    for d in cands:
+        try:
+            p = subprocess.run(["docker", "exec", HOOK, "test", "-f", d + "/wxrefresh.js"],
+                               capture_output=True, timeout=25)
+            if p.returncode == 0:
+                return d
+        except Exception:                   # noqa: BLE001
+            pass
+    return cands[0]
+
+
+def home_c():
+    """仓库在容器里的路径（首次调用时探测一次，之后缓存）。"""
+    global HOME_C
+    if HOME_C is None:
+        HOME_C = _detect_home_c()
+    return HOME_C
 
 CRM_BASE = "https://scrm.wuuxiang.com/crm7game-api"
 LOGIN_URL = "https://wechat.wuuxiang.com/i5xforyou/auth/login"
@@ -544,14 +584,12 @@ def ensure_miniapp(brand, retry_hard=True):
     if not ok and retry_hard:
         # 硬清**只在真的有残留窗口时才做**。没有残留还硬清 = 白白把面板弄没
         # （实测踩过一次，之后整批号都卡在「没能确认小程序面板」）。
-        # 没有残留 → 面板多半是自己那层的问题。wxopen.py 现在会先试 **Ctrl+R 重载面板
-        # webview**（实测：面板会掉成「没有连接到网络」的错误页，窗口和标签条都还在，
-        # 但里面一个小程序都没有 → CDP 上下文为空。一条 Ctrl+R 就恢复）。
-        # 走到这里说明连重载也没成，只能重启微信，所以放弃、别再折腾。
+        # 没有残留 → 面板多半是自己那层的问题。wxopen.py 内部已经重试过
+        # （第 2 轮会关掉旧面板重开），走到这里说明连重开都没成，只能重启微信。
         left = leftover_count()
         if left <= 0:
-            log("  [ensure] 重载面板 + 重启 hook 后仍打不开，且**没有残留窗口** → "
-                "不是残留堵的；重载也救不回来，多半得重启微信。放弃这个号，不再硬清。")
+            log("  [ensure] 重启 hook 后仍打不开，且**没有残留窗口** → "
+                "不是残留堵的，多半得重启微信。放弃这个号，不再硬清。")
             return False
         log("  [ensure] 重启 hook 也没打开，但确有 %d 个残留 → 硬清运行时（⚠️ 会连坐面板）" % left)
         clean_leftovers(hard=True)
@@ -617,7 +655,7 @@ def refresh_token(brand, env, force=False):
     #    它不认 POSIX 单引号，`sh -c '...'` 会被拆错（实测报 Unterminated quoted string）。
     inner = ("cd %s && ENVFILE=%s WX_APPID=%s WX_MPID=%s "
              "NODE_PATH=/opt/wmpf/node_modules node wxrefresh.js%s"
-             % (HOME_C, cpath(HOME_C, "brands", "%s.env" % brand["slug"]),
+             % (home_c(), cpath(home_c(), "brands", "%s.env" % brand["slug"]),
                 brand["appid"], env.get("WX_MPID", ""), " force" if force else ""))
     args = ["docker", "exec", HOOK, "sh", "-c", inner]
     try:
@@ -641,9 +679,9 @@ def harvest_ident(brand):
     自动化的前提是**小程序已经开着**（前一步 ensure_miniapp 刚开过）。
     """
     args = ["docker", "exec",
-            "-e", "ENVFILE=" + cpath(HOME_C, "brands", "%s.env" % brand["slug"]),
+            "-e", "ENVFILE=" + cpath(home_c(), "brands", "%s.env" % brand["slug"]),
             "-e", "WX_APPID=" + brand["appid"], HOOK, "sh", "-c",
-            "cd %s && NODE_PATH=/opt/wmpf/node_modules node wxident.js 30" % HOME_C]
+            "cd %s && NODE_PATH=/opt/wmpf/node_modules node wxident.js 30" % home_c()]
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=300)
         out = (p.stdout or "") + (p.stderr or "")
